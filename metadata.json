@@ -1,0 +1,6 @@
+{
+  "name": "SportAnalytics AI",
+  "description": "Plataforma cuantitativa de análisis deportivo para Fútbol y NBA con modelos probabilísticos, campos interactivos, análisis Over/Under, detector de errores de cuota e IA explicativa.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
