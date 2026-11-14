@@ -361,11 +361,15 @@ export interface LoggedPrediction {
 export interface EmpiricalCalibrationProfile {
   sport: SportType;
   sampleCount: number;
+  minSamplesRequired?: number;
   active: boolean;
   temperature: number; // Logit scale factor (tau < 1 moderates overconfidence)
   bias: number;
   rawBrier: number;
   calibratedBrier: number;
+  cvBrier?: number;
+  cvLogLoss?: number;
+  baselineLogLoss?: number;
   eceBeforePct: number;
   eceAfterPct: number;
   summary: string;

@@ -5,6 +5,9 @@ import type {
   SportType,
 } from '../types/sports.ts';
 
+export const MIN_CALIBRATION_SAMPLES = 15;
+export const MIN_CALIBRATION_CLASS_COUNT = 3;
+
 function clampProb(p: number): number {
   return Math.max(0.005, Math.min(0.995, p));
 }
@@ -44,9 +47,101 @@ function computeEcePct(pairs: Array<{ prob: number; y: number }>): number {
   return ece * 100;
 }
 
+interface BinarySample {
+  rawProb: number;
+  y: number;
+}
+
+function evaluateSampleSet(samples: BinarySample[], tau: number, bias: number) {
+  let brier = 0;
+  let logLoss = 0;
+  const pairs: Array<{ prob: number; y: number }> = [];
+  for (const s of samples) {
+    const cal = clampProb(sigmoid(tau * logit(s.rawProb) + bias));
+    brier += (cal - s.y) * (cal - s.y);
+    logLoss += -(s.y * Math.log(cal) + (1 - s.y) * Math.log(1 - cal));
+    pairs.push({ prob: cal, y: s.y });
+  }
+  const n = Math.max(1, samples.length);
+  return {
+    brier: brier / n,
+    logLoss: logLoss / n,
+    ecePct: computeEcePct(pairs),
+  };
+}
+
+function fitBestParamsOnSamples(trainSamples: BinarySample[]): { tau: number; bias: number } {
+  const n = trainSamples.length;
+  if (n === 0) return { tau: 1, bias: 0 };
+
+  const baseline = evaluateSampleSet(trainSamples, 1, 0);
+  // Adaptive L2 penalty shrinks toward identity (tau=1, bias=0) on moderate sample sizes
+  const regScale = 24 / Math.max(12, n);
+  const tauPenaltyWeight = 0.045 * regScale;
+  const biasPenaltyWeight = 0.055 * regScale;
+
+  let bestTau = 1;
+  let bestBias = 0;
+  let bestObj = baseline.logLoss;
+
+  for (let tau = 0.72; tau <= 1.1001; tau += 0.02) {
+    const tRounded = Math.round(tau * 100) / 100;
+    for (let bias = -0.35; bias <= 0.3501; bias += 0.05) {
+      const bRounded = Math.round(bias * 100) / 100;
+      const stats = evaluateSampleSet(trainSamples, tRounded, bRounded);
+      const regPenalty =
+        tauPenaltyWeight * Math.pow(tRounded - 1, 2) + biasPenaltyWeight * Math.pow(bRounded, 2);
+      const obj = stats.logLoss + regPenalty;
+      if (obj < bestObj - 0.001) {
+        bestObj = obj;
+        bestTau = tRounded;
+        bestBias = bRounded;
+      }
+    }
+  }
+
+  return { tau: bestTau, bias: bestBias };
+}
+
+function runOutOfSampleValidation(samples: BinarySample[]): {
+  cvBrier: number;
+  cvLogLoss: number;
+} {
+  const n = samples.length;
+  const useLoocv = n <= 60;
+  const numFolds = useLoocv ? n : 5;
+
+  let brierSum = 0;
+  let logLossSum = 0;
+
+  for (let fold = 0; fold < numFolds; fold++) {
+    const train: BinarySample[] = [];
+    const test: BinarySample[] = [];
+    for (let i = 0; i < n; i++) {
+      const belongsToTest = useLoocv ? i === fold : i % numFolds === fold;
+      if (belongsToTest) test.push(samples[i]);
+      else train.push(samples[i]);
+    }
+    if (test.length === 0) continue;
+
+    const { tau, bias } = fitBestParamsOnSamples(train);
+    for (const item of test) {
+      const cal = clampProb(sigmoid(tau * logit(item.rawProb) + bias));
+      brierSum += (cal - item.y) * (cal - item.y);
+      logLossSum += -(item.y * Math.log(cal) + (1 - item.y) * Math.log(1 - cal));
+    }
+  }
+
+  return {
+    cvBrier: brierSum / Math.max(1, n),
+    cvLogLoss: logLossSum / Math.max(1, n),
+  };
+}
+
 /**
  * Fits an empirical Platt / Temperature calibration profile on real resolved predictions
- * (excluding reference/illustrative items). Requires at least 6 real resolved samples.
+ * (excluding reference/illustrative items). Requires at least 15 real resolved samples,
+ * at least 3 outcomes per class, and out-of-sample cross-validation improvement before activating.
  */
 export function fitEmpiricalCalibrationProfile(
   predictions: LoggedPrediction[],
@@ -63,6 +158,7 @@ export function fitEmpiricalCalibrationProfile(
     return {
       sport,
       sampleCount: 0,
+      minSamplesRequired: MIN_CALIBRATION_SAMPLES,
       active: false,
       temperature: 1,
       bias: 0,
@@ -74,98 +170,95 @@ export function fitEmpiricalCalibrationProfile(
     };
   }
 
-  const samples = resolved.map((p) => ({
+  const samples: BinarySample[] = resolved.map((p) => ({
     rawProb: clampProb(p.rawPredictedProb ?? p.predictedProb),
     y: p.status === 'won' ? 1 : 0,
   }));
 
-  const evalMetrics = (tau: number, bias: number) => {
-    let brier = 0;
-    let logLoss = 0;
-    const pairs: Array<{ prob: number; y: number }> = [];
-    for (const s of samples) {
-      const cal = clampProb(sigmoid(tau * logit(s.rawProb) + bias));
-      brier += (cal - s.y) * (cal - s.y);
-      logLoss += -(s.y * Math.log(cal) + (1 - s.y) * Math.log(1 - cal));
-      pairs.push({ prob: cal, y: s.y });
-    }
-    const n = samples.length;
-    return {
-      brier: brier / n,
-      logLoss: logLoss / n,
-      ecePct: computeEcePct(pairs),
-    };
-  };
+  const baseline = evaluateSampleSet(samples, 1, 0);
+  const wins = samples.filter((s) => s.y === 1).length;
+  const losses = samples.length - wins;
 
-  const baseline = evalMetrics(1, 0);
-
-  if (samples.length < 6) {
+  if (samples.length < MIN_CALIBRATION_SAMPLES) {
     return {
       sport,
       sampleCount: samples.length,
+      minSamplesRequired: MIN_CALIBRATION_SAMPLES,
       active: false,
       temperature: 1,
       bias: 0,
       rawBrier: baseline.brier,
       calibratedBrier: baseline.brier,
+      baselineLogLoss: baseline.logLoss,
       eceBeforePct: baseline.ecePct,
       eceAfterPct: baseline.ecePct,
-      summary: `Muestra insuficiente (${samples.length}/6 predicciones resueltas mínimas para activar calibración empírica).`,
+      summary: `Muestra insuficiente (${samples.length}/${MIN_CALIBRATION_SAMPLES} predicciones reales resueltas mínimas para calibración fiable).`,
     };
   }
 
-  let bestTau = 1;
-  let bestBias = 0;
-  let bestObj = baseline.logLoss;
-  let bestStats = baseline;
-
-  // Bounded regularized search prevents overfitting on moderate sample sizes
-  for (let tau = 0.68; tau <= 1.1201; tau += 0.02) {
-    const tRounded = Math.round(tau * 100) / 100;
-    for (let bias = -0.35; bias <= 0.3501; bias += 0.05) {
-      const bRounded = Math.round(bias * 100) / 100;
-      const stats = evalMetrics(tRounded, bRounded);
-      const regPenalty = 0.015 * Math.pow(tRounded - 1, 2) + 0.02 * Math.pow(bRounded, 2);
-      const obj = stats.logLoss + regPenalty;
-      if (obj < bestObj - 0.002) {
-        bestObj = obj;
-        bestTau = tRounded;
-        bestBias = bRounded;
-        bestStats = stats;
-      }
-    }
-  }
-
-  const improved =
-    bestStats.brier <= baseline.brier + 0.002 &&
-    (Math.abs(bestTau - 1) >= 0.02 || Math.abs(bestBias) >= 0.05);
-
-  if (!improved) {
+  if (wins < MIN_CALIBRATION_CLASS_COUNT || losses < MIN_CALIBRATION_CLASS_COUNT) {
     return {
       sport,
       sampleCount: samples.length,
-      active: true,
+      minSamplesRequired: MIN_CALIBRATION_SAMPLES,
+      active: false,
       temperature: 1,
       bias: 0,
       rawBrier: baseline.brier,
       calibratedBrier: baseline.brier,
+      baselineLogLoss: baseline.logLoss,
       eceBeforePct: baseline.ecePct,
       eceAfterPct: baseline.ecePct,
-      summary: `Muestra de ${samples.length} pronósticos ya bien calibrada (τ=1.00, ECE ${baseline.ecePct.toFixed(1)}%).`,
+      summary: `Distribución unilateral (${wins} aciertos / ${losses} fallos): se requieren al menos ${MIN_CALIBRATION_CLASS_COUNT} casos de cada resultado para calibrar sin sesgo.`,
+    };
+  }
+
+  const cv = runOutOfSampleValidation(samples);
+  const { tau: bestTau, bias: bestBias } = fitBestParamsOnSamples(samples);
+  const fullStats = evaluateSampleSet(samples, bestTau, bestBias);
+
+  const nonTrivialChange = Math.abs(bestTau - 1) >= 0.02 || Math.abs(bestBias) >= 0.05;
+  const validatedOutOfSample =
+    cv.cvLogLoss < baseline.logLoss - 0.004 &&
+    cv.cvBrier <= baseline.brier - 0.001 &&
+    fullStats.brier <= baseline.brier;
+
+  if (!nonTrivialChange || !validatedOutOfSample) {
+    return {
+      sport,
+      sampleCount: samples.length,
+      minSamplesRequired: MIN_CALIBRATION_SAMPLES,
+      active: false,
+      temperature: 1,
+      bias: 0,
+      rawBrier: baseline.brier,
+      calibratedBrier: baseline.brier,
+      cvBrier: cv.cvBrier,
+      cvLogLoss: cv.cvLogLoss,
+      baselineLogLoss: baseline.logLoss,
+      eceBeforePct: baseline.ecePct,
+      eceAfterPct: baseline.ecePct,
+      summary: !nonTrivialChange
+        ? `Muestra de ${samples.length} pronósticos bien calibrada (ECE ${baseline.ecePct.toFixed(1)}%); se mantiene el modelo base.`
+        : `Validación cruzada (${samples.length} muestras) no confirma mejora fuera de muestra (CV LogLoss ${cv.cvLogLoss.toFixed(3)} vs base ${baseline.logLoss.toFixed(3)}); ajuste descartado para evitar sobreajuste.`,
     };
   }
 
   return {
     sport,
     sampleCount: samples.length,
+    minSamplesRequired: MIN_CALIBRATION_SAMPLES,
     active: true,
     temperature: bestTau,
     bias: bestBias,
     rawBrier: baseline.brier,
-    calibratedBrier: bestStats.brier,
+    calibratedBrier: fullStats.brier,
+    cvBrier: cv.cvBrier,
+    cvLogLoss: cv.cvLogLoss,
+    baselineLogLoss: baseline.logLoss,
     eceBeforePct: baseline.ecePct,
-    eceAfterPct: bestStats.ecePct,
-    summary: `Calibración activa (${samples.length} muestras): τ=${bestTau.toFixed(2)}, sesgo ${bestBias >= 0 ? '+' : ''}${bestBias.toFixed(2)} (Brier ${baseline.brier.toFixed(3)} → ${bestStats.brier.toFixed(3)}).`,
+    eceAfterPct: fullStats.ecePct,
+    summary: `Calibración validada (${samples.length} muestras): τ=${bestTau.toFixed(2)}, sesgo ${bestBias >= 0 ? '+' : ''}${bestBias.toFixed(2)} (CV Brier ${baseline.brier.toFixed(3)} → ${cv.cvBrier.toFixed(3)}, ECE ${baseline.ecePct.toFixed(1)}% → ${fullStats.ecePct.toFixed(1)}%).`,
   };
 }
 
@@ -180,6 +273,12 @@ export function applyBinaryCalibration(
   return clampProb(sigmoid(profile.temperature * logit(clamped) + profile.bias));
 }
 
+/**
+ * Applies both temperature (τ) and directional confidence bias on the 3-way football simplex:
+ *   z_i = τ * ln(p_i) + 1.5 * bias * (p_i - 1/3)
+ * For τ >= 0.72 and bias in [-0.35, 0.35], d(z_i)/dp_i = τ/p_i + 1.5*bias >= 0.195 > 0,
+ * strictly preserving outcome ranking, tie symmetry, and valid normalized probabilities summing to 1.
+ */
 export function applyThreeWayCalibration(
   pHome: number,
   pDraw: number,
@@ -191,17 +290,25 @@ export function applyThreeWayCalibration(
   const nx = Math.max(0.005, pDraw / s);
   const n2 = Math.max(0.005, pAway / s);
 
-  if (!profile || !profile.active || profile.temperature === 1) {
+  if (!profile || !profile.active || (profile.temperature === 1 && profile.bias === 0)) {
     const sum = n1 + nx + n2;
     return [n1 / sum, nx / sum, n2 / sum];
   }
 
-  // Temperature scaling on simplex preserves ranking and softens extreme logits when tau < 1
-  const t = Math.max(0.65, Math.min(1.15, profile.temperature));
-  const w1 = Math.pow(n1, t);
-  const wx = Math.pow(nx, t);
-  const w2 = Math.pow(n2, t);
+  const t = Math.max(0.72, Math.min(1.15, profile.temperature));
+  const b = Math.max(-0.35, Math.min(0.35, profile.bias));
+  const uniformThird = 1 / 3;
+
+  const z1 = t * Math.log(n1) + 1.5 * b * (n1 - uniformThird);
+  const zx = t * Math.log(nx) + 1.5 * b * (nx - uniformThird);
+  const z2 = t * Math.log(n2) + 1.5 * b * (n2 - uniformThird);
+
+  const maxZ = Math.max(z1, zx, z2);
+  const w1 = Math.exp(z1 - maxZ);
+  const wx = Math.exp(zx - maxZ);
+  const w2 = Math.exp(z2 - maxZ);
   const wSum = Math.max(1e-9, w1 + wx + w2);
+
   return [w1 / wSum, wx / wSum, w2 / wSum];
 }
 

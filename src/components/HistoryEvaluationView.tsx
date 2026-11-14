@@ -1,7 +1,10 @@
 import React, { useMemo, useState } from 'react';
 import { CheckCircle2, XCircle, Info, Sliders } from 'lucide-react';
 import type { LoggedPrediction } from '../types/sports.ts';
-import { evaluatePredictionHistory } from '../engine/calibrationEngine.ts';
+import {
+  evaluatePredictionHistory,
+  MIN_CALIBRATION_SAMPLES,
+} from '../engine/calibrationEngine.ts';
 
 interface HistoryEvaluationViewProps {
   predictions: LoggedPrediction[];
@@ -82,13 +85,14 @@ export const HistoryEvaluationView: React.FC<HistoryEvaluationViewProps> = ({
               >
                 {profile.active
                   ? `Activa (${profile.sampleCount} muestras)`
-                  : `Inactiva (${profile.sampleCount}/6 muestras)`}
+                  : `Inactiva (${profile.sampleCount}/${profile.minSamplesRequired ?? MIN_CALIBRATION_SAMPLES} muestras)`}
               </span>
             </div>
             <p className="text-slate-300 leading-relaxed">{profile.summary}</p>
             {profile.sampleCount > 0 && (
               <div className="flex flex-wrap gap-4 text-[11px] font-mono tabular-nums text-slate-400 pt-1">
                 <span>τ = {profile.temperature.toFixed(2)}</span>
+                <span>Sesgo = {profile.bias >= 0 ? `+${profile.bias.toFixed(2)}` : profile.bias.toFixed(2)}</span>
                 <span>Brier: {profile.rawBrier.toFixed(3)} → {profile.calibratedBrier.toFixed(3)}</span>
                 <span>ECE: {profile.eceBeforePct.toFixed(1)}% → {profile.eceAfterPct.toFixed(1)}%</span>
               </div>
@@ -100,7 +104,7 @@ export const HistoryEvaluationView: React.FC<HistoryEvaluationViewProps> = ({
       <div className="rounded-xl border border-slate-800 bg-[#0D1526] px-4 py-3 text-xs text-slate-300 flex items-start gap-2.5">
         <Info className="w-4 h-4 text-blue-400 shrink-0 mt-0.5" />
         <span>
-          Transparencia metodológica: al alcanzar al menos 6 predicciones reales resueltas por deporte (excluyendo los ejemplos ilustrativos iniciales), el motor ajusta automáticamente la temperatura logística (τ) para corregir sobreconfianza o sesgo sistemático.
+          Transparencia metodológica: al alcanzar al menos {MIN_CALIBRATION_SAMPLES} predicciones reales resueltas por deporte (excluyendo ejemplos ilustrativos), el motor valida mediante validación cruzada fuera de muestra si la temperatura logística (τ) y el sesgo reducen el error real sin sobreajuste antes de activarlos.
         </span>
       </div>
 

@@ -322,7 +322,7 @@ export function computeFootballMatchPrediction(
 
   if (calibrationHistory && calibrationHistory.length > 0) {
     const profile = fitEmpiricalCalibrationProfile(calibrationHistory, 'football');
-    if (profile.active && profile.temperature !== 1) {
+    if (profile.active && (profile.temperature !== 1 || profile.bias !== 0)) {
       [probHome, probDraw, probAway] = applyThreeWayCalibration(
         rawProbHome,
         rawProbDraw,
