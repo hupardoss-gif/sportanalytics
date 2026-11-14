@@ -116,17 +116,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
     );
   }, [player, match, statKey, customLine, timeframe, teammatesOverride]);
 
-  const matchingPropOdds = useMemo(
-    () =>
-      (match.odds ?? []).filter(
-        (o) =>
-          o.marketCategory === 'player_prop' &&
-          o.playerId === player.id &&
-          o.statKey === statKey
-      ),
-    [match.odds, player.id, statKey]
-  );
-
   const maxProbBin = useMemo(
     () => Math.max(0.05, ...projection.distribution.map((d) => d.probability)),
     [projection.distribution]
@@ -250,9 +239,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
             <span className="text-xl font-bold font-mono tabular-nums text-white">
               {projection.probOver.toFixed(1)}%
             </span>
-            <span className="text-slate-400 font-mono tabular-nums ml-2">
-              Cuota justa {(100 / Math.max(1, projection.probOver)).toFixed(2)}
-            </span>
           </div>
           <div className="text-right">
             <span className="text-slate-300 font-semibold block">
@@ -260,9 +246,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
             </span>
             <span className="text-xl font-bold font-mono tabular-nums text-slate-200">
               {projection.probUnder.toFixed(1)}%
-            </span>
-            <span className="text-slate-400 font-mono tabular-nums ml-2">
-              Cuota justa {(100 / Math.max(1, projection.probUnder)).toFixed(2)}
             </span>
           </div>
         </div>
@@ -279,31 +262,29 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
         </div>
       </div>
 
-      {/* Real Bookmaker Player Prop Odds Comparison (when published) */}
-      <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs">
-        {matchingPropOdds.length > 0 ? (
-          <div className="space-y-2">
-            <span className="font-semibold text-slate-200 block">
-              Cuotas publicadas para este mercado de jugador:
-            </span>
-            <div className="flex flex-wrap gap-3">
-              {matchingPropOdds.map((o) => (
-                <div
-                  key={o.id}
-                  className="px-3 py-1.5 rounded-md border border-slate-800 bg-[#0D1526] font-mono tabular-nums"
-                >
-                  <span className="text-slate-300">{o.selectionLabel}</span>{' '}
-                  <span className="font-bold text-white ml-1">{o.decimalOdds.toFixed(2)}</span>{' '}
-                  <span className="text-slate-500">({o.bookmaker})</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <span className="text-slate-400">
-            La fuente actual no proporciona cuotas individuales para este mercado (se muestran únicamente probabilidades y cuotas justas teóricas del modelo).
-          </span>
-        )}
+      {/* Data Provenance & Sample Quality Indicator */}
+      <div
+        className={`rounded-lg border px-3 py-2.5 text-xs ${
+          projection.statsQuality === 'verified'
+            ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-200'
+            : projection.statsQuality === 'estimated'
+              ? 'border-amber-500/30 bg-amber-950/20 text-amber-200'
+              : 'border-slate-800 bg-slate-950/60 text-slate-300'
+        }`}
+      >
+        <span className="font-semibold block">
+          {projection.statsQuality === 'verified'
+            ? `Datos verificados (${projection.sampleSizeGames} partidos reales)`
+            : projection.statsQuality === 'estimated'
+              ? `Estimación posicional / muestra reducida (${projection.sampleSizeGames} partidos)`
+              : 'Sin datos individuales suficientes'}
+        </span>
+        <span className="text-[11px] opacity-90 block mt-0.5">
+          {projection.statsOriginNote ??
+            (projection.statsQuality === 'verified'
+              ? 'Proyección calculada con estadísticas individuales reales del jugador.'
+              : 'La fuente actual no publica game logs individuales completos; la proyección aplica estimación posicional con mayor amplitud de incertidumbre.')}
+        </span>
       </div>
 
       {/* Key Quantitative Summary */}

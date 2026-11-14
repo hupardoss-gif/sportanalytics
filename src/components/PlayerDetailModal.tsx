@@ -117,6 +117,28 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
                   {split.minutes.toFixed(1)} min/p · {(split.starterRate * 100).toFixed(0)}% titular
                 </span>
               </p>
+              <div className="flex flex-wrap items-center gap-2 mt-1">
+                <span
+                  className={`px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                    currentPlayer.statsQuality === 'verified'
+                      ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+                      : currentPlayer.statsQuality === 'unavailable'
+                        ? 'border-slate-700 bg-slate-900 text-slate-300'
+                        : 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+                  }`}
+                >
+                  {currentPlayer.statsQuality === 'verified'
+                    ? `Datos verificados (${currentPlayer.sampleSizeGames} p.)`
+                    : currentPlayer.statsQuality === 'unavailable'
+                      ? 'Sin datos individuales suficientes'
+                      : 'Estimación posicional'}
+                </span>
+                {currentPlayer.statsOriginNote && (
+                  <span className="text-[11px] text-slate-400">
+                    {currentPlayer.statsOriginNote}
+                  </span>
+                )}
+              </div>
               {currentPlayer.injuryNote && (
                 <p className="text-xs text-amber-300 mt-0.5">{currentPlayer.injuryNote}</p>
               )}
@@ -211,12 +233,14 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
                   </span>
                 </div>
                 <span className="text-slate-400 font-mono tabular-nums">
-                  {new Date(currentPlayer.latestNews.publishedAt).toLocaleString('es-ES', {
-                    day: '2-digit',
-                    month: 'short',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}
+                  {currentPlayer.latestNews.publishedAt
+                    ? new Date(currentPlayer.latestNews.publishedAt).toLocaleString('es-ES', {
+                        day: '2-digit',
+                        month: 'short',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : 'Fecha no publicada por la fuente'}
                 </span>
               </div>
               <p className="text-slate-300 leading-relaxed">{currentPlayer.latestNews.summary}</p>
@@ -334,29 +358,35 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
               </div>
             </div>
 
-            <div className="h-32 flex items-end gap-3 pt-4">
-              {currentPlayer.recentLogs.map((log, i) => {
-                const val = log.stats[trendStat] ?? 0;
-                const hPct = Math.max(6, (val / maxLogVal) * 100);
-                return (
-                  <div key={i} className="flex-1 flex flex-col items-center justify-end h-full">
-                    <span className="text-xs font-mono tabular-nums font-semibold text-slate-200 mb-1">
-                      {val}
-                    </span>
-                    <div
-                      style={{ height: `${hPct}%` }}
-                      className="w-full max-w-[44px] rounded-t bg-blue-500/80"
-                    />
-                    <span className="text-[11px] font-mono text-slate-400 mt-1.5">
-                      {log.isHome ? 'vs' : '@'} {log.opponent}
-                    </span>
-                    <span className="text-[10px] font-mono tabular-nums text-slate-500">
-                      {log.minutes}&apos;
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+            {currentPlayer.recentLogs.length === 0 ? (
+              <p className="text-xs text-slate-400 py-4 text-center">
+                La fuente actual no publica logs individuales de últimos partidos para este jugador.
+              </p>
+            ) : (
+              <div className="h-32 flex items-end gap-3 pt-4">
+                {currentPlayer.recentLogs.map((log, i) => {
+                  const val = log.stats[trendStat] ?? 0;
+                  const hPct = Math.max(6, (val / maxLogVal) * 100);
+                  return (
+                    <div key={i} className="flex-1 flex flex-col items-center justify-end h-full">
+                      <span className="text-xs font-mono tabular-nums font-semibold text-slate-200 mb-1">
+                        {val}
+                      </span>
+                      <div
+                        style={{ height: `${hPct}%` }}
+                        className="w-full max-w-[44px] rounded-t bg-blue-500/80"
+                      />
+                      <span className="text-[11px] font-mono text-slate-400 mt-1.5">
+                        {log.isHome ? 'vs' : '@'} {log.opponent}
+                      </span>
+                      <span className="text-[10px] font-mono tabular-nums text-slate-500">
+                        {log.minutes}&apos;
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>

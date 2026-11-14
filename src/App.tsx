@@ -5,7 +5,6 @@ import {
   History,
   LayoutGrid,
   RefreshCw,
-  Scale,
   Search,
   Settings,
   Trophy,
@@ -25,15 +24,13 @@ import type {
 import { SANDBOX_MATCHES, SANDBOX_STANDINGS, INITIAL_PREDICTION_HISTORY } from './data/sandboxData.ts';
 import { computeFootballMatchPrediction } from './engine/footballModel.ts';
 import { computeNbaMatchPrediction } from './engine/nbaModel.ts';
-import { evaluateMatchOddsDiscrepancies } from './engine/oddsEngine.ts';
 import { MatchDetailView } from './components/MatchDetailView.tsx';
-import { OddsErrorDetector } from './components/OddsErrorDetector.tsx';
 import { StandingsView } from './components/StandingsView.tsx';
 import { HistoryEvaluationView } from './components/HistoryEvaluationView.tsx';
 import { ApiConfigView } from './components/ApiConfigView.tsx';
 import { PlayerDetailModal } from './components/PlayerDetailModal.tsx';
 
-type NavSection = 'overview' | 'matches' | 'odds' | 'history' | 'settings';
+type NavSection = 'overview' | 'matches' | 'history' | 'settings';
 type DataMode = 'live' | 'offline_sim';
 
 const EMPTY_API_CONFIG: ApiConfigState = {
@@ -46,11 +43,16 @@ const EMPTY_API_CONFIG: ApiConfigState = {
   },
   nba: {
     connected: false,
-    provider: 'basketballapi-net',
+    provider: 'espn-nba',
     maskedKey: null,
     reuseFootballKey: false,
     lastChecked: null,
     error: null,
+  },
+  security: {
+    pinConfigured: false,
+    unlocked: false,
+    envProtected: false,
   },
 };
 
@@ -201,21 +203,6 @@ export default function App() {
     return Array.from(map.values());
   }, [activeMatches, sport, playerOverrides]);
 
-  const topDiscrepanciesPreview = useMemo(() => {
-    const all = activeMatches.flatMap((m) => {
-      const homeOv = m.homePlayers.map((p) => ({
-        ...p,
-        availability: playerOverrides[p.id] ?? p.availability,
-      }));
-      const awayOv = m.awayPlayers.map((p) => ({
-        ...p,
-        availability: playerOverrides[p.id] ?? p.availability,
-      }));
-      return evaluateMatchOddsDiscrepancies(m, homeOv, awayOv);
-    });
-    return all.sort((a, b) => Math.abs(b.edgePct) - Math.abs(a.edgePct)).slice(0, 3);
-  }, [activeMatches, playerOverrides]);
-
   const handleToggleAvailability = (playerId: string, nextStatus: AvailabilityStatus) => {
     setPlayerOverrides((prev) => ({ ...prev, [playerId]: nextStatus }));
   };
@@ -238,12 +225,16 @@ export default function App() {
     }
   };
 
-  const handleResolveHistory = async (id: string, status: 'won' | 'lost') => {
+  const handleResolveHistory = async (
+    id: string,
+    status: 'won' | 'lost',
+    actualValue?: number
+  ) => {
     try {
       const res = await fetch(`/api/history/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status, actualValue }),
       });
       if (res.ok) {
         const updated = (await res.json()) as LoggedPrediction[];
@@ -345,8 +336,13 @@ export default function App() {
       availability: playerOverrides[p.id] ?? p.availability,
     }));
     const fbPred =
-      m.sport === 'football' ? computeFootballMatchPrediction(m, homeOv, awayOv) : null;
-    const nbaPred = m.sport === 'nba' ? computeNbaMatchPrediction(m, homeOv, awayOv) : null;
+      m.sport === 'football'
+        ? computeFootballMatchPrediction(m, homeOv, awayOv, historyItems)
+        : null;
+    const nbaPred =
+      m.sport === 'nba'
+        ? computeNbaMatchPrediction(m, homeOv, awayOv, historyItems)
+        : null;
 
     const statusLabel =
       m.status === 'live'
@@ -380,7 +376,11 @@ export default function App() {
               : m.lineupStatus === 'provisional'
               ? 'Alineación probable'
               : 'Alineación por confirmar'}
-            {m.odds.length > 0 ? ` · ${m.odds.length} cuotas` : ''}
+            {fbPred
+              ? ` · Cob. ${fbPred.dataConfidence}%`
+              : nbaPred
+                ? ` · Cob. ${nbaPred.dataConfidence}%`
+                : ''}
           </span>
           <span
             className={`font-mono tabular-nums font-medium ${
@@ -475,7 +475,7 @@ export default function App() {
           Sin conexión API configurada para {sport === 'football' ? 'Fútbol' : 'NBA'}
         </h3>
         <p className="text-xs text-slate-400 leading-relaxed">
-          SportAnalytics AI nunca inventa resultados ni cuotas reales. Introduce tu clave API en Configuración de APIs para cargar partidos en directo, o utiliza el Simulador Matemático Offline para probar los modelos, el campo interactivo y los deslizadores Over/Under.
+          SportAnalytics AI nunca inventa resultados ni estadísticas reales. Introduce tu clave API en Configuración de APIs para cargar partidos en directo, o utiliza el Simulador Matemático Offline para probar los modelos, el campo interactivo y los deslizadores Over/Under.
         </p>
       </div>
       <div className="flex flex-wrap items-center justify-center gap-3">
@@ -517,13 +517,12 @@ export default function App() {
             SportAnalytics AI
           </button>
 
-          {/* Zone 2: 4 concise single-line navigation links */}
+          {/* Zone 2: Concise single-line navigation links */}
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-300">
             {(
               [
                 { id: 'overview', label: 'Resumen' },
                 { id: 'matches', label: 'Partidos' },
-                { id: 'odds', label: 'Errores Cuota' },
                 { id: 'history', label: 'Historial' },
               ] as const
             ).map((nav) => (
@@ -661,7 +660,7 @@ export default function App() {
         {dataMode === 'offline_sim' && section !== 'settings' && (
           <div className="rounded-xl border border-slate-800 bg-[#0D1526] px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
             <span className="text-slate-300">
-              Modo Simulador Offline activo · Escenario de verificación matemática para probar modelos, campo/pista, bajas y deslizadores Over/Under (no son cuotas ni eventos en directo).
+              Modo Simulador Offline activo · Escenario de verificación matemática para probar modelos, campo/pista, bajas y deslizadores Over/Under (no son eventos en directo).
             </span>
             <button
               type="button"
@@ -789,54 +788,6 @@ export default function App() {
               )}
             </section>
 
-            {/* Top Discrepancies Preview */}
-            {topDiscrepanciesPreview.length > 0 && (
-              <section className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-bold text-white">
-                    Mayores discrepancias modelo vs cuota
-                  </h2>
-                  <button
-                    type="button"
-                    onClick={() => setSection('odds')}
-                    className="text-xs font-semibold text-blue-400 hover:text-blue-300 cursor-pointer"
-                  >
-                    Abrir Detector Completo →
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {topDiscrepanciesPreview.map((d) => (
-                    <button
-                      key={d.id}
-                      type="button"
-                      onClick={() => setSection('odds')}
-                      className="text-left rounded-xl border border-slate-800 bg-[#0D1526] hover:border-blue-500/40 p-4 space-y-2 cursor-pointer"
-                    >
-                      <div className="flex items-center justify-between text-xs text-slate-400">
-                        <span className="truncate">{d.matchLabel}</span>
-                        <span
-                          className={`font-mono tabular-nums font-bold ${
-                            d.edgePct >= 0 ? 'text-emerald-400' : 'text-amber-300'
-                          }`}
-                        >
-                          {d.edgePct >= 0 ? `+${d.edgePct.toFixed(1)}%` : `${d.edgePct.toFixed(1)}%`}
-                        </span>
-                      </div>
-                      <div className="text-sm font-bold text-white truncate">
-                        {d.selectionLabel}
-                      </div>
-                      <div className="text-xs font-mono tabular-nums text-slate-300">
-                        Cuota {d.availableOdds.toFixed(2)} · Modelo{' '}
-                        {(d.modelProbability * 100).toFixed(1)}% (justa{' '}
-                        {d.modelFairOdds.toFixed(2)})
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-
             {/* Standings Preview */}
             <StandingsView sport={sport} standings={activeStandings} />
           </div>
@@ -847,6 +798,7 @@ export default function App() {
           (selectedMatch ? (
             <MatchDetailView
               match={selectedMatch}
+              historyItems={historyItems}
               playerOverrides={playerOverrides}
               onToggleAvailability={handleToggleAvailability}
               onRefreshNbaNews={handleRefreshNbaNews}
@@ -869,7 +821,7 @@ export default function App() {
                     </span>
                   </div>
                   <p className="text-sm text-slate-400 mt-1">
-                    Selecciona cualquier encuentro para abrir su resumen, análisis L5/L10/L15, jugadores, H2H y cuotas.
+                    Selecciona cualquier encuentro para abrir su resumen, análisis L5/L10/L15, jugadores, alineaciones y H2H.
                   </p>
                 </div>
 
@@ -960,16 +912,7 @@ export default function App() {
             </div>
           ))}
 
-        {/* VIEW 4: ODDS ERROR DETECTOR */}
-        {section === 'odds' && (
-          <OddsErrorDetector
-            matches={activeMatches}
-            playerOverrides={playerOverrides}
-            onOpenMatch={openMatchAnalysis}
-          />
-        )}
-
-        {/* VIEW 5: HISTORY & EVALUATION */}
+        {/* VIEW 3: HISTORY & CALIBRATION */}
         {section === 'history' && (
           <HistoryEvaluationView
             predictions={historyItems}
@@ -977,7 +920,7 @@ export default function App() {
           />
         )}
 
-        {/* VIEW 6: API SETTINGS */}
+        {/* VIEW 4: API SETTINGS */}
         {section === 'settings' && (
           <ApiConfigView
             config={apiConfig}
@@ -1007,14 +950,13 @@ export default function App() {
 
       {/* iPhone Thumb-Zone Fixed Bottom Tab Bar */}
       <nav
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-15 pb-safe bg-[#070B14]/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-5 items-center"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-15 pb-safe bg-[#070B14]/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-4 items-center"
         aria-label="Navegación móvil"
       >
         {(
           [
             { id: 'overview', label: 'Resumen', icon: LayoutGrid },
             { id: 'matches', label: 'Partidos', icon: Calendar },
-            { id: 'odds', label: 'Cuotas', icon: Scale },
             { id: 'history', label: 'Historial', icon: History },
             { id: 'settings', label: 'Config.', icon: Settings },
           ] as const

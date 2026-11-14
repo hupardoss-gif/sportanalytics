@@ -1,5 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import type { AvailabilityStatus, MatchRecord, PlayerNewsItem, PlayerProfile } from '../src/types/sports.ts';
+import { fetchWithTimeout } from './httpUtils.ts';
 
 type AnyObj = Record<string, unknown>;
 
@@ -13,7 +14,7 @@ export interface ParsedInjuryRecord {
   statusTag: string;
   confirmed: boolean;
   source: string;
-  publishedAt: string;
+  publishedAt?: string;
   headline: string;
   summary: string;
   url?: string;
@@ -36,7 +37,7 @@ let rssCache: {
     source: string;
     title: string;
     summary: string;
-    publishedAt: string;
+    publishedAt?: string;
     url?: string;
   }>;
 } | null = null;
@@ -46,8 +47,19 @@ export function normalizeNbaName(name: string): string {
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
+    .replace(/\b(jr|sr|ii|iii|iv)\b\.?/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
+}
+
+export function parseValidPublishedAt(raw: unknown): string | undefined {
+  if (raw === null || raw === undefined) return undefined;
+  const s = String(raw).trim();
+  if (!s) return undefined;
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) return undefined;
+  return new Date(ms).toISOString();
 }
 
 function decodeXml(raw: string): string {
@@ -177,10 +189,13 @@ export async function fetchOfficialNbaInjuriesFeed(forceRefresh = false): Promis
 
   const byTeamId = new Map<string, ParsedInjuryRecord[]>();
   const all: ParsedInjuryRecord[] = [];
-  const nowIso = new Date().toISOString();
 
   try {
-    const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries');
+    const res = await fetchWithTimeout(
+      'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries',
+      undefined,
+      9000
+    );
     if (!res.ok) return { byTeamId, all };
     const json = (await res.json()) as { injuries?: AnyObj[] };
 
@@ -215,7 +230,8 @@ export async function fetchOfficialNbaInjuriesFeed(forceRefresh = false): Promis
         const source = rawSource
           ? `Parte médico NBA · ${rawSource}`
           : 'Parte oficial de lesiones NBA (ESPN)';
-        const publishedAt = String(noteItem?.date ?? inj.date ?? nowIso);
+        // Strictly parse real upstream timestamp; NEVER fabricate current time
+        const publishedAt = parseValidPublishedAt(noteItem?.date ?? inj.date);
         const links = (athlete.links as AnyObj[] | undefined) ?? [];
         const webLink = links.find((l) => Array.isArray(l.rel) && l.rel.includes('player'))?.href;
 
@@ -267,14 +283,14 @@ async function fetchLeagueRssNews(forceRefresh = false) {
     source: string;
     title: string;
     summary: string;
-    publishedAt: string;
+    publishedAt?: string;
     url?: string;
   }> = [];
 
   await Promise.all(
     feeds.map(async (f) => {
       try {
-        const res = await fetch(f.url);
+        const res = await fetchWithTimeout(f.url, undefined, 8000);
         if (!res.ok) return;
         const xml = await res.text();
         const itemBlocks = xml.match(/<item\b[\s\S]*?<\/item>/gi) ?? [];
@@ -286,11 +302,7 @@ async function fetchLeagueRssNews(forceRefresh = false) {
           const title = decodeXml(titleRaw);
           const summary = decodeXml(descRaw) || title;
           if (!title) continue;
-          const parsedDate = pubRaw ? new Date(decodeXml(pubRaw)) : null;
-          const publishedAt =
-            parsedDate && !Number.isNaN(parsedDate.getTime())
-              ? parsedDate.toISOString()
-              : new Date().toISOString();
+          const publishedAt = parseValidPublishedAt(decodeXml(pubRaw));
           collected.push({
             source: f.source,
             title,
@@ -355,7 +367,6 @@ export async function fetchNbaExternalNews(params: {
     items.push(item);
   };
 
-  // 1. Official Injury Report records (Confirmed official designations)
   for (const inj of injuriesForMatch) {
     const teamTag = inj.teamId === homeEspnId ? homeShort : awayShort;
     pushUnique({
@@ -374,21 +385,35 @@ export async function fetchNbaExternalNews(params: {
     });
   }
 
-  // 2. ESPN Team News + Yahoo/CBS RSS
   const [homeNewsRes, awayNewsRes, rssItems] = await Promise.all([
-    fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news?team=${homeEspnId}&limit=8`)
-      .then((r) => (r.ok ? r.json() : {}))
-      .catch(() => ({})) as Promise<{ articles?: AnyObj[] }>,
-    fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news?team=${awayEspnId}&limit=8`)
-      .then((r) => (r.ok ? r.json() : {}))
-      .catch(() => ({})) as Promise<{ articles?: AnyObj[] }>,
+    homeEspnId
+      ? fetchWithTimeout(
+          `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news?team=${homeEspnId}&limit=8`,
+          undefined,
+          8000
+        )
+          .then((r) => (r.ok ? r.json() : {}))
+          .catch(() => ({})) as Promise<{ articles?: AnyObj[] }>
+      : Promise.resolve({} as { articles?: AnyObj[] }),
+    awayEspnId
+      ? fetchWithTimeout(
+          `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/news?team=${awayEspnId}&limit=8`,
+          undefined,
+          8000
+        )
+          .then((r) => (r.ok ? r.json() : {}))
+          .catch(() => ({})) as Promise<{ articles?: AnyObj[] }>
+      : Promise.resolve({} as { articles?: AnyObj[] }),
     fetchLeagueRssNews(forceRefresh),
   ]);
 
   const buildTeamKeywords = (full: string): string[] => {
+    const genericGeo = new Set([
+      'los', 'angeles', 'new', 'york', 'golden', 'state', 'san', 'antonio', 'oklahoma', 'city', 'portland',
+    ]);
     const tokens = normalizeNbaName(full)
       .split(' ')
-      .filter((t) => t.length >= 4 && !['los', 'angeles', 'new', 'york', 'golden', 'state', 'san', 'antonio', 'oklahoma', 'city', 'portland'].includes(t));
+      .filter((t) => t.length >= 4 && !genericGeo.has(t));
     const fullNorm = normalizeNbaName(full);
     return Array.from(new Set([fullNorm, ...tokens])).filter(Boolean);
   };
@@ -398,14 +423,15 @@ export async function fetchNbaExternalNews(params: {
   const playerTokens = playerNames.map((n) => ({
     raw: n,
     norm: normalizeNbaName(n),
-    last: normalizeNbaName(n).split(' ').slice(-1)[0] || '',
   }));
 
   const findMatchedPlayers = (text: string): string[] => {
-    const nt = normalizeNbaName(text);
+    const nt = ` ${normalizeNbaName(text)} `;
     const hits: string[] = [];
     for (const p of playerTokens) {
-      if (p.norm && nt.includes(p.norm)) hits.push(p.raw);
+      if (p.norm && p.norm.length >= 5 && nt.includes(` ${p.norm} `)) {
+        hits.push(p.raw);
+      }
     }
     return hits;
   };
@@ -426,17 +452,17 @@ export async function fetchNbaExternalNews(params: {
 
       const lower = combined.toLowerCase();
       const statusTag = lower.includes('out') || lower.includes('ruled out')
-        ? 'Posible baja'
+        ? 'Posible baja (Prensa)'
         : lower.includes('day-to-day') || lower.includes('questionable') || lower.includes('doubtful')
-          ? 'En duda'
+          ? 'En duda (Prensa)'
           : lower.includes('start') || lower.includes('lineup')
             ? 'Rotación / Quinteto'
-            : 'Noticia equipo';
+            : 'Prensa equipo';
 
       pushUnique({
         id: `espn-art-${String(art.id ?? headline.slice(0, 20))}`,
         source: 'ESPN NBA News',
-        publishedAt: String(art.published ?? new Date().toISOString()),
+        publishedAt: parseValidPublishedAt(art.published),
         headline,
         summary: desc || headline,
         url: String(((art.links as AnyObj | undefined)?.web as AnyObj | undefined)?.href ?? '') || undefined,
@@ -452,9 +478,9 @@ export async function fetchNbaExternalNews(params: {
   ingestEspnTeamArticles(awayNewsRes.articles, awayShort);
 
   for (const r of rssItems) {
-    const textNorm = normalizeNbaName(`${r.title} ${r.summary}`);
-    const hitsHome = homeKeys.some((k) => textNorm.includes(k));
-    const hitsAway = awayKeys.some((k) => textNorm.includes(k));
+    const textNorm = ` ${normalizeNbaName(`${r.title} ${r.summary}`)} `;
+    const hitsHome = homeKeys.some((k) => textNorm.includes(` ${k} `));
+    const hitsAway = awayKeys.some((k) => textNorm.includes(` ${k} `));
     const matchedPlayers = findMatchedPlayers(`${r.title} ${r.summary}`);
     if (!hitsHome && !hitsAway && matchedPlayers.length === 0) continue;
 
@@ -468,11 +494,15 @@ export async function fetchNbaExternalNews(params: {
       confirmed: false,
       playerNames: matchedPlayers,
       teamShort: hitsHome && !hitsAway ? homeShort : hitsAway && !hitsHome ? awayShort : undefined,
-      statusTag: 'Prensa deportiva',
+      statusTag: 'Prensa / Rumor',
     });
   }
 
-  items.sort((a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime());
+  items.sort((a, b) => {
+    const ta = a.publishedAt ? Date.parse(a.publishedAt) : 0;
+    const tb = b.publishedAt ? Date.parse(b.publishedAt) : 0;
+    return tb - ta;
+  });
 
   return {
     items: items.slice(0, 18),
@@ -536,7 +566,7 @@ Identify ONLY verified updates from web search results regarding:
 - Players ruled out, resting (load management), suspended, doubtful, questionable, or probable
 - Minutes restrictions / limits
 - Distinguish clearly between official confirmed reports ("confirmed": true) vs beat writer rumors ("confirmed": false).
-Do NOT invent any player status or news if not found in search results.
+Do NOT invent any player status, confirmation, or publication date if not explicitly found in search results (omit publishedAt or set null if unknown).
 
 Respond with a single JSON object (no markdown fences) with schema:
 {
@@ -547,7 +577,7 @@ Respond with a single JSON object (no markdown fences) with schema:
       "confirmed": boolean,
       "minutesLimit": number | null,
       "source": "Source name",
-      "publishedAt": "ISO timestamp or date string",
+      "publishedAt": "ISO timestamp or null if not published",
       "summary": "Brief concise summary in Spanish of the verified report"
     }
   ]
@@ -580,7 +610,12 @@ Respond with a single JSON object (no markdown fences) with schema:
       try {
         const parsed = JSON.parse(jsonMatch[0]) as { findings?: NbaGroundingResult['findings'] };
         if (Array.isArray(parsed.findings)) {
-          findings = parsed.findings.filter((f) => f && f.playerName && f.summary);
+          findings = parsed.findings
+            .filter((f) => f && f.playerName && f.summary)
+            .map((f) => ({
+              ...f,
+              publishedAt: parseValidPublishedAt(f.publishedAt),
+            }));
         }
       } catch {
         // Fallback: keep citations if JSON wasn't strictly formatted
@@ -654,6 +689,9 @@ export function applyNewsAndInjuriesToNbaPlayers(
     } else if (nextAvailability === 'bench') {
       nextAvailability = 'available';
       confidence = lineupConfirmed ? 'confirmed' : 'projected';
+    } else if (playerArticle && !playerArticle.confirmed && confidence !== 'confirmed') {
+      // Attach rumor context without promoting unverified media to confirmed status
+      confidence = 'rumor';
     }
 
     const latestNews = inj

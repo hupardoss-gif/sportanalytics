@@ -18,8 +18,6 @@ import {
 } from './server/liveAdapters.ts';
 import {
   fetchEspnNbaCalendarAndStandings,
-  fetchTheOddsApiForSport,
-  mergeRealOddsIntoMatches,
   teamsMatch,
 } from './server/espnAdapters.ts';
 import {
@@ -27,8 +25,17 @@ import {
   fetchNbaExternalNews,
   fetchOfficialNbaInjuriesFeed,
   normalizeNbaName,
+  parseValidPublishedAt,
   queryGeminiNbaSearchGrounding,
 } from './server/nbaIntelligence.ts';
+import {
+  createRequireConfigAdmin,
+  decryptVaultSecret,
+  encryptVaultSecret,
+  isConfigRequestAuthorized,
+  registerConfigAuthRoutes,
+} from './server/configSecurity.ts';
+import { fetchWithTimeout, writeFileAtomic } from './server/httpUtils.ts';
 
 dotenv.config();
 
@@ -56,9 +63,9 @@ interface StoredSportConfig {
 }
 
 interface StoredVault {
+  adminPinHash?: string;
   football: StoredSportConfig;
   nba: StoredSportConfig & { reuseFootballKey: boolean };
-  odds: StoredSportConfig;
 }
 
 const DEFAULT_VAULT: StoredVault = {
@@ -79,14 +86,6 @@ const DEFAULT_VAULT: StoredVault = {
     accountInfo: null,
     error: null,
   },
-  odds: {
-    provider: 'the-odds-api',
-    apiKey: '',
-    connected: false,
-    lastChecked: null,
-    accountInfo: null,
-    error: null,
-  },
 };
 
 function maskKey(key: string): string | null {
@@ -98,10 +97,12 @@ async function readVault(): Promise<StoredVault> {
   try {
     const raw = await fs.readFile(VAULT_PATH, 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoredVault>;
+    const fbKey = await decryptVaultSecret(parsed.football?.apiKey ?? '');
+    const nbaKey = await decryptVaultSecret(parsed.nba?.apiKey ?? '');
     return {
-      football: { ...DEFAULT_VAULT.football, ...(parsed.football ?? {}) },
-      nba: { ...DEFAULT_VAULT.nba, ...(parsed.nba ?? {}) },
-      odds: { ...DEFAULT_VAULT.odds, ...(parsed.odds ?? {}) },
+      adminPinHash: typeof parsed.adminPinHash === 'string' ? parsed.adminPinHash : undefined,
+      football: { ...DEFAULT_VAULT.football, ...(parsed.football ?? {}), apiKey: fbKey },
+      nba: { ...DEFAULT_VAULT.nba, ...(parsed.nba ?? {}), apiKey: nbaKey },
     };
   } catch {
     return structuredClone(DEFAULT_VAULT);
@@ -109,15 +110,27 @@ async function readVault(): Promise<StoredVault> {
 }
 
 async function writeVault(vault: StoredVault): Promise<void> {
-  await fs.writeFile(VAULT_PATH, JSON.stringify(vault, null, 2), 'utf8');
+  const encryptedPayload: StoredVault = {
+    adminPinHash: vault.adminPinHash,
+    football: {
+      ...vault.football,
+      apiKey: await encryptVaultSecret(vault.football.apiKey),
+    },
+    nba: {
+      ...vault.nba,
+      apiKey: await encryptVaultSecret(vault.nba.apiKey),
+    },
+  };
+  await writeFileAtomic(VAULT_PATH, JSON.stringify(encryptedPayload, null, 2), 0o600);
 }
 
-function toPublicConfig(vault: StoredVault): ApiConfigState {
+async function toPublicConfig(vault: StoredVault, req?: express.Request): Promise<ApiConfigState> {
   const effectiveNbaKey = vault.nba.reuseFootballKey
     ? vault.football.apiKey
     : vault.nba.apiKey;
   const fbZeroKey = vault.football.provider === 'espn-football';
   const nbaZeroKey = vault.nba.provider === 'espn-nba';
+  const unlocked = req ? await isConfigRequestAuthorized(req, vault) : false;
 
   return {
     football: {
@@ -137,50 +150,48 @@ function toPublicConfig(vault: StoredVault): ApiConfigState {
       accountInfo: vault.nba.accountInfo,
       error: vault.nba.error,
     },
-    odds: {
-      connected: vault.odds.connected && Boolean(vault.odds.apiKey),
-      provider: vault.odds.provider,
-      maskedKey: maskKey(vault.odds.apiKey),
-      lastChecked: vault.odds.lastChecked,
-      accountInfo: vault.odds.accountInfo,
-      error: vault.odds.error,
+    security: {
+      pinConfigured: Boolean(vault.adminPinHash),
+      unlocked,
+      envProtected: Boolean(process.env.CONFIG_ADMIN_KEY?.trim()),
     },
   };
 }
 
 async function testProviderConnection(
-  sport: 'football' | 'nba' | 'odds',
+  sport: 'football' | 'nba',
   provider: string,
   apiKey: string
 ): Promise<{ ok: boolean; accountInfo: string | null; error: string | null }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-
   try {
     if (provider === 'espn-football') {
-      const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard', {
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard',
+        undefined,
+        9000
+      );
       if (!res.ok) {
         return { ok: false, accountInfo: null, error: `ESPN Soccer devolvió HTTP ${res.status}` };
       }
       return {
         ok: true,
-        accountInfo: 'ESPN Soccer Oficial + DraftKings · 8 competiciones (incl. Europa y Conference League)',
+        accountInfo: 'ESPN Soccer Oficial · Ligas europeas y competiciones UEFA (calendario y clasificaciones)',
         error: null,
       };
     }
 
     if (provider === 'espn-nba') {
-      const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', {
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
+        undefined,
+        9000
+      );
       if (!res.ok) {
         return { ok: false, accountInfo: null, error: `ESPN NBA devolvió HTTP ${res.status}` };
       }
       return {
         ok: true,
-        accountInfo: 'ESPN NBA Oficial + Cuotas DraftKings · Calendario, lesiones, clasificaciones y game logs',
+        accountInfo: 'ESPN NBA Oficial · Calendario, lesiones oficiales, clasificaciones y game logs',
         error: null,
       };
     }
@@ -188,11 +199,13 @@ async function testProviderConnection(
     if (!apiKey.trim()) {
       return { ok: false, accountInfo: null, error: 'Introduce una clave API válida antes de comprobar.' };
     }
+
     if (provider === 'api-football' || (sport === 'football' && provider === 'api-sports')) {
-      const res = await fetch('https://v3.football.api-sports.io/status', {
-        headers: { 'x-apisports-key': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://v3.football.api-sports.io/status',
+        { headers: { 'x-apisports-key': apiKey.trim() } },
+        9000
+      );
       const json = (await res.json().catch(() => ({}))) as {
         errors?: Record<string, string> | string[];
         response?: { account?: { email?: string }; subscription?: { plan?: string; active?: boolean }; requests?: { current?: number; limit_day?: number } };
@@ -214,10 +227,11 @@ async function testProviderConnection(
     }
 
     if (provider === 'football-data') {
-      const res = await fetch('https://api.football-data.org/v4/competitions', {
-        headers: { 'X-Auth-Token': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://api.football-data.org/v4/competitions',
+        { headers: { 'X-Auth-Token': apiKey.trim() } },
+        9000
+      );
       if (!res.ok) {
         return {
           ok: false,
@@ -238,10 +252,11 @@ async function testProviderConnection(
         provider === 'api-nba'
           ? 'https://v2.nba.api-sports.io/status'
           : 'https://v1.basketball.api-sports.io/status';
-      const res = await fetch(url, {
-        headers: { 'x-apisports-key': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        url,
+        { headers: { 'x-apisports-key': apiKey.trim() } },
+        9000
+      );
       const json = (await res.json().catch(() => ({}))) as {
         errors?: Record<string, string> | string[];
         response?: { subscription?: { plan?: string }; requests?: { current?: number; limit_day?: number } };
@@ -270,10 +285,11 @@ async function testProviderConnection(
       const token = apiKey.trim().replace(/^Bearer\s+/i, '');
       const headers = { Authorization: `Bearer ${token}` };
 
-      const compRes = await fetch('https://api.basketballapi.net/v1/competitions', {
-        headers,
-        signal: controller.signal,
-      });
+      const compRes = await fetchWithTimeout(
+        'https://api.basketballapi.net/v1/competitions',
+        { headers },
+        9000
+      );
 
       if (compRes.status === 401) {
         return {
@@ -297,11 +313,11 @@ async function testProviderConnection(
         };
       }
 
-      // Fallback check on /v1/results/yesterday (included in Free tier)
-      const yestRes = await fetch('https://api.basketballapi.net/v1/results/yesterday', {
-        headers,
-        signal: controller.signal,
-      });
+      const yestRes = await fetchWithTimeout(
+        'https://api.basketballapi.net/v1/results/yesterday',
+        { headers },
+        9000
+      );
       if (yestRes.ok) {
         return {
           ok: true,
@@ -319,10 +335,11 @@ async function testProviderConnection(
     }
 
     if (provider === 'balldontlie') {
-      const res = await fetch('https://api.balldontlie.io/v1/teams', {
-        headers: { Authorization: apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://api.balldontlie.io/v1/teams',
+        { headers: { Authorization: apiKey.trim() } },
+        9000
+      );
       if (!res.ok) {
         return {
           ok: false,
@@ -333,68 +350,65 @@ async function testProviderConnection(
       return { ok: true, accountInfo: 'BallDontLie NBA v1 · Conexión verificada', error: null };
     }
 
-    if (provider === 'the-odds-api') {
-      const res = await fetch(
-        `https://api.the-odds-api.com/v4/sports/?apiKey=${encodeURIComponent(apiKey.trim())}`,
-        { signal: controller.signal }
-      );
-      if (!res.ok) {
-        return {
-          ok: false,
-          accountInfo: null,
-          error: `The Odds API devolvió HTTP ${res.status}. Verifica tu API key.`,
-        };
-      }
-      const remaining = res.headers.get('x-requests-remaining');
-      return {
-        ok: true,
-        accountInfo: `The Odds API v4 · Cuotas en vivo${remaining ? ` · ${remaining} créditos restantes` : ''}`,
-        error: null,
-      };
-    }
-
     return { ok: false, accountInfo: null, error: `Proveedor no reconocido: ${provider}` };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error de red desconocido';
     return { ok: false, accountInfo: null, error: `No se pudo contactar con el proveedor: ${message}` };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
+function sanitizeHistoryList(rawList: unknown[]): LoggedPrediction[] {
+  return rawList
+    .filter((x): x is Record<string, unknown> => Boolean(x && typeof x === 'object'))
+    .map((x) => {
+      const copy = { ...x };
+      delete copy.bookmakerOdds;
+      return copy as unknown as LoggedPrediction;
+    });
+}
 
 async function readHistory(): Promise<LoggedPrediction[]> {
   try {
     const raw = await fs.readFile(HISTORY_PATH, 'utf8');
-    return JSON.parse(raw) as LoggedPrediction[];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return sanitizeHistoryList(parsed);
   } catch {
-    await fs.writeFile(HISTORY_PATH, JSON.stringify(INITIAL_PREDICTION_HISTORY, null, 2), 'utf8');
+    await writeFileAtomic(HISTORY_PATH, JSON.stringify(INITIAL_PREDICTION_HISTORY, null, 2), 0o600);
     return INITIAL_PREDICTION_HISTORY;
   }
 }
 
 async function writeHistory(items: LoggedPrediction[]): Promise<void> {
-  await fs.writeFile(HISTORY_PATH, JSON.stringify(items, null, 2), 'utf8');
+  await writeFileAtomic(HISTORY_PATH, JSON.stringify(items, null, 2), 0o600);
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // 1. API Vault Configuration Routes (Server-side secret protection)
-  app.get('/api/config/apis', async (_req, res) => {
+  const requireConfigAdmin = createRequireConfigAdmin(readVault);
+
+  // 1. Config Auth & API Vault Configuration Routes (Server-side secret protection)
+  registerConfigAuthRoutes(app, readVault, writeVault);
+
+  app.get('/api/config/apis', async (req, res) => {
     const vault = await readVault();
-    res.json(toPublicConfig(vault));
+    res.json(await toPublicConfig(vault, req));
   });
 
-  app.post('/api/config/apis', async (req, res) => {
+  app.post('/api/config/apis', requireConfigAdmin, async (req, res) => {
     try {
       const { sport, provider, apiKey, reuseFootballKey } = req.body as {
-        sport: 'football' | 'nba' | 'odds';
+        sport: 'football' | 'nba';
         provider?: string;
         apiKey?: string;
         reuseFootballKey?: boolean;
       };
+
+      if (sport !== 'football' && sport !== 'nba') {
+        return res.status(400).json({ error: 'Deporte no válido; solo se admite football o nba.' });
+      }
 
       const vault = await readVault();
       const now = new Date().toISOString();
@@ -414,7 +428,6 @@ async function startServer() {
         vault.football.error = test.error;
         vault.football.lastChecked = now;
 
-        // If NBA is configured to reuse Football key, re-check NBA too
         if (vault.nba.reuseFootballKey && vault.football.apiKey) {
           const nbaTest = await testProviderConnection(
             'nba',
@@ -426,7 +439,7 @@ async function startServer() {
           vault.nba.error = nbaTest.error;
           vault.nba.lastChecked = now;
         }
-      } else if (sport === 'nba') {
+      } else {
         if (provider) vault.nba.provider = provider;
         if (typeof reuseFootballKey === 'boolean') {
           vault.nba.reuseFootballKey = reuseFootballKey;
@@ -442,57 +455,45 @@ async function startServer() {
         vault.nba.accountInfo = test.accountInfo;
         vault.nba.error = test.error;
         vault.nba.lastChecked = now;
-      } else if (sport === 'odds') {
-        if (provider) vault.odds.provider = provider;
-        if (typeof apiKey === 'string' && apiKey.trim()) {
-          vault.odds.apiKey = apiKey.trim();
-        }
-        const test = await testProviderConnection('odds', vault.odds.provider, vault.odds.apiKey);
-        vault.odds.connected = test.ok;
-        vault.odds.accountInfo = test.accountInfo;
-        vault.odds.error = test.error;
-        vault.odds.lastChecked = now;
       }
 
       liveCache = null;
       await writeVault(vault);
-      res.json(toPublicConfig(vault));
+      return res.json(await toPublicConfig(vault, req));
     } catch (err) {
-      res.status(500).json({
+      return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error guardando configuración API',
       });
     }
   });
 
-  app.post('/api/config/apis/test', async (req, res) => {
+  app.post('/api/config/apis/test', requireConfigAdmin, async (req, res) => {
     try {
       const { sport, provider, apiKey, reuseFootballKey } = req.body as {
-        sport: 'football' | 'nba' | 'odds';
+        sport: 'football' | 'nba';
         provider?: string;
         apiKey?: string;
         reuseFootballKey?: boolean;
       };
+
+      if (sport !== 'football' && sport !== 'nba') {
+        return res.status(400).json({ error: 'Deporte no válido; solo se admite football o nba.' });
+      }
+
       const vault = await readVault();
       const now = new Date().toISOString();
 
       const targetProvider =
-        provider ??
-        (sport === 'football'
-          ? vault.football.provider
-          : sport === 'nba'
-            ? vault.nba.provider
-            : vault.odds.provider);
+        provider ?? (sport === 'football' ? vault.football.provider : vault.nba.provider);
 
       let targetKey = apiKey?.trim() ?? '';
       if (!targetKey) {
         if (sport === 'football') {
           targetKey = vault.football.apiKey;
-        } else if (sport === 'nba') {
+        } else {
           const useFb =
             typeof reuseFootballKey === 'boolean' ? reuseFootballKey : vault.nba.reuseFootballKey;
           targetKey = useFb ? vault.football.apiKey : vault.nba.apiKey;
-        } else {
-          targetKey = vault.odds.apiKey;
         }
       }
 
@@ -502,28 +503,23 @@ async function startServer() {
         vault.football.accountInfo = result.accountInfo;
         vault.football.error = result.error;
         vault.football.lastChecked = now;
-      } else if (sport === 'nba') {
+      } else {
         vault.nba.connected = result.ok;
         vault.nba.accountInfo = result.accountInfo;
         vault.nba.error = result.error;
         vault.nba.lastChecked = now;
-      } else {
-        vault.odds.connected = result.ok;
-        vault.odds.accountInfo = result.accountInfo;
-        vault.odds.error = result.error;
-        vault.odds.lastChecked = now;
       }
       liveCache = null;
       await writeVault(vault);
-      res.json({ result, config: toPublicConfig(vault) });
+      return res.json({ result, config: await toPublicConfig(vault, req) });
     } catch (err) {
-      res.status(500).json({
+      return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error comprobando conexión API',
       });
     }
   });
 
-  app.delete('/api/config/apis', async (req, res) => {
+  app.delete('/api/config/apis', requireConfigAdmin, async (req, res) => {
     const sport = (req.query.sport as string) || 'all';
     const vault = await readVault();
     if (sport === 'football' || sport === 'all') {
@@ -532,12 +528,9 @@ async function startServer() {
     if (sport === 'nba' || sport === 'all') {
       vault.nba = structuredClone(DEFAULT_VAULT.nba);
     }
-    if (sport === 'odds' || sport === 'all') {
-      vault.odds = structuredClone(DEFAULT_VAULT.odds);
-    }
     liveCache = null;
     await writeVault(vault);
-    res.json(toPublicConfig(vault));
+    res.json(await toPublicConfig(vault, req));
   });
 
   // 2. Live Sports Data Proxy Routes (Multi-day Calendar, Standings & On-Demand Match Hydration)
@@ -547,12 +540,12 @@ async function startServer() {
 
     if (!forceRefresh && liveCache && Date.now() < liveCache.expiresAt) {
       return res.json({
-        config: toPublicConfig(vault),
+        config: await toPublicConfig(vault, req),
         ...liveCache.payload,
       });
     }
 
-    let matches: MatchRecord[] = [];
+    const matches: MatchRecord[] = [];
     const standings: StandingEntry[] = [];
     const errors: string[] = [];
 
@@ -570,13 +563,13 @@ async function startServer() {
       } catch (err) {
         errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de fútbol');
       }
-    } else if (!vault.football.connected) {
-      // Provide public ESPN Soccer calendar + DraftKings odds if no Football API key is configured yet
+    } else {
       try {
         const fbPublic = await fetchFootballCalendarAndStandings('espn-football', '');
         matches.push(...fbPublic.matches);
-      } catch {
-        // Ignore silent fallback error
+        standings.push(...fbPublic.standings);
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : 'Error consultando ESPN Soccer');
       }
     }
 
@@ -593,26 +586,12 @@ async function startServer() {
         errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de NBA');
       }
     } else {
-      // Automatic public ESPN NBA feed so NBA calendar, standings, injuries & DraftKings odds always work
       try {
         const nbaPublic = await fetchNbaCalendarAndStandings('espn-nba', '');
         matches.push(...nbaPublic.matches);
         standings.push(...nbaPublic.standings);
-      } catch {
-        // Ignore silent fallback error
-      }
-    }
-
-    // Optional The Odds API multi-bookmaker enrichment
-    if (vault.odds.connected && vault.odds.apiKey) {
-      try {
-        const [fbOdds, nbaOdds] = await Promise.all([
-          fetchTheOddsApiForSport('football', vault.odds.apiKey),
-          fetchTheOddsApiForSport('nba', vault.odds.apiKey),
-        ]);
-        matches = mergeRealOddsIntoMatches(matches, [...fbOdds, ...nbaOdds]);
-      } catch {
-        // Keep primary odds cleanly if optional Odds API fails
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : 'Error consultando ESPN NBA');
       }
     }
 
@@ -628,7 +607,7 @@ async function startServer() {
     };
 
     res.json({
-      config: toPublicConfig(vault),
+      config: await toPublicConfig(vault, req),
       ...payload,
     });
   });
@@ -781,7 +760,8 @@ async function startServer() {
         sourcesChecked.push('Google Search Grounding (Gemini Web Search)');
         for (const f of grounding.findings ?? []) {
           const normPlayer = normalizeNbaName(f.playerName);
-          const publishedAt = f.publishedAt || nowIso;
+          // Strictly preserve upstream publishedAt without fabricating fallback dates
+          const publishedAt = parseValidPublishedAt(f.publishedAt);
           mergedNewsItems.unshift({
             id: `ground-${normPlayer}-${Date.now()}`,
             source: f.source || 'Google Search Grounding',
@@ -797,6 +777,19 @@ async function startServer() {
           const applyFinding = (list: typeof updatedHomePlayers) =>
             list.map((p) => {
               if (normalizeNbaName(p.name) !== normPlayer) return p;
+              // Never overwrite a confirmed official status with an unconfirmed rumor
+              if (p.availabilityConfidence === 'confirmed' && !f.confirmed) {
+                return {
+                  ...p,
+                  latestNews: {
+                    source: f.source || 'Google Search Grounding',
+                    publishedAt,
+                    summary: f.summary,
+                    url: grounding.citations?.[0]?.url,
+                    confirmed: false,
+                  },
+                };
+              }
               return {
                 ...p,
                 availability: f.status,
@@ -868,7 +861,7 @@ async function startServer() {
 
     try {
       const { contextType, payload } = req.body as {
-        contextType: 'match' | 'player_prop' | 'odds_discrepancy';
+        contextType: 'match' | 'player_prop';
         payload: Record<string, unknown>;
       };
 
@@ -884,16 +877,16 @@ async function startServer() {
       const systemInstruction = `Eres el analista cuantitativo de SportAnalytics AI.
 Reglas estrictas e inquebrantables:
 1. Responde siempre en español claro, técnico y preciso.
-2. Explica ÚNICAMENTE utilizando los números, probabilidades, alineaciones, bajas y discrepancias exactas recibidas en el JSON de entrada.
-3. NUNCA inventes estadísticas, lesiones, cuotas, historiales ni probabilidades independientes.
-4. Señala siempre factores favorables, factores desfavorables, impacto de ausencias/rotaciones y la incertidumbre real del modelo (varianza, muestra, alineaciones provisionales).
-5. Nunca garantices resultados ni presentes una ventaja estadística como apuesta segura.`;
+2. Explica ÚNICAMENTE utilizando los números, probabilidades, alineaciones, bajas y métricas estadísticas exactas recibidas en el JSON de entrada.
+3. NUNCA inventes estadísticas, lesiones, fechas ni probabilidades independientes, y NO hagas referencias a casas de apuestas o cuotas.
+4. Diferencia claramente entre datos verificados, estimaciones posicionales, rumores de prensa e información no disponible.
+5. Señala siempre factores favorables, factores desfavorables, impacto de ausencias/rotaciones y la incertidumbre estadística real del modelo.`;
 
       const prompt = `Tipo de análisis: ${contextType}
 Datos exactos calculados por los modelos matemáticos de SportAnalytics AI:
 ${JSON.stringify(payload, null, 2)}
 
-Genera una explicación estructurada con resumen ejecutivo, factores favorables, factores desfavorables, impacto de disponibilidad/bajas y nota de incertidumbre.`;
+Genera una explicación estructurada con resumen estadístico, factores favorables, factores desfavorables, impacto de disponibilidad/bajas y nota de incertidumbre.`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
@@ -924,7 +917,7 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
               },
               uncertaintyNote: {
                 type: Type.STRING,
-                description: 'Nota sobre varianza, tamaño muestral, margen de casa y fiabilidad.',
+                description: 'Nota sobre varianza, tamaño muestral, calidad de los datos y fiabilidad.',
               },
             },
             required: [
@@ -955,12 +948,20 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
 
   app.post('/api/history', async (req, res) => {
     const items = await readHistory();
-    const entry = req.body as LoggedPrediction;
+    const entry = req.body as Record<string, unknown>;
+    const cleanEntry = { ...entry };
+    delete cleanEntry.bookmakerOdds;
     const next: LoggedPrediction = {
-      ...entry,
-      id: entry.id || `pred-${Date.now()}`,
-      createdAt: entry.createdAt || new Date().toISOString(),
-      status: entry.status || 'pending',
+      ...(cleanEntry as unknown as LoggedPrediction),
+      id: typeof cleanEntry.id === 'string' && cleanEntry.id ? cleanEntry.id : `pred-${Date.now()}`,
+      createdAt:
+        typeof cleanEntry.createdAt === 'string' && cleanEntry.createdAt
+          ? cleanEntry.createdAt
+          : new Date().toISOString(),
+      status:
+        cleanEntry.status === 'won' || cleanEntry.status === 'lost' || cleanEntry.status === 'pending'
+          ? cleanEntry.status
+          : 'pending',
     };
     const updated = [next, ...items];
     await writeHistory(updated);
@@ -979,7 +980,10 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
         ? {
             ...item,
             status,
-            actualValue: actualValue ?? item.actualValue,
+            actualValue:
+              typeof actualValue === 'number' && Number.isFinite(actualValue)
+                ? actualValue
+                : item.actualValue,
             resolvedAt: status === 'pending' ? undefined : new Date().toISOString(),
           }
         : item

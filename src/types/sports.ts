@@ -2,6 +2,8 @@ export type SportType = 'football' | 'nba';
 
 export type MatchStatus = 'live' | 'today' | 'upcoming' | 'finished';
 
+export type DataReliability = 'verified' | 'estimated' | 'unavailable';
+
 export type AvailabilityStatus =
   | 'confirmed_starter'
   | 'possible_starter'
@@ -16,7 +18,7 @@ export type AvailabilityStatus =
 export interface PlayerNewsItem {
   id: string;
   source: string;
-  publishedAt: string;
+  publishedAt?: string;
   headline: string;
   summary: string;
   url?: string;
@@ -104,7 +106,7 @@ export interface PlayerProfile {
   };
   latestNews?: {
     source: string;
-    publishedAt: string;
+    publishedAt?: string;
     summary: string;
     url?: string;
     confirmed: boolean;
@@ -122,6 +124,8 @@ export interface PlayerProfile {
   splits: Record<TimeframeSplit, StatSplitValues>;
   recentLogs: PlayerGameLogEntry[];
   sampleSizeGames: number;
+  statsQuality?: DataReliability;
+  statsOriginNote?: string;
 }
 
 export interface TeamRecentGame {
@@ -144,6 +148,7 @@ export interface TeamInfo {
   awayRecord?: string;
   ppgOrGpg?: number;
   oppgOrGapg?: number;
+  playedGames?: number;
   formRecent: ('W' | 'D' | 'L')[];
   recentGames?: TeamRecentGame[];
   restDays: number;
@@ -173,8 +178,8 @@ export interface BookmakerOdd {
   line?: number;
   side?: 'over' | 'under' | 'home' | 'draw' | 'away' | 'yes' | 'no';
   decimalOdds: number;
-  complementOdds?: number; // Other side odds for 2-way de-vigging
-  threeWayOdds?: [number, number, number]; // For 1X2 de-vigging
+  complementOdds?: number;
+  threeWayOdds?: [number, number, number];
   bookmaker: string;
   updatedAt: string;
 }
@@ -229,6 +234,7 @@ export interface MatchRecord {
     };
     items: PlayerNewsItem[];
   };
+  teamStatsQuality?: DataReliability;
   hydrationStatus?: 'idle' | 'ok' | 'partial' | 'not_published' | 'provider_unavailable' | 'query_error' | 'network_error';
   hydrationNote?: string;
   dataOrigin: string;
@@ -262,6 +268,9 @@ export interface FootballPredictionResult {
   probHome: number;
   probDraw: number;
   probAway: number;
+  rawProbHome: number;
+  rawProbDraw: number;
+  rawProbAway: number;
   over15: number;
   over25: number;
   over35: number;
@@ -275,7 +284,11 @@ export interface FootballPredictionResult {
     probability: number;
   }>;
   absenceImpactSummary: string[];
-  dataConfidence: number; // 0..100
+  dataConfidence: number; // 0..100 (represents data coverage & certainty, NEVER match outcome probability)
+  dataQuality: DataReliability;
+  calibrationApplied: boolean;
+  calibrationNote?: string;
+  modelWarnings: string[];
 }
 
 export interface NbaPredictionResult {
@@ -286,10 +299,16 @@ export interface NbaPredictionResult {
   expectedSpreadHome: number; // Positive means home favored by X
   probHomeWin: number;
   probAwayWin: number;
+  rawProbHomeWin: number;
+  rawProbAwayWin: number;
   spreadStdDev: number;
   totalStdDev: number;
   absenceImpactSummary: string[];
-  dataConfidence: number;
+  dataConfidence: number; // 0..100 (data coverage & certainty, separate from win probability)
+  dataQuality: DataReliability;
+  calibrationApplied: boolean;
+  calibrationNote?: string;
+  modelWarnings: string[];
 }
 
 export interface PropDistributionBin {
@@ -316,36 +335,10 @@ export interface PropProjectionResult {
   expectedMinutes: number;
   absenceAdjustmentPct: number;
   sampleConfidence: number;
+  sampleSizeGames: number;
+  statsQuality: DataReliability;
+  statsOriginNote?: string;
   distribution: PropDistributionBin[];
-}
-
-export interface OddsDiscrepancyItem {
-  id: string;
-  sport: SportType;
-  matchId: string;
-  matchLabel: string;
-  competition: string;
-  kickoffIso: string;
-  playerId?: string;
-  playerName?: string;
-  marketLabel: string;
-  marketCategory: BookmakerOdd['marketCategory'];
-  selectionLabel: string;
-  line?: number;
-  availableOdds: number;
-  bookmaker: string;
-  updatedAt: string;
-  modelProbability: number; // 0..1
-  rawImpliedProbability: number; // 0..1
-  fairImpliedProbability: number; // 0..1 (de-vigged)
-  bookmakerMarginPct: number; // Overround %
-  modelFairOdds: number;
-  edgePct: number; // (modelProb - fairImpliedProb) * 100
-  expectedValuePct: number; // (modelProb * availableOdds - 1) * 100
-  dataQualityScore: number; // 0..100
-  uncertaintyBandPct: number; // +/- %
-  mainReason: string;
-  isOfflineReference?: boolean;
 }
 
 export interface LoggedPrediction {
@@ -357,11 +350,25 @@ export interface LoggedPrediction {
   market: string;
   selection: string;
   predictedProb: number; // 0..1
-  predictedValue?: number; // e.g., expected goals or points
-  bookmakerOdds?: number;
+  rawPredictedProb?: number; // 0..1 before empirical calibration
+  predictedValue?: number; // e.g., expected goals, spread or points
   status: 'pending' | 'won' | 'lost';
   actualValue?: number;
   resolvedAt?: string;
+  isReferenceExample?: boolean;
+}
+
+export interface EmpiricalCalibrationProfile {
+  sport: SportType;
+  sampleCount: number;
+  active: boolean;
+  temperature: number; // Logit scale factor (tau < 1 moderates overconfidence)
+  bias: number;
+  rawBrier: number;
+  calibratedBrier: number;
+  eceBeforePct: number;
+  eceAfterPct: number;
+  summary: string;
 }
 
 export interface HistoryEvaluationMetrics {
@@ -372,16 +379,21 @@ export interface HistoryEvaluationMetrics {
   logLoss: number;
   mae: number;
   rmse: number;
+  ecePct: number;
   calibrationBins: Array<{
     bucketLabel: string;
     avgPredictedPct: number;
     observedHitPct: number;
     count: number;
   }>;
+  calibrationProfiles: {
+    football: EmpiricalCalibrationProfile;
+    nba: EmpiricalCalibrationProfile;
+  };
 }
 
-export type FootballProviderId = 'api-football' | 'football-data' | 'espn-football' | 'the-odds-api';
-export type NbaProviderId = 'espn-nba' | 'basketballapi-net' | 'api-basketball' | 'api-nba' | 'balldontlie' | 'the-odds-api';
+export type FootballProviderId = 'api-football' | 'football-data' | 'espn-football';
+export type NbaProviderId = 'espn-nba' | 'basketballapi-net' | 'api-basketball' | 'api-nba' | 'balldontlie';
 
 export interface ApiProviderStatus {
   connected: boolean;
@@ -393,8 +405,14 @@ export interface ApiProviderStatus {
   error: string | null;
 }
 
+export interface ApiSecurityStatus {
+  pinConfigured: boolean;
+  unlocked: boolean;
+  envProtected: boolean;
+}
+
 export interface ApiConfigState {
   football: ApiProviderStatus;
   nba: ApiProviderStatus;
-  odds?: ApiProviderStatus;
+  security?: ApiSecurityStatus;
 }

@@ -445,12 +445,14 @@ export const BasketballCourt: React.FC<BasketballCourtProps> = ({
                       <span className="text-[11px] font-medium text-slate-300">{item.source}</span>
                     </div>
                     <span className="text-[11px] text-slate-400 font-mono tabular-nums">
-                      {new Date(item.publishedAt).toLocaleString('es-ES', {
-                        day: '2-digit',
-                        month: 'short',
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
+                      {item.publishedAt
+                        ? new Date(item.publishedAt).toLocaleString('es-ES', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : 'Fecha no publicada por la fuente'}
                     </span>
                   </div>
 
@@ -611,12 +613,14 @@ export const BasketballCourt: React.FC<BasketballCourtProps> = ({
                                     </span>
                                   </span>
                                   <span className="font-mono tabular-nums">
-                                    {new Date(p.latestNews.publishedAt).toLocaleString('es-ES', {
-                                      day: '2-digit',
-                                      month: 'short',
-                                      hour: '2-digit',
-                                      minute: '2-digit',
-                                    })}
+                                    {p.latestNews.publishedAt
+                                      ? new Date(p.latestNews.publishedAt).toLocaleString('es-ES', {
+                                          day: '2-digit',
+                                          month: 'short',
+                                          hour: '2-digit',
+                                          minute: '2-digit',
+                                        })
+                                      : 'Fecha no publicada por la fuente'}
                                   </span>
                                 </div>
                                 <p className="text-slate-300 leading-snug">{p.latestNews.summary}</p>

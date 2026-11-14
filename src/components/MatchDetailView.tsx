@@ -4,16 +4,18 @@ import {
   BookmarkPlus,
   Check,
   AlertCircle,
-  Scale,
   BarChart3,
   Users,
   History,
   LayoutDashboard,
   Loader2,
   Info,
+  ShieldCheck,
+  AlertTriangle,
 } from 'lucide-react';
 import type {
   AvailabilityStatus,
+  DataReliability,
   LoggedPrediction,
   MatchRecord,
   PlayerProfile,
@@ -21,13 +23,13 @@ import type {
 } from '../types/sports.ts';
 import { computeFootballMatchPrediction } from '../engine/footballModel.ts';
 import { computeNbaMatchPrediction } from '../engine/nbaModel.ts';
-import { evaluateMatchOddsDiscrepancies } from '../engine/oddsEngine.ts';
 import { TacticalPitch } from './TacticalPitch.tsx';
 import { BasketballCourt } from './BasketballCourt.tsx';
 import { AiExplanationBox, type AiExplanationPayload } from './AiExplanationBox.tsx';
 
 interface MatchDetailViewProps {
   match: MatchRecord;
+  historyItems?: LoggedPrediction[];
   hydrating?: boolean;
   refreshingNbaNews?: boolean;
   playerOverrides: Record<string, AvailabilityStatus>;
@@ -38,7 +40,7 @@ interface MatchDetailViewProps {
   onBack: () => void;
 }
 
-type DetailTab = 'summary' | 'teams' | 'tactical' | 'odds' | 'h2h';
+type DetailTab = 'summary' | 'teams' | 'tactical' | 'h2h';
 
 function summarizeGames(games: TeamRecentGame[]) {
   const n = games.length;
@@ -86,8 +88,31 @@ function summarizeGames(games: TeamRecentGame[]) {
   };
 }
 
+function renderDataQualityBadge(quality: DataReliability, dataConfidence: number) {
+  const cls =
+    quality === 'verified'
+      ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+      : quality === 'estimated'
+        ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+        : 'border-rose-500/35 bg-rose-950/25 text-rose-300';
+  const label =
+    quality === 'verified'
+      ? 'Datos verificados'
+      : quality === 'estimated'
+        ? 'Estimación parcial'
+        : 'Sin datos suficientes';
+
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded border text-[11px] font-semibold ${cls}`}>
+      <ShieldCheck className="w-3.5 h-3.5" />
+      {label} · Cobertura {dataConfidence}%
+    </span>
+  );
+}
+
 export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   match,
+  historyItems = [],
   hydrating = false,
   refreshingNbaNews = false,
   playerOverrides,
@@ -125,22 +150,27 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   const footballPred = useMemo(
     () =>
       match.sport === 'football'
-        ? computeFootballMatchPrediction(match, effectiveHomePlayers, effectiveAwayPlayers)
+        ? computeFootballMatchPrediction(
+            match,
+            effectiveHomePlayers,
+            effectiveAwayPlayers,
+            historyItems
+          )
         : null,
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
+    [match, effectiveHomePlayers, effectiveAwayPlayers, historyItems]
   );
 
   const nbaPred = useMemo(
     () =>
       match.sport === 'nba'
-        ? computeNbaMatchPrediction(match, effectiveHomePlayers, effectiveAwayPlayers)
+        ? computeNbaMatchPrediction(
+            match,
+            effectiveHomePlayers,
+            effectiveAwayPlayers,
+            historyItems
+          )
         : null,
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
-  );
-
-  const oddsItems = useMemo(
-    () => evaluateMatchOddsDiscrepancies(match, effectiveHomePlayers, effectiveAwayPlayers),
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
+    [match, effectiveHomePlayers, effectiveAwayPlayers, historyItems]
   );
 
   const handleExplainAi = async () => {
@@ -154,14 +184,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               competition: match.competition,
               lineupStatus: match.lineupStatus,
               modelOutputs: footballPred,
-              oddsDiscrepancies: oddsItems.slice(0, 4),
             }
           : {
               match: `${match.homeTeam.name} vs ${match.awayTeam.name}`,
               competition: match.competition,
               lineupStatus: match.lineupStatus,
               modelOutputs: nbaPred,
-              oddsDiscrepancies: oddsItems.slice(0, 4),
             };
 
       const res = await fetch('/api/ai/explain', {
@@ -192,6 +220,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           ? `Victoria ${match.homeTeam.shortName}`
           : `Victoria ${match.awayTeam.shortName}`,
         predictedProb: Math.max(footballPred.probHome, footballPred.probAway),
+        rawPredictedProb: Math.max(footballPred.rawProbHome, footballPred.rawProbAway),
         predictedValue: +(footballPred.lambdaHome + footballPred.lambdaAway).toFixed(2),
       });
     } else if (match.sport === 'nba' && nbaPred) {
@@ -203,6 +232,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
         market: 'Ganador (Moneyline)',
         selection: favoriteIsHome ? match.homeTeam.name : match.awayTeam.name,
         predictedProb: Math.max(nbaPred.probHomeWin, nbaPred.probAwayWin),
+        rawPredictedProb: Math.max(nbaPred.rawProbHomeWin, nbaPred.rawProbAwayWin),
         predictedValue: +nbaPred.expectedSpreadHome.toFixed(1),
       });
     }
@@ -214,6 +244,11 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
     match.sport === 'football'
       ? footballPred?.absenceImpactSummary ?? []
       : nbaPred?.absenceImpactSummary ?? [];
+
+  const modelWarnings =
+    match.sport === 'football'
+      ? footballPred?.modelWarnings ?? []
+      : nbaPred?.modelWarnings ?? [];
 
   const statusText =
     match.status === 'live'
@@ -376,6 +411,20 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </div>
         )}
 
+        {/* Model Warnings Strip */}
+        {modelWarnings.length > 0 && (
+          <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-300 flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              {modelWarnings.map((w, idx) => (
+                <span key={idx} className="block">
+                  · {w}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
         {match.hydrationNote && (
           <div className="rounded-lg border border-slate-800 bg-slate-950/50 px-3.5 py-2 text-xs text-slate-300 flex items-center gap-2">
             <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />
@@ -384,7 +433,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
         )}
       </section>
 
-      {/* Sub-Navigation Tabs: Resumen, Análisis equipos, Jugadores y alineaciones, Cuotas, H2H */}
+      {/* Sub-Navigation Tabs */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
         {(
           [
@@ -396,7 +445,6 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               icon: Users,
             },
             { id: 'h2h', label: 'D. Historial H2H', icon: History },
-            { id: 'odds', label: 'E. Cuotas y Valor', icon: Scale },
           ] as const
         ).map((item) => {
           const Icon = item.icon;
@@ -425,9 +473,13 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           {match.sport === 'football' && footballPred && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Probabilidades de victoria y modelo Dixon-Coles
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Probabilidades y modelo Dixon-Coles
+                  </h3>
+                  {renderDataQualityBadge(footballPred.dataQuality, footballPred.dataConfidence)}
+                </div>
+
                 <div className="space-y-3">
                   {[
                     { label: `Victoria ${match.homeTeam.shortName}`, val: footballPred.probHome, color: 'bg-blue-500' },
@@ -438,7 +490,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                       <div className="flex justify-between text-xs">
                         <span className="text-slate-300">{r.label}</span>
                         <span className="font-mono tabular-nums font-semibold text-white">
-                          {(r.val * 100).toFixed(1)}% · Cuota justa {(1 / r.val).toFixed(2)}
+                          {(r.val * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
@@ -489,9 +541,21 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               </div>
 
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Resultados exactos más probables y confianza
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Resultados exactos más probables
+                  </h3>
+                  <span
+                    className={`px-2 py-0.5 rounded border text-[11px] font-medium ${
+                      footballPred.calibrationApplied
+                        ? 'border-blue-500/35 bg-blue-950/30 text-blue-300'
+                        : 'border-slate-700 bg-slate-900 text-slate-400'
+                    }`}
+                  >
+                    {footballPred.calibrationApplied ? 'Calibrado empíricamente' : 'Modelo base (sin ajuste)'}
+                  </span>
+                </div>
+
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                   {footballPred.exactScores.map((sc) => (
                     <div
@@ -507,9 +571,14 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                     </div>
                   ))}
                 </div>
-                <p className="text-xs text-slate-400">
-                  Confianza del modelo: {footballPred.dataConfidence}% · Basado en xG local/visitante, clasificación actual, forma reciente y bajas activas.
-                </p>
+                <div className="text-xs text-slate-400 space-y-1">
+                  <p>
+                    Cobertura de datos: <strong className="text-slate-200">{footballPred.dataConfidence}%</strong> (mide la disponibilidad de métricas reales, independiente de la probabilidad del favorito).
+                  </p>
+                  {footballPred.calibrationNote && (
+                    <p className="text-blue-300">{footballPred.calibrationNote}</p>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -517,9 +586,13 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           {match.sport === 'nba' && nbaPred && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Modelo de Eficiencia Ajustada por Ritmo (NBA)
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Modelo de Eficiencia Ajustada por Ritmo (NBA)
+                  </h3>
+                  {renderDataQualityBadge(nbaPred.dataQuality, nbaPred.dataConfidence)}
+                </div>
+
                 <div className="space-y-3">
                   {[
                     { label: `Victoria ${match.homeTeam.name}`, val: nbaPred.probHomeWin, color: 'bg-blue-500' },
@@ -529,7 +602,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                       <div className="flex justify-between text-xs">
                         <span className="text-slate-300">{r.label}</span>
                         <span className="font-mono tabular-nums font-semibold text-white">
-                          {(r.val * 100).toFixed(1)}% · Cuota justa {(1 / r.val).toFixed(2)}
+                          {(r.val * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
@@ -566,12 +639,21 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                     </span>
                   </div>
                   <div>
-                    <span className="text-slate-400 block">Confianza de datos</span>
+                    <span className="text-slate-400 block">Cobertura de datos</span>
                     <span className="text-base font-bold font-mono tabular-nums text-slate-200">
                       {nbaPred.dataConfidence}%
                     </span>
                   </div>
+                  <div>
+                    <span className="text-slate-400 block">Calibración</span>
+                    <span className="text-xs font-semibold text-slate-200">
+                      {nbaPred.calibrationApplied ? 'Empírica activa' : 'Modelo base'}
+                    </span>
+                  </div>
                 </div>
+                {nbaPred.calibrationNote && (
+                  <p className="text-xs text-blue-300">{nbaPred.calibrationNote}</p>
+                )}
               </div>
 
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-3">
@@ -890,75 +972,6 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           )}
         </div>
       )}
-
-      {/* SECTION E: CUOTAS Y VALOR */}
-      {tab === 'odds' && (
-        <div className="rounded-xl border border-slate-800 bg-[#0D1526] overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-800">
-            <h3 className="text-base font-semibold text-white">
-              Comparativa de cuotas disponibles vs modelo
-            </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Probabilidad implícita ajustada sin margen de la casa (de-vigging proporcional). Comparación matemática sujeta a incertidumbre.
-            </p>
-          </div>
-          {oddsItems.length === 0 ? (
-            <div className="p-6 text-center text-xs text-slate-400">
-              No se han podido obtener cuotas publicadas actualmente para este partido.
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-800/80">
-              {oddsItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                >
-                  <div className="space-y-1">
-                    <div className="font-semibold text-slate-100">
-                      {item.selectionLabel}{' '}
-                      <span className="text-slate-400 font-normal">· {item.marketLabel}</span>
-                    </div>
-                    <div className="text-slate-400">
-                      {item.bookmaker} · Margen {item.bookmakerMarginPct.toFixed(1)}% ·{' '}
-                      {item.mainReason}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-5 font-mono tabular-nums shrink-0">
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Cuota</span>
-                      <span className="text-sm font-bold text-white">
-                        {item.availableOdds.toFixed(2)}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Modelo / Impl.</span>
-                      <span className="text-sm font-semibold text-blue-300">
-                        {(item.modelProbability * 100).toFixed(1)}% vs{' '}
-                        {(item.fairImpliedProbability * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Diferencia</span>
-                      <span
-                        className={`text-sm font-bold ${
-                          item.edgePct > 2
-                            ? 'text-emerald-400'
-                            : item.edgePct < -2
-                              ? 'text-rose-400'
-                              : 'text-slate-300'
-                        }`}
-                      >
-                        {item.edgePct > 0 ? `+${item.edgePct.toFixed(1)}%` : `${item.edgePct.toFixed(1)}%`}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 };
-

@@ -265,11 +265,17 @@ export const TacticalPitch: React.FC<TacticalPitchProps> = ({
         </button>
 
         {showBench && (
-          <div className="p-4 border-t border-slate-800 grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {[
-              { title: match.homeTeam.name, all: homePlayers, subs: homeSubsAndOut },
-              { title: match.awayTeam.name, all: awayPlayers, subs: awaySubsAndOut },
-            ].map((side) => (
+          <div className="p-4 border-t border-slate-800 space-y-4">
+            {[...homePlayers, ...awayPlayers].some((p) => p.statsQuality === 'estimated') && (
+              <p className="text-[11px] text-amber-200/90 rounded-lg border border-amber-500/25 bg-amber-950/20 px-3 py-2">
+                Nota de datos: cuando el proveedor no publica logs individuales completos por encuentro, las métricas base por jugador reflejan estimaciones posicionales marcadas en su ficha.
+              </p>
+            )}
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+              {[
+                { title: match.homeTeam.name, all: homePlayers, subs: homeSubsAndOut },
+                { title: match.awayTeam.name, all: awayPlayers, subs: awaySubsAndOut },
+              ].map((side) => (
               <div key={side.title} className="space-y-3">
                 <h5 className="text-xs font-semibold text-slate-400">{side.title}</h5>
                 <div className="divide-y divide-slate-800/70">
@@ -324,6 +330,7 @@ export const TacticalPitch: React.FC<TacticalPitchProps> = ({
                 </div>
               </div>
             ))}
+            </div>
           </div>
         )}
       </div>
