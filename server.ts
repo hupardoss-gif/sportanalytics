@@ -47,6 +47,7 @@ import {
   registerConfigAuthRoutes,
 } from './server/configSecurity.ts';
 import { fetchWithTimeout, writeFileAtomic } from './server/httpUtils.ts';
+import { fetchMatchOdds } from './server/oddsAdapters.ts';
 
 dotenv.config();
 
@@ -1295,6 +1296,41 @@ async function startServer() {
     } catch (err) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error hidratando detalle del partido',
+      });
+    }
+  });
+
+  // 2A-bis. Reference odds per match (informational / statistical use only)
+  app.post('/api/odds/match', async (req, res) => {
+    try {
+      const { match, refresh } = req.body as { match?: MatchRecord; refresh?: boolean };
+      if (
+        !match ||
+        typeof match.id !== 'string' ||
+        (match.sport !== 'football' && match.sport !== 'nba') ||
+        !match.homeTeam ||
+        !match.awayTeam
+      ) {
+        return res.status(400).json({ error: 'Partido no válido para consultar cuotas.' });
+      }
+      if (match.isOfflineReference) {
+        return res.json({
+          matchId: match.id,
+          sport: match.sport,
+          fetchedAt: new Date().toISOString(),
+          sources: [],
+        });
+      }
+      const vault = await readVault();
+      const footballDataKey =
+        match.sport === 'football'
+          ? getActiveFootballProviders(vault).find((p) => p.provider === 'football-data')?.apiKey
+          : undefined;
+      const payload = await fetchMatchOdds(match, { footballDataKey, forceRefresh: refresh === true });
+      return res.json(payload);
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Error consultando cuotas de referencia',
       });
     }
   });

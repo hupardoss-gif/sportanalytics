@@ -602,3 +602,47 @@ export interface ApiConfigState {
   nbaProviders?: Record<string, ApiProviderStatus>;
   security?: ApiSecurityStatus;
 }
+
+// ─────────────────────────────────────────────────────────────
+// Cuotas de referencia y probabilidades (apartado informativo)
+// ─────────────────────────────────────────────────────────────
+
+export type OddsMarketKind = 'match_winner_3way' | 'moneyline_2way' | 'totals' | 'btts' | 'spread';
+export type OddsOutcomeKey = 'home' | 'draw' | 'away' | 'over' | 'under' | 'yes' | 'no';
+
+export interface OddsOutcome {
+  key: OddsOutcomeKey;
+  label: string;
+  /** Cuota decimal (> 1). null = no disponible en la fuente. */
+  decimalOdds: number | null;
+  /** Valor original tal y como lo publica la fuente (p. ej. "-110"). */
+  rawOdds?: string;
+}
+
+export interface OddsMarketSnapshot {
+  /** Identificador estable del mercado dentro de una fuente: `${kind}` o `${kind}:${line}`. */
+  id: string;
+  kind: OddsMarketKind;
+  label: string;
+  /** Línea del mercado (totales o hándicap del local). */
+  line?: number;
+  outcomes: OddsOutcome[];
+  updatedAt?: string;
+}
+
+export interface OddsSourceSnapshot {
+  sourceId: string;
+  sourceLabel: string;
+  bookmaker?: string;
+  fetchedAt: string;
+  status: 'ok' | 'no_odds' | 'unavailable' | 'error';
+  message?: string;
+  markets: OddsMarketSnapshot[];
+}
+
+export interface MatchOddsResponse {
+  matchId: string;
+  sport: SportType;
+  fetchedAt: string;
+  sources: OddsSourceSnapshot[];
+}

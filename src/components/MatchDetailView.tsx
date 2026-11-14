@@ -15,6 +15,7 @@ import {
   Target,
   Minus,
   Plus,
+  Percent,
   SlidersHorizontal,
 } from 'lucide-react';
 import type {
@@ -37,6 +38,7 @@ import { evaluateMatchStatOverUnder } from '../engine/distributionMath.ts';
 import { TacticalPitch } from './TacticalPitch.tsx';
 import { BasketballCourt } from './BasketballCourt.tsx';
 import { AiExplanationBox, type AiExplanationPayload } from './AiExplanationBox.tsx';
+import { OddsProbabilityPanel } from './OddsProbabilityPanel.tsx';
 
 interface MatchDetailViewProps {
   match: MatchRecord;
@@ -53,7 +55,7 @@ interface MatchDetailViewProps {
   onBack: () => void;
 }
 
-type DetailTab = 'summary' | 'expected' | 'teams' | 'tactical' | 'h2h';
+type DetailTab = 'summary' | 'expected' | 'teams' | 'tactical' | 'h2h' | 'odds';
 
 function summarizeGames(games: TeamRecentGame[]) {
   const n = games.length;
@@ -498,6 +500,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               icon: Users,
             },
             { id: 'h2h', label: 'E. Historial H2H', icon: History },
+            { id: 'odds', label: 'F. Cuotas y Probabilidades', icon: Percent },
           ] as const
         ).map((item) => {
           const Icon = item.icon;
@@ -1347,6 +1350,11 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* SECTION F: CUOTAS DE REFERENCIA Y PROBABILIDADES */}
+      {tab === 'odds' && (
+        <OddsProbabilityPanel match={match} footballPred={footballPred} nbaPred={nbaPred} />
       )}
     </div>
   );
