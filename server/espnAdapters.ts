@@ -19,6 +19,10 @@ import {
   normalizeNbaName,
   type ParsedInjuryRecord,
 } from './nbaIntelligence.ts';
+import {
+  buildProbableFootballLineups,
+  promoteOfficialToConfirmedLineup,
+} from './footballIntelligence.ts';
 
 type AnyObj = Record<string, unknown>;
 
@@ -1393,6 +1397,10 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
 
     const homePace = calcPaceFromTeamStats(homeStatRes);
     const awayPace = calcPaceFromTeamStats(awayStatRes);
+    const homeAvgReb = extractTeamNum(homeStatRes, 'avgRebounds') ?? undefined;
+    const awayAvgReb = extractTeamNum(awayStatRes, 'avgRebounds') ?? undefined;
+    const homeAvgAst = extractTeamNum(homeStatRes, 'avgAssists') ?? undefined;
+    const awayAvgAst = extractTeamNum(awayStatRes, 'avgAssists') ?? undefined;
 
     const teamStats = [
       {
@@ -1425,6 +1433,11 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
         homeValue: extractTeamStat(homeStatRes, 'avgRebounds'),
         awayValue: extractTeamStat(awayStatRes, 'avgRebounds'),
       },
+      {
+        label: 'Asistencias / partido',
+        homeValue: extractTeamStat(homeStatRes, 'avgAssists'),
+        awayValue: extractTeamStat(awayStatRes, 'avgAssists'),
+      },
     ];
 
     return {
@@ -1432,6 +1445,8 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       homeTeam: {
         ...baseMatch.homeTeam,
         pace: homePace ?? baseMatch.homeTeam.pace,
+        avgRebounds: homeAvgReb ?? baseMatch.homeTeam.avgRebounds,
+        avgAssists: homeAvgAst ?? baseMatch.homeTeam.avgAssists,
         formRecent: homeSched.formRecent,
         recentGames: homeSched.recentGames,
         restDays: homeSched.restDays,
@@ -1440,6 +1455,8 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       awayTeam: {
         ...baseMatch.awayTeam,
         pace: awayPace ?? baseMatch.awayTeam.pace,
+        avgRebounds: awayAvgReb ?? baseMatch.awayTeam.avgRebounds,
+        avgAssists: awayAvgAst ?? baseMatch.awayTeam.avgAssists,
         formRecent: awaySched.formRecent,
         recentGames: awaySched.recentGames,
         restDays: awaySched.restDays,
@@ -1475,6 +1492,14 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       hydrationNote: hasCurrentBoxscore
         ? 'Quintetos titulares confirmados, parte médico oficial y noticias actualizadas.'
         : 'Posibles titulares proyectados según rotaciones recientes + parte oficial de lesiones y noticias externas (los titulares definitivos se confirman ~30 min antes del inicio).',
+      provenance: {
+        source: 'ESPN NBA API + Parte Oficial NBA + Medios NBA',
+        fetchedAt,
+        status: homePlayers.length > 0 ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: 'real',
+      },
       updatedAt: fetchedAt,
     };
   } catch (err) {
@@ -1482,6 +1507,15 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       ...baseMatch,
       hydrationStatus: 'network_error',
       hydrationNote: `Error consultando los datos NBA en vivo: ${err instanceof Error ? err.message : 'Fallo de red'}`,
+      provenance: {
+        source: baseMatch.dataOrigin,
+        fetchedAt,
+        status: 'error',
+        isStale: true,
+        staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+        dataType: 'unavailable',
+        errorMessage: err instanceof Error ? err.message : 'Fallo de red',
+      },
       updatedAt: fetchedAt,
     };
   }
@@ -1505,10 +1539,51 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
         ...baseMatch,
         hydrationStatus: 'query_error',
         hydrationNote: `El proveedor ESPN Soccer devolvió HTTP ${res.status} al consultar el detalle del partido.`,
+        provenance: {
+          source: 'ESPN Soccer API',
+          fetchedAt,
+          status: 'error',
+          isStale: true,
+          staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+          dataType: 'unavailable',
+          errorMessage: `HTTP ${res.status}`,
+        },
       };
     }
     const sum = (await res.json()) as AnyObj;
     const rosters = (sum.rosters as AnyObj[] | undefined) ?? [];
+
+    // Extract real team IDs from header / boxscore / rosters for historical lineup lookup
+    const boxTeams = (((sum.boxscore as AnyObj | undefined)?.teams as AnyObj[] | undefined) ?? []);
+    const headerComp = ((((sum.header as AnyObj | undefined)?.competitions as AnyObj[] | undefined)?.[0]) ?? {}) as AnyObj;
+    const headerComps = (headerComp.competitors as AnyObj[] | undefined) ?? [];
+    const headerHome = headerComps.find((c) => c.homeAway === 'home') ?? headerComps[0];
+    const headerAway = headerComps.find((c) => c.homeAway === 'away') ?? headerComps[1];
+
+    const homeEspnTeamId =
+      String((rosters[0]?.team as AnyObj | undefined)?.id ?? (headerHome?.team as AnyObj | undefined)?.id ?? baseMatch.homeTeam.id.replace('espnsoc-t-', ''));
+    const awayEspnTeamId =
+      String((rosters[1]?.team as AnyObj | undefined)?.id ?? (headerAway?.team as AnyObj | undefined)?.id ?? baseMatch.awayTeam.id.replace('espnsoc-t-', ''));
+
+    // Extract boxscore team stats when already available (live/finished matches)
+    const parseBoxTeamStat = (teamIdx: number, names: string[]): number | undefined => {
+      const statsArr = (boxTeams[teamIdx]?.statistics as AnyObj[] | undefined) ?? [];
+      for (const n of names) {
+        const found = statsArr.find((s) => String(s.name ?? '').toLowerCase() === n.toLowerCase());
+        const num = Number(found?.displayValue ?? found?.value);
+        if (found && Number.isFinite(num)) return num;
+      }
+      return undefined;
+    };
+
+    const homeBoxShots = parseBoxTeamStat(0, ['totalShots', 'shotsSummary']);
+    const awayBoxShots = parseBoxTeamStat(1, ['totalShots', 'shotsSummary']);
+    const homeBoxSot = parseBoxTeamStat(0, ['shotsOnTarget']);
+    const awayBoxSot = parseBoxTeamStat(1, ['shotsOnTarget']);
+    const homeBoxCorners = parseBoxTeamStat(0, ['wonCorners', 'cornerKicks']);
+    const awayBoxCorners = parseBoxTeamStat(1, ['wonCorners', 'cornerKicks']);
+    const homeBoxYc = parseBoxTeamStat(0, ['yellowCards']);
+    const awayBoxYc = parseBoxTeamStat(1, ['yellowCards']);
 
     const parseRoster = (
       sideIdx: number,
@@ -1541,8 +1616,10 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
           teamShort,
           number: Number(entry.jersey) || idx + 1,
           position: String(posObj.displayName ?? posAbbr),
-          availability: isStarter ? 'starter' : 'bench',
+          availability: confirmed ? (isStarter ? 'confirmed_starter' : 'bench') : isStarter ? 'possible_starter' : 'bench',
           availabilityConfidence: confirmed ? 'confirmed' : 'projected',
+          starterConfidence: confirmed ? (isStarter ? 100 : 15) : isStarter ? 72 : 25,
+          roleReason: confirmed ? 'Once inicial oficial ESPN' : 'Listado previo ESPN',
           isKeyPlayer: isStarter && (isFwd || idx < 4),
           pitchCoord: isStarter ? mapFootballGridCoord(idx, 11, posCode) : undefined,
           impact: {
@@ -1611,13 +1688,24 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
       }
     }
 
-    return {
+    let hydrated: MatchRecord = {
       ...baseMatch,
-      homeTeam: { ...baseMatch.homeTeam, formation: homeR.formation ?? baseMatch.homeTeam.formation },
-      awayTeam: { ...baseMatch.awayTeam, formation: awayR.formation ?? baseMatch.awayTeam.formation },
-      lineupStatus: homeR.confirmed && awayR.confirmed ? 'confirmed' : homeR.players.length > 0 ? 'provisional' : 'unknown',
-      homePlayers: homeR.players,
-      awayPlayers: awayR.players,
+      homeTeam: {
+        ...baseMatch.homeTeam,
+        formation: homeR.formation ?? baseMatch.homeTeam.formation,
+        avgShots: homeBoxShots ?? baseMatch.homeTeam.avgShots,
+        avgShotsOnTarget: homeBoxSot ?? baseMatch.homeTeam.avgShotsOnTarget,
+        avgCorners: homeBoxCorners ?? baseMatch.homeTeam.avgCorners,
+        avgYellowCards: homeBoxYc ?? baseMatch.homeTeam.avgYellowCards,
+      },
+      awayTeam: {
+        ...baseMatch.awayTeam,
+        formation: awayR.formation ?? baseMatch.awayTeam.formation,
+        avgShots: awayBoxShots ?? baseMatch.awayTeam.avgShots,
+        avgShotsOnTarget: awayBoxSot ?? baseMatch.awayTeam.avgShotsOnTarget,
+        avgCorners: awayBoxCorners ?? baseMatch.awayTeam.avgCorners,
+        avgYellowCards: awayBoxYc ?? baseMatch.awayTeam.avgYellowCards,
+      },
       odds: [],
       h2hSummary: {
         played: h2hMeetings.length,
@@ -1631,13 +1719,72 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
         baseMatch.homeTeam.ppgOrGpg !== undefined && baseMatch.awayTeam.ppgOrGpg !== undefined
           ? 'verified'
           : 'estimated',
-      hydrationStatus: homeR.players.length > 0 ? 'ok' : 'not_published',
-      hydrationNote:
-        homeR.players.length > 0
-          ? homeR.confirmed
-            ? 'Alineaciones oficiales confirmadas por el proveedor.'
-            : 'Plantilla / once probable disponible previo a confirmación oficial.'
-          : 'Alineación todavía no publicada por la competición (suele confirmarse ~60 min antes del inicio).',
+      updatedAt: fetchedAt,
+    };
+
+    if (homeR.confirmed && awayR.confirmed) {
+      hydrated = promoteOfficialToConfirmedLineup(
+        hydrated,
+        homeR.players,
+        awayR.players,
+        'ESPN Soccer / Oficial Competición',
+        fetchedAt,
+        homeR.formation,
+        awayR.formation
+      );
+      hydrated.hydrationStatus = 'ok';
+      hydrated.hydrationNote = 'Alineaciones oficiales confirmadas por la competición y cargadas en el campo táctico.';
+      hydrated.provenance = {
+        source: 'ESPN Soccer Oficial',
+        fetchedAt,
+        status: 'ok',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: 'real',
+      };
+      return hydrated;
+    }
+
+    // Hours before kickoff: build probable XI from ESPN recent starter frequencies + news RSS
+    const probableBundle = await buildProbableFootballLineups({
+      match: hydrated,
+      slug,
+      homeEspnTeamId,
+      awayEspnTeamId,
+      includeSearchGrounding: false,
+    });
+
+    const finalHomePlayers = homeR.players.length >= 11 ? homeR.players : probableBundle.homePlayers;
+    const finalAwayPlayers = awayR.players.length >= 11 ? awayR.players : probableBundle.awayPlayers;
+    const hasProbable = finalHomePlayers.length > 0 || finalAwayPlayers.length > 0;
+
+    return {
+      ...hydrated,
+      homeTeam: {
+        ...hydrated.homeTeam,
+        formation: probableBundle.homeFormation ?? hydrated.homeTeam.formation,
+      },
+      awayTeam: {
+        ...hydrated.awayTeam,
+        formation: probableBundle.awayFormation ?? hydrated.awayTeam.formation,
+      },
+      lineupStatus: hasProbable ? 'provisional' : 'unknown',
+      homePlayers: finalHomePlayers,
+      awayPlayers: finalAwayPlayers,
+      probableLineup: probableBundle.probableLineup,
+      footballNews: probableBundle.footballNews,
+      hydrationStatus: hasProbable ? 'ok' : 'not_published',
+      hydrationNote: hasProbable
+        ? 'Alineación probable calculada a partir de los últimos onces iniciales, plantilla oficial y noticias deportivas recientes (se actualizará automáticamente al confirmarse el once oficial).'
+        : 'Todavía no hay datos suficientes ni convocatoria oficial publicada para proyectar el once probable.',
+      provenance: {
+        source: `ESPN Soccer + ${probableBundle.footballNews.sourcesChecked.slice(0, 3).join(', ')}`,
+        fetchedAt,
+        status: hasProbable ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: hasProbable ? 'estimated' : 'unavailable',
+      },
       updatedAt: fetchedAt,
     };
   } catch (err) {
@@ -1645,6 +1792,15 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
       ...baseMatch,
       hydrationStatus: 'network_error',
       hydrationNote: `Error de red al consultar detalle: ${err instanceof Error ? err.message : 'desconocido'}`,
+      provenance: {
+        source: 'ESPN Soccer API',
+        fetchedAt,
+        status: 'error',
+        isStale: true,
+        staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+        dataType: 'unavailable',
+        errorMessage: err instanceof Error ? err.message : 'desconocido',
+      },
       updatedAt: fetchedAt,
     };
   }

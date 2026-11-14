@@ -216,7 +216,18 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
             </div>
           </div>
 
-          {currentPlayer.sport === 'nba' && currentPlayer.latestNews && (
+          {(currentPlayer.roleReason || currentPlayer.starterConfidence !== undefined) && (
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3.5 py-2 text-xs text-slate-300 flex flex-wrap items-center justify-between gap-2">
+              <span>{currentPlayer.roleReason ?? 'Estado de rotación en convocatoria'}</span>
+              {currentPlayer.starterConfidence !== undefined && (
+                <span className="font-mono tabular-nums font-semibold text-sky-300">
+                  Prob. titular: {currentPlayer.starterConfidence}%
+                </span>
+              )}
+            </div>
+          )}
+
+          {currentPlayer.latestNews && (
             <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-2 text-xs">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 font-semibold text-slate-100">

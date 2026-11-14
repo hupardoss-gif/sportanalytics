@@ -287,6 +287,18 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
         </span>
       </div>
 
+      {projection.freshnessWarning && (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            projection.dataFreshness === 'stale'
+              ? 'border-amber-500/40 bg-amber-950/30 text-amber-200'
+              : 'border-slate-800 bg-slate-950/60 text-slate-300'
+          }`}
+        >
+          {projection.freshnessWarning}
+        </div>
+      )}
+
       {/* Key Quantitative Summary */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-800/80 text-xs">
         <div>
@@ -314,6 +326,21 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
           </span>
         </div>
       </div>
+
+      {projection.multiSplitSummary && (
+        <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 px-3 py-2.5 text-[11px] space-y-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 font-mono tabular-nums text-slate-200">
+            <span>Temp: {projection.multiSplitSummary.seasonAvg}</span>
+            <span>L5: {projection.multiSplitSummary.last5Avg}</span>
+            <span>L10: {projection.multiSplitSummary.last10Avg}</span>
+            <span>Casa/Fuera: {projection.multiSplitSummary.homeAwayAvg}</span>
+            {projection.multiSplitSummary.h2hAvg !== undefined && (
+              <span>H2H: {projection.multiSplitSummary.h2hAvg}</span>
+            )}
+          </div>
+          <p className="text-slate-400">{projection.multiSplitSummary.weightsNote}</p>
+        </div>
+      )}
 
       {/* Probability Distribution Chart */}
       <div className="space-y-2 pt-2 border-t border-slate-800/80">

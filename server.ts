@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import type {
   ApiConfigState,
+  LiveFeedSourceStatus,
   LoggedPrediction,
   MatchRecord,
   StandingEntry,
@@ -29,6 +30,11 @@ import {
   queryGeminiNbaSearchGrounding,
 } from './server/nbaIntelligence.ts';
 import {
+  buildProbableFootballLineups,
+  resolveEspnSoccerIdsForMatch,
+} from './server/footballIntelligence.ts';
+import { evaluateFeedStaleness } from './server/dataHealth.ts';
+import {
   createRequireConfigAdmin,
   decryptVaultSecret,
   encryptVaultSecret,
@@ -45,6 +51,7 @@ let liveCache: {
     matches: MatchRecord[];
     standings: StandingEntry[];
     errors: string[];
+    sources: LiveFeedSourceStatus[];
     fetchedAt: string;
   };
 } | null = null;
@@ -542,73 +549,110 @@ async function startServer() {
       return res.json({
         config: await toPublicConfig(vault, req),
         ...liveCache.payload,
+        feedMeta: evaluateFeedStaleness({
+          fetchedAt: liveCache.payload.fetchedAt,
+          fromCache: true,
+          sources: liveCache.payload.sources,
+          errors: liveCache.payload.errors,
+        }),
       });
     }
 
     const matches: MatchRecord[] = [];
     const standings: StandingEntry[] = [];
     const errors: string[] = [];
+    const sources: LiveFeedSourceStatus[] = [];
 
-    if (
+    const fbProvider =
       vault.football.connected &&
       (vault.football.provider === 'espn-football' || vault.football.apiKey)
-    ) {
-      try {
-        const fb = await fetchFootballCalendarAndStandings(
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        matches.push(...fb.matches);
-        standings.push(...fb.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de fútbol');
-      }
-    } else {
-      try {
-        const fbPublic = await fetchFootballCalendarAndStandings('espn-football', '');
-        matches.push(...fbPublic.matches);
-        standings.push(...fbPublic.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error consultando ESPN Soccer');
-      }
+        ? vault.football.provider
+        : 'espn-football';
+    const fbKey = fbProvider === vault.football.provider ? vault.football.apiKey : '';
+
+    try {
+      const fb = await fetchFootballCalendarAndStandings(fbProvider, fbKey);
+      matches.push(...fb.matches);
+      standings.push(...fb.standings);
+      sources.push({
+        sport: 'football',
+        provider: fbProvider,
+        status: 'ok',
+        updatedAt: new Date().toISOString(),
+        matchCount: fb.matches.length,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Error obteniendo calendario de fútbol';
+      errors.push(msg);
+      sources.push({
+        sport: 'football',
+        provider: fbProvider,
+        status: 'error',
+        updatedAt: new Date().toISOString(),
+        matchCount: 0,
+        error: msg,
+      });
     }
 
     const nbaKey = vault.nba.reuseFootballKey ? vault.football.apiKey : vault.nba.apiKey;
-    if (
-      vault.nba.connected &&
-      (vault.nba.provider === 'espn-nba' || nbaKey)
-    ) {
-      try {
-        const nba = await fetchNbaCalendarAndStandings(vault.nba.provider, nbaKey);
-        matches.push(...nba.matches);
-        standings.push(...nba.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de NBA');
-      }
-    } else {
-      try {
-        const nbaPublic = await fetchNbaCalendarAndStandings('espn-nba', '');
-        matches.push(...nbaPublic.matches);
-        standings.push(...nbaPublic.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error consultando ESPN NBA');
-      }
+    const nbaProvider =
+      vault.nba.connected && (vault.nba.provider === 'espn-nba' || nbaKey)
+        ? vault.nba.provider
+        : 'espn-nba';
+    const effNbaKey = nbaProvider === vault.nba.provider ? nbaKey : '';
+
+    try {
+      const nba = await fetchNbaCalendarAndStandings(nbaProvider, effNbaKey);
+      matches.push(...nba.matches);
+      standings.push(...nba.standings);
+      sources.push({
+        sport: 'nba',
+        provider: nbaProvider,
+        status: 'ok',
+        updatedAt: new Date().toISOString(),
+        matchCount: nba.matches.length,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Error obteniendo calendario de NBA';
+      errors.push(msg);
+      sources.push({
+        sport: 'nba',
+        provider: nbaProvider,
+        status: 'error',
+        updatedAt: new Date().toISOString(),
+        matchCount: 0,
+        error: msg,
+      });
     }
 
+    const fetchedAt = new Date().toISOString();
     const payload = {
       matches,
       standings,
       errors,
-      fetchedAt: new Date().toISOString(),
+      sources,
+      fetchedAt,
     };
-    liveCache = {
-      expiresAt: Date.now() + 180_000,
-      payload,
-    };
+
+    // Never cache failed responses as fresh valid cache
+    if (errors.length === 0) {
+      liveCache = {
+        expiresAt: Date.now() + 180_000,
+        payload,
+      };
+    } else {
+      liveCache = null;
+    }
 
     res.json({
       config: await toPublicConfig(vault, req),
       ...payload,
+      feedMeta: evaluateFeedStaleness({
+        fetchedAt,
+        fromCache: false,
+        sources,
+        errors,
+      }),
     });
   });
 
@@ -845,6 +889,97 @@ async function startServer() {
     } catch (err) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error actualizando noticias NBA',
+      });
+    }
+  });
+
+  // 2C. Real-Time Football Probable vs Confirmed Lineups, Club Releases & Press Refresh Route
+  app.post('/api/football/match/refresh-lineups', async (req, res) => {
+    try {
+      const { match, includeSearchGrounding = true } = req.body as {
+        match: MatchRecord;
+        includeSearchGrounding?: boolean;
+      };
+      if (!match || match.sport !== 'football' || match.isOfflineReference) {
+        return res.json({ match });
+      }
+
+      const vault = await readVault();
+      let workingMatch = match;
+
+      // Re-hydrate from primary live provider first to catch newly confirmed official starting XIs
+      if (match.id.startsWith('espnsoc-')) {
+        workingMatch = await hydrateLiveMatchDetails(workingMatch, 'espn-football', '');
+      } else if (vault.football.connected && vault.football.apiKey) {
+        workingMatch = await hydrateLiveMatchDetails(
+          workingMatch,
+          vault.football.provider,
+          vault.football.apiKey
+        );
+      }
+
+      // If official lineup was just published, ensure probableLineup is preserved cleanly alongside confirmedLineup
+      if (workingMatch.lineupStatus === 'confirmed' && workingMatch.confirmedLineup) {
+        if (!workingMatch.probableLineup && match.probableLineup) {
+          workingMatch.probableLineup = match.probableLineup;
+        }
+        return res.json({ match: workingMatch });
+      }
+
+      // Otherwise refresh probable lineups + RSS + Google Search Grounding (club websites & Marca/AS/MD/SPORT/Relevo/ESPN/BBC/Sky)
+      const espnIds = await resolveEspnSoccerIdsForMatch(
+        workingMatch.competition,
+        workingMatch.homeTeam.name,
+        workingMatch.awayTeam.name
+      );
+      const bundle = await buildProbableFootballLineups({
+        match: workingMatch,
+        slug: espnIds.slug,
+        homeEspnTeamId: espnIds.homeEspnTeamId,
+        awayEspnTeamId: espnIds.awayEspnTeamId,
+        includeSearchGrounding,
+        forceRefresh: true,
+      });
+
+      const nowIso = new Date().toISOString();
+      const updatedHome = bundle.homePlayers.length >= 11 ? bundle.homePlayers : workingMatch.homePlayers;
+      const updatedAway = bundle.awayPlayers.length >= 11 ? bundle.awayPlayers : workingMatch.awayPlayers;
+      const hasLineups = updatedHome.length > 0 || updatedAway.length > 0;
+
+      const updatedMatch: MatchRecord = {
+        ...workingMatch,
+        homeTeam: {
+          ...workingMatch.homeTeam,
+          formation: bundle.homeFormation ?? workingMatch.homeTeam.formation,
+        },
+        awayTeam: {
+          ...workingMatch.awayTeam,
+          formation: bundle.awayFormation ?? workingMatch.awayTeam.formation,
+        },
+        lineupStatus: hasLineups ? 'provisional' : 'unknown',
+        homePlayers: updatedHome,
+        awayPlayers: updatedAway,
+        probableLineup: bundle.probableLineup ?? workingMatch.probableLineup,
+        footballNews: bundle.footballNews,
+        hydrationStatus: hasLineups ? 'ok' : 'not_published',
+        hydrationNote: hasLineups
+          ? 'Alineación probable actualizada con fuentes deportivas y estado reciente.'
+          : 'Sin novedades suficientes para proyectar el once todavía.',
+        provenance: {
+          source: bundle.footballNews.sourcesChecked.slice(0, 4).join(' · ') || workingMatch.dataOrigin,
+          fetchedAt: nowIso,
+          status: hasLineups ? 'ok' : 'partial',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: hasLineups ? 'estimated' : 'unavailable',
+        },
+        updatedAt: nowIso,
+      };
+
+      return res.json({ match: updatedMatch });
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Error actualizando alineaciones de fútbol',
       });
     }
   });

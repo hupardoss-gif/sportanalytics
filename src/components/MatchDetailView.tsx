@@ -12,6 +12,7 @@ import {
   Info,
   ShieldCheck,
   AlertTriangle,
+  Target,
 } from 'lucide-react';
 import type {
   AvailabilityStatus,
@@ -21,8 +22,14 @@ import type {
   PlayerProfile,
   TeamRecentGame,
 } from '../types/sports.ts';
-import { computeFootballMatchPrediction } from '../engine/footballModel.ts';
-import { computeNbaMatchPrediction } from '../engine/nbaModel.ts';
+import {
+  buildFootballMatchExplanation,
+  computeFootballMatchPrediction,
+} from '../engine/footballModel.ts';
+import {
+  buildNbaMatchExplanation,
+  computeNbaMatchPrediction,
+} from '../engine/nbaModel.ts';
 import { TacticalPitch } from './TacticalPitch.tsx';
 import { BasketballCourt } from './BasketballCourt.tsx';
 import { AiExplanationBox, type AiExplanationPayload } from './AiExplanationBox.tsx';
@@ -32,15 +39,17 @@ interface MatchDetailViewProps {
   historyItems?: LoggedPrediction[];
   hydrating?: boolean;
   refreshingNbaNews?: boolean;
+  refreshingFootballLineups?: boolean;
   playerOverrides: Record<string, AvailabilityStatus>;
   onToggleAvailability: (playerId: string, nextStatus: AvailabilityStatus) => void;
   onRefreshNbaNews?: (match: MatchRecord) => Promise<void>;
+  onRefreshFootballLineups?: (match: MatchRecord) => Promise<void>;
   onSelectPlayer: (player: PlayerProfile, match: MatchRecord) => void;
   onLogPrediction: (pred: Omit<LoggedPrediction, 'id' | 'createdAt' | 'status'>) => Promise<void>;
   onBack: () => void;
 }
 
-type DetailTab = 'summary' | 'teams' | 'tactical' | 'h2h';
+type DetailTab = 'summary' | 'expected' | 'teams' | 'tactical' | 'h2h';
 
 function summarizeGames(games: TeamRecentGame[]) {
   const n = games.length;
@@ -115,9 +124,11 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   historyItems = [],
   hydrating = false,
   refreshingNbaNews = false,
+  refreshingFootballLineups = false,
   playerOverrides,
   onToggleAvailability,
   onRefreshNbaNews,
+  onRefreshFootballLineups,
   onSelectPlayer,
   onLogPrediction,
   onBack,
@@ -173,6 +184,16 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
     [match, effectiveHomePlayers, effectiveAwayPlayers, historyItems]
   );
 
+  const narrative = useMemo(() => {
+    if (match.sport === 'football' && footballPred) {
+      return buildFootballMatchExplanation(match, footballPred);
+    }
+    if (match.sport === 'nba' && nbaPred) {
+      return buildNbaMatchExplanation(match, nbaPred, effectiveHomePlayers, effectiveAwayPlayers);
+    }
+    return null;
+  }, [match, footballPred, nbaPred, effectiveHomePlayers, effectiveAwayPlayers]);
+
   const handleExplainAi = async () => {
     setAiLoading(true);
     setAiError(null);
@@ -213,6 +234,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
       const favoriteIsHome = footballPred.probHome >= footballPred.probAway;
       await onLogPrediction({
         sport: 'football',
+        competition: match.competition,
         matchId: match.id,
         matchLabel,
         market: 'Resultado Final (1X2)',
@@ -227,6 +249,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
       const favoriteIsHome = nbaPred.probHomeWin >= nbaPred.probAwayWin;
       await onLogPrediction({
         sport: 'nba',
+        competition: match.competition,
         matchId: match.id,
         matchLabel,
         market: 'Ganador (Moneyline)',
@@ -425,6 +448,15 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </div>
         )}
 
+        {match.provenance && (match.provenance.isStale || match.provenance.status === 'error') && (
+          <div className="rounded-lg border border-amber-500/35 bg-amber-950/25 px-3.5 py-2 text-xs text-amber-200 flex items-center gap-2">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span>
+              Estado de fuente ({match.provenance.source}): {match.provenance.errorMessage ?? `datos con ${match.provenance.staleAgeMinutes} min de antigüedad`} · Tipo: {match.provenance.dataType}.
+            </span>
+          </div>
+        )}
+
         {match.hydrationNote && (
           <div className="rounded-lg border border-slate-800 bg-slate-950/50 px-3.5 py-2 text-xs text-slate-300 flex items-center gap-2">
             <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />
@@ -438,13 +470,14 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
         {(
           [
             { id: 'summary', label: 'A. Resumen y Predicción', icon: LayoutDashboard },
-            { id: 'teams', label: 'B. Análisis de Equipos', icon: BarChart3 },
+            { id: 'expected', label: 'B. Qué se espera del partido', icon: Target },
+            { id: 'teams', label: 'C. Análisis de Equipos', icon: BarChart3 },
             {
               id: 'tactical',
-              label: match.sport === 'football' ? 'C. Jugadores y Alineaciones' : 'C. Jugadores y Rotación',
+              label: match.sport === 'football' ? 'D. Jugadores y Alineaciones' : 'D. Jugadores y Rotación',
               icon: Users,
             },
-            { id: 'h2h', label: 'D. Historial H2H', icon: History },
+            { id: 'h2h', label: 'E. Historial H2H', icon: History },
           ] as const
         ).map((item) => {
           const Icon = item.icon;
@@ -736,6 +769,74 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
             </div>
           )}
 
+          {narrative && (
+            <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                <div>
+                  <h3 className="text-base font-semibold text-white">
+                    Por qué el modelo estima este escenario
+                  </h3>
+                  <p className="text-xs text-blue-300 mt-0.5">{narrative.headline}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTab('expected')}
+                  className="text-xs font-semibold text-blue-400 hover:text-blue-300 cursor-pointer"
+                >
+                  Ver «Qué se espera del partido» →
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 p-3.5 space-y-2">
+                  <span className="font-semibold text-blue-300 block">
+                    Factores a favor de {match.homeTeam.shortName}
+                  </span>
+                  <p className="text-slate-400 font-mono text-[11px]">{narrative.homeStrengthsWeaknesses}</p>
+                  <ul className="space-y-1 text-slate-300">
+                    {narrative.homeFavoringFactors.map((f, i) => (
+                      <li key={i}>· {f}</li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 p-3.5 space-y-2">
+                  <span className="font-semibold text-sky-300 block">
+                    Factores a favor de {match.awayTeam.shortName}
+                  </span>
+                  <p className="text-slate-400 font-mono text-[11px]">{narrative.awayStrengthsWeaknesses}</p>
+                  <ul className="space-y-1 text-slate-300">
+                    {narrative.awayFavoringFactors.map((f, i) => (
+                      <li key={i}>· {f}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                <div className="space-y-1">
+                  <span className="font-semibold text-slate-200 block">Emparejamientos tácticos</span>
+                  {narrative.tacticalMatchups.map((t, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {t}</p>
+                  ))}
+                </div>
+                <div className="space-y-1">
+                  <span className="font-semibold text-slate-200 block">Impacto de bajas y dudas</span>
+                  {narrative.keyAbsencesImpact.map((b, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {b}</p>
+                  ))}
+                  <p className="text-slate-400 leading-relaxed pt-1">{narrative.h2hAssessment}</p>
+                </div>
+                <div className="space-y-1">
+                  <span className="font-semibold text-amber-300 block">Incertidumbres y límites</span>
+                  {narrative.uncertaintiesAndLimits.map((u, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {u}</p>
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+
           <AiExplanationBox
             title="Explicación Cuantitativa con IA"
             loading={aiLoading}
@@ -744,6 +845,103 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
             onTrigger={handleExplainAi}
             buttonLabel="Explicar predicción con IA"
           />
+        </div>
+      )}
+
+      {/* SECTION B: QUÉ SE ESPERA DEL PARTIDO */}
+      {tab === 'expected' && (
+        <div className="space-y-6">
+          <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-base font-semibold text-white">
+                Qué se espera del partido (Estimación puntual e intervalo 80%)
+              </h3>
+              {(footballPred || nbaPred) &&
+                renderDataQualityBadge(
+                  (footballPred?.dataQuality ?? nbaPred?.dataQuality)!,
+                  (footballPred?.dataConfidence ?? nbaPred?.dataConfidence)!
+                )}
+            </div>
+            <p className="text-xs text-slate-400">
+              Cada métrica diferencia si procede de estadísticas reales verificadas o de una estimación matemática derivada cuando el proveedor no publica ese dato específico.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {(footballPred?.expectedStats ?? nbaPred?.expectedStats ?? []).map((item) => (
+              <div
+                key={item.key}
+                className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-2"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="text-xs font-medium text-slate-300">{item.label}</span>
+                  <span
+                    className={`px-2 py-0.5 rounded border text-[10px] font-semibold shrink-0 ${
+                      item.reliability === 'verified'
+                        ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+                        : item.reliability === 'estimated'
+                          ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+                          : 'border-rose-500/35 bg-rose-950/25 text-rose-300'
+                    }`}
+                  >
+                    {item.reliability === 'verified'
+                      ? 'Verificado'
+                      : item.reliability === 'estimated'
+                        ? 'Estimación'
+                        : 'No disponible'}
+                  </span>
+                </div>
+
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="text-2xl font-bold font-mono tabular-nums text-white">
+                    {item.pointEstimate !== null ? item.pointEstimate : 'N/D'}
+                    {item.unit ? (
+                      <span className="text-xs font-normal text-slate-400 ml-1">{item.unit}</span>
+                    ) : null}
+                  </span>
+                  {item.intervalLow !== null && item.intervalHigh !== null && (
+                    <span className="text-xs font-mono tabular-nums text-blue-300">
+                      80%: [{item.intervalLow} – {item.intervalHigh}]
+                    </span>
+                  )}
+                </div>
+
+                {item.note && <p className="text-[11px] text-slate-400">{item.note}</p>}
+              </div>
+            ))}
+          </div>
+
+          {match.sport === 'football' && footballPred && (
+            <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+              <div>
+                <span className="text-slate-400 block">Ambos marcan (BTTS Sí)</span>
+                <span className="text-lg font-bold font-mono tabular-nums text-emerald-400">
+                  {(footballPred.bttsYes * 100).toFixed(1)}%
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Over 1.5 / 2.5 / 3.5 goles</span>
+                <span className="text-sm font-bold font-mono tabular-nums text-white">
+                  {(footballPred.over15 * 100).toFixed(0)}% / {(footballPred.over25 * 100).toFixed(0)}% /{' '}
+                  {(footballPred.over35 * 100).toFixed(0)}%
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Marcador más probable</span>
+                <span className="text-lg font-bold font-mono tabular-nums text-blue-300">
+                  {footballPred.exactScores[0]
+                    ? `${footballPred.exactScores[0].home}-${footballPred.exactScores[0].away} (${(footballPred.exactScores[0].probability * 100).toFixed(1)}%)`
+                    : '-'}
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Tarjetas ({match.homeTeam.shortName} / {match.awayTeam.shortName})</span>
+                <span className="text-sm font-bold font-mono tabular-nums text-white">
+                  {footballPred.expectedCardsHome.toFixed(1)} / {footballPred.expectedCardsAway.toFixed(1)}
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -893,16 +1091,55 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               </div>
             ))}
           </div>
+          {match.sport === 'nba' && (
+            <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-3 text-xs">
+              <h4 className="text-sm font-semibold text-white">
+                Eficiencia avanzada NBA (ORtg, DRtg, Pace) y duelos tácticos
+              </h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[match.homeTeam, match.awayTeam].map((tm) => (
+                  <div key={tm.id} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-1.5">
+                    <span className="font-semibold text-slate-100 block">{tm.name}</span>
+                    <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">ORtg</span>
+                        <span className="text-blue-300 font-bold">{tm.offRating ? tm.offRating.toFixed(1) : 'N/D'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">DRtg</span>
+                        <span className="text-sky-300 font-bold">{tm.defRating ? tm.defRating.toFixed(1) : 'N/D'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">Pace</span>
+                        <span className="text-white font-bold">{tm.pace ? tm.pace.toFixed(1) : 'N/D'}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {narrative && narrative.tacticalMatchups.length > 0 && (
+                <div className="space-y-1 pt-1 text-slate-300">
+                  {narrative.tacticalMatchups.map((line, i) => (
+                    <p key={i}>· {line}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* SECTION C: JUGADORES Y ALINEACIONES */}
+      {/* SECTION D: JUGADORES Y ALINEACIONES */}
       {tab === 'tactical' &&
         (match.sport === 'football' ? (
           <TacticalPitch
             match={match}
             homePlayers={effectiveHomePlayers}
             awayPlayers={effectiveAwayPlayers}
+            refreshingLineups={refreshingFootballLineups}
+            onRefreshFootballLineups={
+              onRefreshFootballLineups ? () => void onRefreshFootballLineups(match) : undefined
+            }
             onSelectPlayer={(p) => onSelectPlayer(p, match)}
             onToggleAvailability={onToggleAvailability}
           />
@@ -918,12 +1155,20 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           />
         ))}
 
-      {/* SECTION D: HISTORIAL H2H */}
+      {/* SECTION E: HISTORIAL H2H */}
       {tab === 'h2h' && (
         <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
           <h3 className="text-base font-semibold text-white">
             Enfrentamientos directos (H2H) y balance histórico
           </h3>
+          {match.h2hSummary.played < 4 && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3.5 py-2.5 text-xs text-amber-200 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                Muestra H2H reducida ({match.h2hSummary.played} duelo{match.h2hSummary.played === 1 ? '' : 's'}). Con menos de 4 enfrentamientos directos recientes el modelo restringe su peso para no sobreinterpretar rachas puntuales.
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
             <div>
               <span className="text-slate-400 block">Partidos H2H</span>

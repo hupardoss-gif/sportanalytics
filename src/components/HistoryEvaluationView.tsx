@@ -17,6 +17,14 @@ export const HistoryEvaluationView: React.FC<HistoryEvaluationViewProps> = ({
 }) => {
   const metrics = useMemo(() => evaluatePredictionHistory(predictions), [predictions]);
   const [actualInputs, setActualInputs] = useState<Record<string, string>>({});
+  const [breakdownTab, setBreakdownTab] = useState<'sport' | 'competition' | 'market'>('sport');
+
+  const breakdownRows =
+    breakdownTab === 'sport'
+      ? metrics.breakdownBySport
+      : breakdownTab === 'competition'
+        ? metrics.breakdownByCompetition
+        : metrics.breakdownByMarket;
 
   const handleResolveClick = async (id: string, status: 'won' | 'lost') => {
     const raw = actualInputs[id]?.trim();
@@ -107,6 +115,105 @@ export const HistoryEvaluationView: React.FC<HistoryEvaluationViewProps> = ({
           Transparencia metodológica: al alcanzar al menos {MIN_CALIBRATION_SAMPLES} predicciones reales resueltas por deporte (excluyendo ejemplos ilustrativos), el motor valida mediante validación cruzada fuera de muestra si la temperatura logística (τ) y el sesgo reducen el error real sin sobreajuste antes de activarlos.
         </span>
       </div>
+
+      {/* Leak-Free Temporal Walk-Forward Validation */}
+      <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-3 text-xs">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <h3 className="text-base font-semibold text-white">
+            Validación temporal estricta (Walk-Forward sin fuga futura)
+          </h3>
+          <span className="px-2.5 py-0.5 rounded border border-emerald-500/35 bg-emerald-950/25 text-emerald-300 text-[11px] font-semibold">
+            Sin fuga temporal verificada
+          </span>
+        </div>
+        <p className="text-slate-300 leading-relaxed">{metrics.temporalValidation.note}</p>
+        {metrics.temporalValidation.evaluatedCount > 0 && (
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-800 font-mono tabular-nums">
+            <div>
+              <span className="text-slate-400 block font-sans">Brier (Base → Cal.)</span>
+              <span className="text-sm font-bold text-white">
+                {metrics.temporalValidation.baseBrier.toFixed(3)} → {metrics.temporalValidation.calibratedBrier.toFixed(3)}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block font-sans">LogLoss (Base → Cal.)</span>
+              <span className="text-sm font-bold text-white">
+                {metrics.temporalValidation.baseLogLoss.toFixed(3)} → {metrics.temporalValidation.calibratedLogLoss.toFixed(3)}
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block font-sans">ECE (Base → Cal.)</span>
+              <span className="text-sm font-bold text-blue-300">
+                {metrics.temporalValidation.baseEcePct.toFixed(1)}% → {metrics.temporalValidation.calibratedEcePct.toFixed(1)}%
+              </span>
+            </div>
+            <div>
+              <span className="text-slate-400 block font-sans">Evaluadas / Calentamiento</span>
+              <span className="text-sm font-bold text-slate-200">
+                {metrics.temporalValidation.evaluatedCount} / {metrics.temporalValidation.skippedWarmup}
+              </span>
+            </div>
+          </div>
+        )}
+      </section>
+
+      {/* Breakdown by Sport, Competition and Market */}
+      {(metrics.breakdownBySport.length > 0 || metrics.breakdownByMarket.length > 0) && (
+        <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <h3 className="text-base font-semibold text-white">
+              Desglose de precisión por segmento
+            </h3>
+            <div className="inline-flex items-center gap-1 p-1 rounded-lg bg-slate-900 border border-slate-800 text-xs">
+              {(
+                [
+                  { id: 'sport', label: 'Deporte' },
+                  { id: 'competition', label: 'Competición' },
+                  { id: 'market', label: 'Mercado' },
+                ] as const
+              ).map((t) => (
+                <button
+                  key={t.id}
+                  type="button"
+                  onClick={() => setBreakdownTab(t.id)}
+                  className={`min-h-[32px] px-3 py-1 rounded-md font-semibold cursor-pointer ${
+                    breakdownTab === t.id ? 'bg-blue-600 text-white' : 'text-slate-300 hover:text-white'
+                  }`}
+                >
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-xs text-left">
+              <thead className="text-[11px] text-slate-400 border-b border-slate-800">
+                <tr>
+                  <th className="py-2 pr-3 font-medium">Segmento</th>
+                  <th className="py-2 px-3 font-medium text-right">Muestras</th>
+                  <th className="py-2 px-3 font-medium text-right">Acierto %</th>
+                  <th className="py-2 px-3 font-medium text-right">Brier</th>
+                  <th className="py-2 px-3 font-medium text-right">LogLoss</th>
+                  <th className="py-2 pl-3 font-medium text-right">ECE %</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                {breakdownRows.map((row) => (
+                  <tr key={row.key}>
+                    <td className="py-2.5 pr-3 font-sans font-medium text-slate-200">{row.label}</td>
+                    <td className="py-2.5 px-3 text-right text-slate-300">{row.count}</td>
+                    <td className="py-2.5 px-3 text-right text-emerald-400">{row.hitRatePct.toFixed(1)}%</td>
+                    <td className="py-2.5 px-3 text-right text-white">{row.brierScore.toFixed(3)}</td>
+                    <td className="py-2.5 px-3 text-right text-slate-300">{row.logLoss.toFixed(3)}</td>
+                    <td className="py-2.5 pl-3 text-right text-blue-300">{row.ecePct.toFixed(1)}%</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      )}
 
       {/* Calibration Chart */}
       {metrics.calibrationBins.length > 0 && (

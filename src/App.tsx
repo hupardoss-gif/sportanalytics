@@ -14,6 +14,7 @@ import {
 import type {
   ApiConfigState,
   AvailabilityStatus,
+  LiveFeedMeta,
   LoggedPrediction,
   MatchRecord,
   MatchStatus,
@@ -69,11 +70,13 @@ export default function App() {
   const [liveMatches, setLiveMatches] = useState<MatchRecord[]>([]);
   const [liveStandings, setLiveStandings] = useState<StandingEntry[]>([]);
   const [liveErrors, setLiveErrors] = useState<string[]>([]);
+  const [liveFeedMeta, setLiveFeedMeta] = useState<LiveFeedMeta | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
 
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
   const [hydratingMatchId, setHydratingMatchId] = useState<string | null>(null);
   const [refreshingNbaNewsId, setRefreshingNbaNewsId] = useState<string | null>(null);
+  const [refreshingFootballLineupId, setRefreshingFootballLineupId] = useState<string | null>(null);
   const [activeModalPlayer, setActiveModalPlayer] = useState<{
     player: PlayerProfile;
     match: MatchRecord;
@@ -92,11 +95,13 @@ export default function App() {
           matches: MatchRecord[];
           standings?: StandingEntry[];
           errors: string[];
+          feedMeta?: LiveFeedMeta;
         };
         setApiConfig(data.config);
         setLiveMatches(data.matches);
         setLiveStandings(data.standings ?? []);
         setLiveErrors(data.errors ?? []);
+        setLiveFeedMeta(data.feedMeta ?? null);
         if (
           data.config.football.connected ||
           data.config.nba.connected ||
@@ -266,6 +271,30 @@ export default function App() {
       // Keep current match data cleanly if refresh fails
     } finally {
       setRefreshingNbaNewsId(null);
+    }
+  }, []);
+
+  const handleRefreshFootballLineups = useCallback(async (m: MatchRecord) => {
+    if (m.sport !== 'football' || m.isOfflineReference) return;
+    setRefreshingFootballLineupId(m.id);
+    try {
+      const res = await fetch('/api/football/match/refresh-lineups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ match: m, includeSearchGrounding: true }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { match: MatchRecord };
+        if (data.match) {
+          setLiveMatches((prev) =>
+            prev.map((item) => (item.id === data.match.id ? data.match : item))
+          );
+        }
+      }
+    } catch {
+      // Keep current match data cleanly if refresh fails
+    } finally {
+      setRefreshingFootballLineupId(null);
     }
   }, []);
 
@@ -672,6 +701,21 @@ export default function App() {
           </div>
         )}
 
+        {liveFeedMeta?.isStale && dataMode === 'live' && (
+          <div className="rounded-xl border border-amber-500/35 bg-amber-950/25 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+            <span>
+              Datos en caché con {liveFeedMeta.cacheAgeMinutes} min de antigüedad: {liveFeedMeta.staleReason ?? 'pulsa Actualizar para reintentar las fuentes en directo'}.
+            </span>
+            <button
+              type="button"
+              onClick={() => void loadConfigAndLive(true)}
+              className="font-semibold text-amber-300 hover:text-amber-200 underline cursor-pointer"
+            >
+              Reintentar actualización
+            </button>
+          </div>
+        )}
+
         {liveErrors.length > 0 && dataMode === 'live' && (
           <div className="rounded-xl border border-rose-500/30 bg-rose-950/30 px-4 py-3 text-xs text-rose-200">
             {liveErrors.join(' · ')}
@@ -802,11 +846,13 @@ export default function App() {
               playerOverrides={playerOverrides}
               onToggleAvailability={handleToggleAvailability}
               onRefreshNbaNews={handleRefreshNbaNews}
+              onRefreshFootballLineups={handleRefreshFootballLineups}
               onSelectPlayer={(player, m) => setActiveModalPlayer({ player, match: m })}
               onLogPrediction={handleLogPrediction}
               onBack={() => setSelectedMatchId(null)}
               hydrating={hydratingMatchId === selectedMatch.id}
               refreshingNbaNews={refreshingNbaNewsId === selectedMatch.id}
+              refreshingFootballLineups={refreshingFootballLineupId === selectedMatch.id}
             />
           ) : (
             <div className="space-y-6">

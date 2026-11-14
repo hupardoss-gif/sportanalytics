@@ -1,13 +1,16 @@
 import type {
   AvailabilityStatus,
+  DataFreshnessStatus,
   DataReliability,
   FootballPredictionResult,
   FootballPropStat,
   LoggedPrediction,
+  MatchNarrativeExplanation,
   MatchRecord,
   PlayerProfile,
   PropDistributionBin,
   PropProjectionResult,
+  StatExpectationWithInterval,
   TimeframeSplit,
 } from '../types/sports.ts';
 import {
@@ -375,9 +378,141 @@ export function computeFootballMatchPrediction(
         ? 'estimated'
         : 'unavailable';
 
+  // Expected Shots & Shots on Target per team (verified when team averages exist, else estimated from xG)
+  const expectedGoalsTotal = lambdaHome + lambdaAway;
+  const hasRealShotsHome = match.homeTeam.avgShots !== undefined;
+  const hasRealShotsAway = match.awayTeam.avgShots !== undefined;
+  const hasRealSotHome = match.homeTeam.avgShotsOnTarget !== undefined;
+  const hasRealSotAway = match.awayTeam.avgShotsOnTarget !== undefined;
+
+  const expectedShotsHome = hasRealShotsHome
+    ? match.homeTeam.avgShots!
+    : +(lambdaHome * 8.6 + 1.8).toFixed(1);
+  const expectedShotsAway = hasRealShotsAway
+    ? match.awayTeam.avgShots!
+    : +(lambdaAway * 8.4 + 1.4).toFixed(1);
+
+  const expectedShotsOnTargetHome = hasRealSotHome
+    ? match.homeTeam.avgShotsOnTarget!
+    : +(lambdaHome * 3.15 + 0.5).toFixed(1);
+  const expectedShotsOnTargetAway = hasRealSotAway
+    ? match.awayTeam.avgShotsOnTarget!
+    : +(lambdaAway * 3.05 + 0.4).toFixed(1);
+
+  const poissonInterval80 = (mean: number, scaleSd = 1.0): [number, number] => {
+    const sd = Math.sqrt(Math.max(0.25, mean)) * scaleSd;
+    return [Math.max(0, +(mean - 1.28 * sd).toFixed(1)), +(mean + 1.28 * sd).toFixed(1)];
+  };
+
+  const cornersMean = Math.max(5.5, expectedCorners);
+  const cardsTotalMean = expectedCardsHome + expectedCardsAway;
+  const cornersInt = poissonInterval80(cornersMean, 1.05);
+  const cardsInt = poissonInterval80(cardsTotalMean, 1.1);
+  const shotsHInt = poissonInterval80(expectedShotsHome, 1.18);
+  const shotsAInt = poissonInterval80(expectedShotsAway, 1.18);
+  const sotHInt = poissonInterval80(expectedShotsOnTargetHome, 1.12);
+  const sotAInt = poissonInterval80(expectedShotsOnTargetAway, 1.12);
+
+  const goalRel: DataReliability = hasHomeMetrics && hasAwayMetrics ? 'verified' : hasHomeMetrics || hasAwayMetrics ? 'estimated' : 'unavailable';
+  const cornersRel: DataReliability =
+    match.homeTeam.avgCorners !== undefined && match.awayTeam.avgCorners !== undefined
+      ? 'verified'
+      : 'estimated';
+  const cardsRel: DataReliability =
+    match.homeTeam.avgYellowCards !== undefined && match.awayTeam.avgYellowCards !== undefined
+      ? 'verified'
+      : 'estimated';
+
+  const expectedStats: StatExpectationWithInterval[] = [
+    {
+      key: 'xg_home',
+      label: `Goles / xG esperados (${match.homeTeam.shortName})`,
+      pointEstimate: +lambdaHome.toFixed(2),
+      intervalLow: Math.max(0, +(lambdaHome - 1.28 * Math.sqrt(lambdaHome)).toFixed(2)),
+      intervalHigh: +(lambdaHome + 1.28 * Math.sqrt(lambdaHome)).toFixed(2),
+      unit: 'goles',
+      reliability: hasHomeMetrics ? 'verified' : 'estimated',
+    },
+    {
+      key: 'xg_away',
+      label: `Goles / xG esperados (${match.awayTeam.shortName})`,
+      pointEstimate: +lambdaAway.toFixed(2),
+      intervalLow: Math.max(0, +(lambdaAway - 1.28 * Math.sqrt(lambdaAway)).toFixed(2)),
+      intervalHigh: +(lambdaAway + 1.28 * Math.sqrt(lambdaAway)).toFixed(2),
+      unit: 'goles',
+      reliability: hasAwayMetrics ? 'verified' : 'estimated',
+    },
+    {
+      key: 'goals_total',
+      label: 'Goles totales esperados',
+      pointEstimate: +expectedGoalsTotal.toFixed(2),
+      intervalLow: Math.max(0, +(expectedGoalsTotal - 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2)),
+      intervalHigh: +(expectedGoalsTotal + 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2),
+      unit: 'goles',
+      reliability: goalRel,
+    },
+    {
+      key: 'shots_home',
+      label: `Tiros totales (${match.homeTeam.shortName})`,
+      pointEstimate: +expectedShotsHome.toFixed(1),
+      intervalLow: shotsHInt[0],
+      intervalHigh: shotsHInt[1],
+      unit: 'tiros',
+      reliability: hasRealShotsHome ? 'verified' : 'estimated',
+      note: hasRealShotsHome ? 'Promedio verificado del equipo' : 'Estimado desde volumen ofensivo xG',
+    },
+    {
+      key: 'shots_away',
+      label: `Tiros totales (${match.awayTeam.shortName})`,
+      pointEstimate: +expectedShotsAway.toFixed(1),
+      intervalLow: shotsAInt[0],
+      intervalHigh: shotsAInt[1],
+      unit: 'tiros',
+      reliability: hasRealShotsAway ? 'verified' : 'estimated',
+      note: hasRealShotsAway ? 'Promedio verificado del equipo' : 'Estimado desde volumen ofensivo xG',
+    },
+    {
+      key: 'sot_home',
+      label: `Tiros a puerta (${match.homeTeam.shortName})`,
+      pointEstimate: +expectedShotsOnTargetHome.toFixed(1),
+      intervalLow: sotHInt[0],
+      intervalHigh: sotHInt[1],
+      unit: 'a puerta',
+      reliability: hasRealSotHome ? 'verified' : 'estimated',
+    },
+    {
+      key: 'sot_away',
+      label: `Tiros a puerta (${match.awayTeam.shortName})`,
+      pointEstimate: +expectedShotsOnTargetAway.toFixed(1),
+      intervalLow: sotAInt[0],
+      intervalHigh: sotAInt[1],
+      unit: 'a puerta',
+      reliability: hasRealSotAway ? 'verified' : 'estimated',
+    },
+    {
+      key: 'corners',
+      label: 'Córners totales esperados',
+      pointEstimate: +cornersMean.toFixed(1),
+      intervalLow: cornersInt[0],
+      intervalHigh: cornersInt[1],
+      unit: 'córners',
+      reliability: cornersRel,
+    },
+    {
+      key: 'yellow_cards',
+      label: 'Tarjetas amarillas esperadas',
+      pointEstimate: +cardsTotalMean.toFixed(1),
+      intervalLow: cardsInt[0],
+      intervalHigh: cardsInt[1],
+      unit: 'tarjetas',
+      reliability: cardsRel,
+    },
+  ];
+
   return {
     lambdaHome,
     lambdaAway,
+    expectedGoalsTotal,
     probHome,
     probDraw,
     probAway,
@@ -388,9 +523,14 @@ export function computeFootballMatchPrediction(
     over25,
     over35,
     bttsYes,
-    expectedCorners: Math.max(5.5, expectedCorners),
+    expectedCorners: cornersMean,
     expectedCardsHome,
     expectedCardsAway,
+    expectedShotsHome,
+    expectedShotsAway,
+    expectedShotsOnTargetHome,
+    expectedShotsOnTargetAway,
+    expectedStats,
     exactScores: exactScores.slice(0, 6),
     absenceImpactSummary: [...homeAdj.notes, ...awayAdj.notes],
     dataConfidence,
@@ -416,9 +556,42 @@ export const FOOTBALL_STAT_CONFIG: Record<
   passes: { label: 'Pases completados', min: 19.5, max: 99.5, step: 1, overdispersion: 0.12, isNormal: true },
 };
 
+function evaluatePlayerLogFreshness(
+  player: PlayerProfile,
+  referenceIso: string
+): { freshness: DataFreshnessStatus; warning?: string } {
+  const latest = player.recentLogs[0]?.date ?? player.lastLogDate;
+  if (!latest) {
+    return {
+      freshness: player.sampleSizeGames > 0 ? 'aging' : 'unknown',
+      warning: player.sampleSizeGames === 0 ? 'Sin partidos individuales recientes registrados.' : undefined,
+    };
+  }
+  const latestMs = new Date(latest).getTime();
+  const refMs = new Date(referenceIso).getTime();
+  if (!Number.isFinite(latestMs) || !Number.isFinite(refMs)) {
+    return { freshness: 'unknown' };
+  }
+  const ageDays = Math.round((refMs - latestMs) / 86_400_000);
+  if (ageDays > 45) {
+    return {
+      freshness: 'stale',
+      warning: `Último partido registrado hace ${ageDays} días (${latest}); la proyección aumenta la incertidumbre por posible cambio de rol o inactividad.`,
+    };
+  }
+  if (ageDays > 21) {
+    return {
+      freshness: 'aging',
+      warning: `Último registro individual hace ${ageDays} días (${latest}).`,
+    };
+  }
+  return { freshness: 'fresh' };
+}
+
 /**
- * Computes Football Player Prop Over/Under distribution adjusted for split, opponent defense,
- * expected minutes, and missing teammates' normalized usage/assist redistribution.
+ * Computes Football Player Prop Over/Under distribution combining Season, L5, L10,
+ * Home/Away context, opponent defense, expected minutes/starter role, freshness check,
+ * and zero-sum normalized teammate redistribution.
  */
 export function computeFootballPlayerProp(
   player: PlayerProfile,
@@ -436,11 +609,35 @@ export function computeFootballPlayerProp(
   const statsQuality: DataReliability =
     player.statsQuality ?? (player.sampleSizeGames >= 5 ? 'verified' : player.sampleSizeGames > 0 ? 'estimated' : 'estimated');
 
-  const splitData = player.splits[timeframe] ?? player.splits.season;
   const seasonData = player.splits.season;
-  const rawSplitVal = splitData[statKey] ?? seasonData[statKey] ?? 0;
+  const last5Data = player.splits.last5 ?? seasonData;
+  const last10Data = player.splits.last10 ?? seasonData;
+  const venueData = isHome ? (player.splits.home ?? seasonData) : (player.splits.away ?? seasonData);
+  const splitData = player.splits[timeframe] ?? seasonData;
+
   const rawSeasonVal = seasonData[statKey] ?? 0;
-  const baseMean = timeframe === 'season' ? rawSeasonVal : rawSplitVal * 0.62 + rawSeasonVal * 0.38;
+  const rawLast5Val = last5Data[statKey] ?? rawSeasonVal;
+  const rawLast10Val = last10Data[statKey] ?? rawSeasonVal;
+  const rawVenueVal = venueData[statKey] ?? rawSeasonVal;
+  const rawSplitVal = splitData[statKey] ?? rawSeasonVal;
+
+  const hasMultiWindowSamples =
+    (last5Data.games ?? 0) > 0 && (last10Data.games ?? 0) > 0 && (seasonData.games ?? 0) > 0;
+
+  // When default 'season' is active and verified multi-window splits exist, blend Season + L10 + L5 + Home/Away cleanly
+  const compositeMean = hasMultiWindowSamples
+    ? rawSeasonVal * 0.30 + rawLast10Val * 0.25 + rawLast5Val * 0.30 + rawVenueVal * 0.15
+    : rawSeasonVal;
+
+  const baseMean =
+    timeframe === 'season'
+      ? compositeMean
+      : rawSplitVal * 0.65 + compositeMean * 0.35;
+
+  const { freshness: dataFreshness, warning: freshnessWarning } = evaluatePlayerLogFreshness(
+    player,
+    match.kickoffIso
+  );
 
   const availFactor = getAvailabilityFactor(player.availability);
   const starterMinutes = Math.max(45, splitData.minutes || 82);
@@ -506,15 +703,30 @@ export function computeFootballPlayerProp(
         );
   const line = customLine ?? defaultLine;
 
-  const sampleConfidence =
-    player.sampleSizeGames <= 0 || statsQuality !== 'verified'
+  const freshnessPenalty = dataFreshness === 'stale' ? 14 : dataFreshness === 'aging' ? 5 : 0;
+  const sampleConfidence = Math.max(
+    18,
+    (player.sampleSizeGames <= 0 || statsQuality !== 'verified'
       ? Math.min(48, 32 + (match.lineupStatus === 'confirmed' ? 12 : 4))
       : Math.min(
           92,
           50 + Math.min(32, player.sampleSizeGames * 1.4) + (match.lineupStatus === 'confirmed' ? 8 : 0)
-        );
+        )) - freshnessPenalty
+  );
 
-  const dispersionInflation = statsQuality === 'verified' ? 1.0 : 1.28;
+  const dispersionInflation =
+    (statsQuality === 'verified' ? 1.0 : 1.28) * (dataFreshness === 'stale' ? 1.18 : 1.0);
+
+  const multiSplitSummary = {
+    seasonAvg: +rawSeasonVal.toFixed(2),
+    last5Avg: +rawLast5Val.toFixed(2),
+    last10Avg: +rawLast10Val.toFixed(2),
+    homeAwayAvg: +rawVenueVal.toFixed(2),
+    h2hAvg: player.splits.h2h?.games ? +(player.splits.h2h[statKey] ?? rawSeasonVal).toFixed(2) : undefined,
+    weightsNote: hasMultiWindowSamples
+      ? 'Modelo ponderado: 30% Temp + 30% L5 + 25% L10 + 15% Local/Visitante'
+      : 'Sin logs completos multi-ventana; se aplica base disponible',
+  };
 
   if (cfg.isNormal) {
     const stdDev = Math.max(5.0, expectedValue * 0.22 * dispersionInflation);
@@ -556,6 +768,9 @@ export function computeFootballPlayerProp(
       sampleSizeGames: player.sampleSizeGames,
       statsQuality,
       statsOriginNote: player.statsOriginNote,
+      dataFreshness,
+      freshnessWarning,
+      multiSplitSummary,
       distribution: bins,
     };
   }
@@ -632,6 +847,89 @@ export function computeFootballPlayerProp(
     sampleSizeGames: player.sampleSizeGames,
     statsQuality,
     statsOriginNote: player.statsOriginNote,
+    dataFreshness,
+    freshnessWarning,
+    multiSplitSummary,
     distribution,
+  };
+}
+
+/**
+ * Generates a specific, transparent pre-match explanation grounded strictly in each team's
+ * verified numbers, recent form, absences, tactical matchup and data sample constraints.
+ */
+export function buildFootballMatchExplanation(
+  match: MatchRecord,
+  pred: FootballPredictionResult
+): MatchNarrativeExplanation {
+  const h = match.homeTeam;
+  const a = match.awayTeam;
+  const homePtsL5 = h.formRecent.reduce((acc, r) => acc + (r === 'W' ? 3 : r === 'D' ? 1 : 0), 0);
+  const awayPtsL5 = a.formRecent.reduce((acc, r) => acc + (r === 'W' ? 3 : r === 'D' ? 1 : 0), 0);
+
+  const favLabel =
+    pred.probHome >= pred.probAway + 0.05
+      ? `Ventaja estadística de ${h.name} (${(pred.probHome * 100).toFixed(1)}% vs ${(pred.probAway * 100).toFixed(1)}%)`
+      : pred.probAway >= pred.probHome + 0.05
+        ? `Ligero favoritismo visitante para ${a.name} (${(pred.probAway * 100).toFixed(1)}% vs ${(pred.probHome * 100).toFixed(1)}%)`
+        : `Duelo muy equilibrado entre ${h.shortName} (${(pred.probHome * 100).toFixed(1)}%) y ${a.shortName} (${(pred.probAway * 100).toFixed(1)}%)`;
+
+  const homeFavoringFactors: string[] = [
+    `Localía y producción esperada de ${pred.lambdaHome.toFixed(2)} xG (${pred.expectedShotsHome.toFixed(1)} tiros totales est.).`,
+  ];
+  if (h.homeRecord) homeFavoringFactors.push(`Balance en casa registrado: ${h.homeRecord}.`);
+  if (h.formRecent.length > 0) homeFavoringFactors.push(`Forma L${h.formRecent.length}: ${h.formRecent.join('-')} (${homePtsL5} de ${h.formRecent.length * 3} pts).`);
+  if (h.ppgOrGpg !== undefined) homeFavoringFactors.push(`Promedio ofensivo reciente: ${h.ppgOrGpg.toFixed(2)} goles/partido.`);
+
+  const awayFavoringFactors: string[] = [
+    `Proyección ofensiva visitante de ${pred.lambdaAway.toFixed(2)} xG (${pred.expectedShotsAway.toFixed(1)} tiros est.).`,
+  ];
+  if (a.awayRecord) awayFavoringFactors.push(`Rendimiento fuera de casa: ${a.awayRecord}.`);
+  if (a.formRecent.length > 0) awayFavoringFactors.push(`Forma L${a.formRecent.length}: ${a.formRecent.join('-')} (${awayPtsL5} de ${a.formRecent.length * 3} pts).`);
+  if (a.ppgOrGpg !== undefined) awayFavoringFactors.push(`Media anotadora: ${a.ppgOrGpg.toFixed(2)} goles/partido.`);
+
+  const homeStrengthsWeaknesses = `${h.shortName}: ${h.ppgOrGpg !== undefined ? `${h.ppgOrGpg.toFixed(2)} GF` : 'GF base'} / ${h.oppgOrGapg !== undefined ? `${h.oppgOrGapg.toFixed(2)} GC` : 'GC base'} · Formación ${h.formation ?? '4-3-3'}.`;
+  const awayStrengthsWeaknesses = `${a.shortName}: ${a.ppgOrGpg !== undefined ? `${a.ppgOrGpg.toFixed(2)} GF` : 'GF base'} / ${a.oppgOrGapg !== undefined ? `${a.oppgOrGapg.toFixed(2)} GC` : 'GC base'} · Formación ${a.formation ?? '4-2-3-1'}.`;
+
+  const h2hAssessment =
+    match.h2hSummary.played >= 4
+      ? `H2H con muestra útil (${match.h2hSummary.played} duelos: ${match.h2hSummary.homeWins}V ${h.shortName}, ${match.h2hSummary.draws}E, ${match.h2hSummary.awayWins}V ${a.shortName}, media ${match.h2hSummary.avgTotalPointsOrGoals.toFixed(2)} goles).`
+      : match.h2hSummary.played > 0
+        ? `Muestra H2H reducida (${match.h2hSummary.played} duelo${match.h2hSummary.played === 1 ? '' : 's'}); el modelo limita su peso al ${Math.min(5, match.h2hSummary.played * 0.8).toFixed(1)}% para evitar conclusiones engañosas.`
+        : 'Sin duelos H2H recientes suficientes; el modelo no aplica ajuste por historial directo.';
+
+  const tacticalMatchups = [
+    `Ritmo esperado del partido: ${pred.expectedGoalsTotal.toFixed(2)} goles totales (BTTS ${(pred.bttsYes * 100).toFixed(1)}% · Over 2.5 ${(pred.over25 * 100).toFixed(1)}%).`,
+    `Volumen territorial estimado: ${pred.expectedCorners.toFixed(1)} córners y ${(pred.expectedCardsHome + pred.expectedCardsAway).toFixed(1)} tarjetas amarillas.`,
+  ];
+
+  const uncertaintiesAndLimits = [...pred.modelWarnings];
+  if (match.lineupStatus !== 'confirmed') {
+    uncertaintiesAndLimits.push(
+      `Alineación actualmente en estado "${match.lineupStatus === 'provisional' ? 'probable' : 'por confirmar'}"; los porcentajes pueden variar al conocerse el once oficial.`
+    );
+  }
+  if (match.provenance?.isStale) {
+    uncertaintiesAndLimits.push(
+      `Advertencia de frescura: datos con ${match.provenance.staleAgeMinutes} min de antigüedad (${match.provenance.errorMessage ?? 'revisar actualización'}).`
+    );
+  }
+
+  return {
+    headline: `${favLabel}. Total esperado: ${pred.expectedGoalsTotal.toFixed(2)} goles.`,
+    homeFavoringFactors,
+    awayFavoringFactors,
+    homeStrengthsWeaknesses,
+    awayStrengthsWeaknesses,
+    keyAbsencesImpact:
+      pred.absenceImpactSummary.length > 0
+        ? pred.absenceImpactSummary
+        : ['No hay bajas de jugadores clave registradas que alteren significativamente el xG proyectado.'],
+    h2hAssessment,
+    tacticalMatchups,
+    uncertaintiesAndLimits:
+      uncertaintiesAndLimits.length > 0
+        ? uncertaintiesAndLimits
+        : [`Cobertura estadística del ${pred.dataConfidence}% sobre métricas verificadas.`],
   };
 }

@@ -13,6 +13,11 @@ import {
   hydrateEspnSoccerMatch,
   teamsMatch,
 } from './espnAdapters.ts';
+import {
+  buildProbableFootballLineups,
+  promoteOfficialToConfirmedLineup,
+  resolveEspnSoccerIdsForMatch,
+} from './footballIntelligence.ts';
 
 function isoDateOffset(days: number): string {
   const d = new Date(Date.now() + days * 86400000);
@@ -1227,7 +1232,7 @@ export async function hydrateLiveMatchDetails(
       0
     );
 
-    return {
+    const baseHydrated: MatchRecord = {
       ...baseMatch,
       homeTeam: {
         ...baseMatch.homeTeam,
@@ -1258,6 +1263,65 @@ export async function hydrateLiveMatchDetails(
         lastMeetings: h2hMeetings,
       },
       updatedAt: fetchedAt,
+    };
+
+    if (homeLineup && awayLineup) {
+      const confirmed = promoteOfficialToConfirmedLineup(
+        baseHydrated,
+        homePlayers,
+        awayPlayers,
+        'API-Football Oficial',
+        fetchedAt,
+        homeLineup.formation,
+        awayLineup.formation
+      );
+      return {
+        ...confirmed,
+        hydrationStatus: 'ok',
+        hydrationNote: 'Once inicial oficial confirmado por API-Football.',
+        provenance: {
+          source: 'API-Football Oficial',
+          fetchedAt,
+          status: 'ok',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: 'real',
+        },
+      };
+    }
+
+    const espnIds = await resolveEspnSoccerIdsForMatch(
+      baseMatch.competition,
+      baseMatch.homeTeam.name,
+      baseMatch.awayTeam.name
+    );
+    const probBundle = await buildProbableFootballLineups({
+      match: baseHydrated,
+      slug: espnIds.slug,
+      homeEspnTeamId: espnIds.homeEspnTeamId,
+      awayEspnTeamId: espnIds.awayEspnTeamId,
+    });
+    const probHome = probBundle.homePlayers.length >= 11 ? probBundle.homePlayers : homePlayers;
+    const probAway = probBundle.awayPlayers.length >= 11 ? probBundle.awayPlayers : awayPlayers;
+    return {
+      ...baseHydrated,
+      homePlayers: probHome,
+      awayPlayers: probAway,
+      lineupStatus: probHome.length > 0 && probAway.length > 0 ? 'provisional' : 'unknown',
+      probableLineup: probBundle.probableLineup,
+      footballNews: probBundle.footballNews,
+      hydrationStatus: probHome.length > 0 ? 'ok' : 'not_published',
+      hydrationNote: probBundle.probableLineup
+        ? 'Alineación probable calculada con últimos partidos + noticias deportivas previas.'
+        : 'Alineación oficial pendiente de publicación.',
+      provenance: {
+        source: `API-Football + ${probBundle.footballNews.sourcesChecked.slice(0, 2).join(', ')}`,
+        fetchedAt,
+        status: probHome.length > 0 ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: probHome.length > 0 ? 'estimated' : 'unavailable',
+      },
     };
   }
 
@@ -1598,9 +1662,7 @@ export async function hydrateLiveMatchDetails(
     ];
 
     const hasConfirmed = homeRes.confirmed && awayRes.confirmed;
-    const hasAnyPlayers = homeRes.players.length > 0 && awayRes.players.length > 0;
-
-    return {
+    let fdHydrated: MatchRecord = {
       ...baseMatch,
       venue: detailRes.venue || baseMatch.venue,
       homeTeam: {
@@ -1627,9 +1689,6 @@ export async function hydrateLiveMatchDetails(
         oppgOrGapg: aHist.oppg ?? baseMatch.awayTeam.oppgOrGapg,
         restDays: aHist.restDays,
       },
-      lineupStatus: hasConfirmed ? 'confirmed' : hasAnyPlayers ? 'provisional' : 'unknown',
-      homePlayers: homeRes.players,
-      awayPlayers: awayRes.players,
       teamStats,
       teamStatsQuality:
         (hHist.ppg !== undefined || baseMatch.homeTeam.ppgOrGpg !== undefined) &&
@@ -1653,15 +1712,84 @@ export async function hydrateLiveMatchDetails(
         avgTotalPointsOrGoals: h2hMeetings.length ? h2hGoals / h2hMeetings.length : 2.5,
         lastMeetings: h2hMeetings,
       },
-      hydrationStatus: hasAnyPlayers ? 'ok' : rateLimited ? 'query_error' : 'partial',
-      hydrationNote: hasConfirmed
-        ? 'Once inicial oficial confirmado + historial reciente L15 y H2H cargados.'
-        : hasAnyPlayers
-          ? 'Once probable generado desde la plantilla oficial y últimos 15 partidos (la alineación definitiva se confirma ~60 min antes del inicio).'
-          : rateLimited
-            ? 'Football-Data.org devolvió HTTP 429 (límite de 10 peticiones/minuto del plan gratuito). Espera ~45 s y vuelve a abrir este partido.'
-            : 'Football-Data.org todavía no devolvió jugadores para este encuentro (convocatoria pendiente).',
       updatedAt: fetchedAt,
+    };
+
+    if (hasConfirmed) {
+      fdHydrated = promoteOfficialToConfirmedLineup(
+        fdHydrated,
+        homeRes.players,
+        awayRes.players,
+        'Football-Data.org Oficial',
+        fetchedAt,
+        detailRes.homeTeam?.formation,
+        detailRes.awayTeam?.formation
+      );
+      return {
+        ...fdHydrated,
+        hydrationStatus: 'ok',
+        hydrationNote: 'Once inicial oficial confirmado + historial reciente L15 y H2H cargados.',
+        provenance: {
+          source: 'Football-Data.org Oficial',
+          fetchedAt,
+          status: 'ok',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: 'real',
+        },
+      };
+    }
+
+    const espnIds = await resolveEspnSoccerIdsForMatch(
+      baseMatch.competition,
+      baseMatch.homeTeam.name,
+      baseMatch.awayTeam.name
+    );
+    const probBundle = await buildProbableFootballLineups({
+      match: {
+        ...fdHydrated,
+        homePlayers: homeRes.players,
+        awayPlayers: awayRes.players,
+      },
+      slug: espnIds.slug,
+      homeEspnTeamId: espnIds.homeEspnTeamId,
+      awayEspnTeamId: espnIds.awayEspnTeamId,
+    });
+
+    const finalHome = probBundle.homePlayers.length >= 11 ? probBundle.homePlayers : homeRes.players;
+    const finalAway = probBundle.awayPlayers.length >= 11 ? probBundle.awayPlayers : awayRes.players;
+    const hasAnyPlayers = finalHome.length > 0 && finalAway.length > 0;
+
+    return {
+      ...fdHydrated,
+      homeTeam: {
+        ...fdHydrated.homeTeam,
+        formation: probBundle.homeFormation ?? fdHydrated.homeTeam.formation,
+      },
+      awayTeam: {
+        ...fdHydrated.awayTeam,
+        formation: probBundle.awayFormation ?? fdHydrated.awayTeam.formation,
+      },
+      lineupStatus: hasAnyPlayers ? 'provisional' : 'unknown',
+      homePlayers: finalHome,
+      awayPlayers: finalAway,
+      probableLineup: probBundle.probableLineup,
+      footballNews: probBundle.footballNews,
+      hydrationStatus: hasAnyPlayers ? 'ok' : rateLimited ? 'query_error' : 'partial',
+      hydrationNote: hasAnyPlayers
+        ? 'Once probable calculado desde últimos partidos + plantilla oficial y fuentes deportivas (se actualizará automáticamente al publicarse el once oficial).'
+        : rateLimited
+          ? 'Football-Data.org devolvió HTTP 429 (límite de 10 peticiones/minuto del plan gratuito). Espera ~45 s y vuelve a abrir este partido.'
+          : 'Football-Data.org todavía no devolvió jugadores para este encuentro (convocatoria pendiente).',
+      provenance: {
+        source: `Football-Data.org + ${probBundle.footballNews.sourcesChecked.slice(0, 2).join(', ')}`,
+        fetchedAt,
+        status: rateLimited ? 'error' : hasAnyPlayers ? 'ok' : 'partial',
+        isStale: rateLimited,
+        staleAgeMinutes: 0,
+        dataType: hasAnyPlayers ? 'estimated' : 'unavailable',
+        errorMessage: rateLimited ? 'HTTP 429 Football-Data.org (rate limit)' : undefined,
+      },
     };
   }
 

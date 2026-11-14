@@ -4,6 +4,8 @@ export type MatchStatus = 'live' | 'today' | 'upcoming' | 'finished';
 
 export type DataReliability = 'verified' | 'estimated' | 'unavailable';
 
+export type DataFreshnessStatus = 'fresh' | 'aging' | 'stale' | 'unknown';
+
 export type AvailabilityStatus =
   | 'confirmed_starter'
   | 'possible_starter'
@@ -99,6 +101,8 @@ export interface PlayerProfile {
   photoUrl?: string;
   availability: AvailabilityStatus;
   availabilityConfidence?: 'confirmed' | 'projected' | 'rumor' | 'unknown';
+  starterConfidence?: number; // 0..100 probability of starting for probable lineups
+  roleReason?: string;
   injuryNote?: string;
   minutesRestriction?: {
     maxMinutes?: number;
@@ -126,6 +130,8 @@ export interface PlayerProfile {
   sampleSizeGames: number;
   statsQuality?: DataReliability;
   statsOriginNote?: string;
+  dataFreshness?: DataFreshnessStatus;
+  lastLogDate?: string;
 }
 
 export interface TeamRecentGame {
@@ -160,11 +166,15 @@ export interface TeamInfo {
   defenseAway?: number;
   avgCorners?: number;
   avgYellowCards?: number;
+  avgShots?: number;
+  avgShotsOnTarget?: number;
   // NBA strength params
   offRating?: number;
   defRating?: number;
   pace?: number;
   homeCourtBoost?: number;
+  avgRebounds?: number;
+  avgAssists?: number;
 }
 
 export interface BookmakerOdd {
@@ -182,6 +192,49 @@ export interface BookmakerOdd {
   threeWayOdds?: [number, number, number];
   bookmaker: string;
   updatedAt: string;
+}
+
+export interface FootballLineupSnapshot {
+  confirmed: boolean;
+  homeFormation?: string;
+  awayFormation?: string;
+  homeStarters: PlayerProfile[];
+  awayStarters: PlayerProfile[];
+  homeSubs: PlayerProfile[];
+  awaySubs: PlayerProfile[];
+  homeAbsences: PlayerProfile[];
+  awayAbsences: PlayerProfile[];
+  sourcesConsulted: string[];
+  officialSource?: string;
+  publishedAt?: string;
+  updatedAt: string;
+  overallConfidence?: number; // 0..100
+  discrepancyDetected?: boolean;
+  discrepancyNote?: string;
+  notes?: string[];
+}
+
+export interface FootballNewsBundle {
+  fetchedAt: string;
+  sourcesChecked: string[];
+  searchGrounding: {
+    available: boolean;
+    used: boolean;
+    status: 'active' | 'unconfigured' | 'error';
+    message?: string;
+    citations?: Array<{ title: string; url: string }>;
+  };
+  items: PlayerNewsItem[];
+}
+
+export interface DataProvenanceMeta {
+  source: string;
+  fetchedAt: string;
+  status: 'ok' | 'partial' | 'stale' | 'error' | 'unavailable';
+  isStale: boolean;
+  staleAgeMinutes: number;
+  dataType: 'real' | 'estimated' | 'unavailable';
+  errorMessage?: string;
 }
 
 export interface MatchRecord {
@@ -203,6 +256,8 @@ export interface MatchRecord {
   lineupStatus: LineupConfirmation;
   homePlayers: PlayerProfile[];
   awayPlayers: PlayerProfile[];
+  probableLineup?: FootballLineupSnapshot;
+  confirmedLineup?: FootballLineupSnapshot;
   h2hSummary: {
     played: number;
     homeWins: number;
@@ -234,9 +289,11 @@ export interface MatchRecord {
     };
     items: PlayerNewsItem[];
   };
+  footballNews?: FootballNewsBundle;
   teamStatsQuality?: DataReliability;
   hydrationStatus?: 'idle' | 'ok' | 'partial' | 'not_published' | 'provider_unavailable' | 'query_error' | 'network_error';
   hydrationNote?: string;
+  provenance?: DataProvenanceMeta;
   dataOrigin: string;
   updatedAt: string;
   isOfflineReference?: boolean;
@@ -262,9 +319,21 @@ export interface StandingEntry {
   awayRecord: string;
 }
 
+export interface StatExpectationWithInterval {
+  key: string;
+  label: string;
+  pointEstimate: number | null;
+  intervalLow: number | null;
+  intervalHigh: number | null;
+  unit?: string;
+  reliability: DataReliability;
+  note?: string;
+}
+
 export interface FootballPredictionResult {
   lambdaHome: number;
   lambdaAway: number;
+  expectedGoalsTotal: number;
   probHome: number;
   probDraw: number;
   probAway: number;
@@ -278,6 +347,11 @@ export interface FootballPredictionResult {
   expectedCorners: number;
   expectedCardsHome: number;
   expectedCardsAway: number;
+  expectedShotsHome: number;
+  expectedShotsAway: number;
+  expectedShotsOnTargetHome: number;
+  expectedShotsOnTargetAway: number;
+  expectedStats: StatExpectationWithInterval[];
   exactScores: Array<{
     home: number;
     away: number;
@@ -297,6 +371,11 @@ export interface NbaPredictionResult {
   expectedAwayPts: number;
   expectedTotal: number;
   expectedSpreadHome: number; // Positive means home favored by X
+  expectedReboundsHome: number;
+  expectedReboundsAway: number;
+  expectedAssistsHome: number;
+  expectedAssistsAway: number;
+  expectedStats: StatExpectationWithInterval[];
   probHomeWin: number;
   probAwayWin: number;
   rawProbHomeWin: number;
@@ -338,13 +417,36 @@ export interface PropProjectionResult {
   sampleSizeGames: number;
   statsQuality: DataReliability;
   statsOriginNote?: string;
+  dataFreshness?: DataFreshnessStatus;
+  freshnessWarning?: string;
+  multiSplitSummary?: {
+    seasonAvg: number;
+    last5Avg: number;
+    last10Avg: number;
+    homeAwayAvg: number;
+    h2hAvg?: number;
+    weightsNote: string;
+  };
   distribution: PropDistributionBin[];
+}
+
+export interface MatchNarrativeExplanation {
+  headline: string;
+  homeFavoringFactors: string[];
+  awayFavoringFactors: string[];
+  homeStrengthsWeaknesses: string;
+  awayStrengthsWeaknesses: string;
+  keyAbsencesImpact: string[];
+  h2hAssessment: string;
+  tacticalMatchups: string[];
+  uncertaintiesAndLimits: string[];
 }
 
 export interface LoggedPrediction {
   id: string;
   createdAt: string;
   sport: SportType;
+  competition?: string;
   matchId: string;
   matchLabel: string;
   market: string;
@@ -375,6 +477,33 @@ export interface EmpiricalCalibrationProfile {
   summary: string;
 }
 
+export interface CalibrationBreakdownRow {
+  key: string;
+  label: string;
+  count: number;
+  hitRatePct: number;
+  brierScore: number;
+  logLoss: number;
+  ecePct: number;
+  mae: number;
+  rmse: number;
+}
+
+export interface TemporalValidationResult {
+  evaluatedCount: number;
+  skippedWarmup: number;
+  baseBrier: number;
+  calibratedBrier: number;
+  baseLogLoss: number;
+  calibratedLogLoss: number;
+  baseEcePct: number;
+  calibratedEcePct: number;
+  improvementBrierPct: number;
+  activeRatePct: number;
+  leakFreeVerified: boolean;
+  note: string;
+}
+
 export interface HistoryEvaluationMetrics {
   totalLogged: number;
   resolvedCount: number;
@@ -394,6 +523,10 @@ export interface HistoryEvaluationMetrics {
     football: EmpiricalCalibrationProfile;
     nba: EmpiricalCalibrationProfile;
   };
+  temporalValidation: TemporalValidationResult;
+  breakdownBySport: CalibrationBreakdownRow[];
+  breakdownByCompetition: CalibrationBreakdownRow[];
+  breakdownByMarket: CalibrationBreakdownRow[];
 }
 
 export type FootballProviderId = 'api-football' | 'football-data' | 'espn-football';
@@ -413,6 +546,24 @@ export interface ApiSecurityStatus {
   pinConfigured: boolean;
   unlocked: boolean;
   envProtected: boolean;
+}
+
+export interface LiveFeedSourceStatus {
+  sport: SportType;
+  provider: string;
+  status: 'ok' | 'error' | 'stale';
+  updatedAt: string;
+  matchCount: number;
+  error?: string;
+}
+
+export interface LiveFeedMeta {
+  fetchedAt: string;
+  fromCache: boolean;
+  cacheAgeMinutes: number;
+  isStale: boolean;
+  staleReason?: string;
+  sources: LiveFeedSourceStatus[];
 }
 
 export interface ApiConfigState {
