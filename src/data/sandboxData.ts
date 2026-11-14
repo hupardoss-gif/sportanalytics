@@ -132,6 +132,72 @@ function makeNbaLogs(
   }));
 }
 
+function makeFootballGkSplits(
+  base: {
+    minutes: number;
+    saves: number;
+    goalsConceded: number;
+    savePct: number;
+    cleanSheets: number;
+    fc: number;
+    fd: number;
+    yc: number;
+    passes: number;
+  },
+  starterRate = 0.96
+): PlayerProfile['splits'] {
+  const scale = (m: number, g: number): StatSplitValues => ({
+    games: g,
+    minutes: Math.round(base.minutes),
+    starterRate,
+    saves: +(base.saves * m).toFixed(2),
+    goalsConceded: +(base.goalsConceded / Math.max(0.85, m)).toFixed(2),
+    savePct: +Math.min(92, base.savePct * (0.98 + (m - 1) * 0.25)).toFixed(1),
+    cleanSheets: +(Math.min(1, base.cleanSheets * m)).toFixed(2),
+    foulsCommitted: +(base.fc * m).toFixed(2),
+    foulsDrawn: +(base.fd * m).toFixed(2),
+    yellowCards: +(base.yc * m).toFixed(2),
+    redCards: 0.01,
+    passes: Math.round(base.passes * m),
+  });
+  return {
+    season: scale(1, 24),
+    last5: scale(1.06, 5),
+    last10: scale(1.02, 10),
+    last15: scale(1.01, 15),
+    home: scale(1.08, 12),
+    away: scale(0.93, 12),
+    h2h: scale(1.04, 4),
+  };
+}
+
+function makeFootballGkLogs(
+  oppList: string[],
+  baseSaves: number,
+  baseConceded: number,
+  basePasses: number
+) {
+  return oppList.map((opp, idx) => ({
+    date: `2026-10-${String(28 - idx * 4).padStart(2, '0')}`,
+    opponent: opp,
+    isHome: idx % 2 === 0,
+    minutes: 90,
+    stats: {
+      saves: Math.max(1, Math.round(baseSaves + ((idx % 3) - 1))),
+      goalsConceded: Math.max(0, Math.round(baseConceded + (idx === 1 ? 1 : idx === 3 ? -1 : 0))),
+      foulsCommitted: 0,
+      foulsDrawn: idx % 2 === 0 ? 1 : 0,
+      yellowCards: idx === 4 ? 1 : 0,
+      passes: Math.round(basePasses + (idx % 3) * 3 - 2),
+    },
+  }));
+}
+
+function isSandboxGoalkeeper(pos: string): boolean {
+  const norm = pos.trim().toUpperCase();
+  return norm === 'POR' || norm === 'GK' || norm.includes('GOALKEEPER') || norm.includes('PORTERO');
+}
+
 function buildFootballTeamRoster(
   teamId: string,
   teamName: string,
@@ -156,6 +222,10 @@ function buildFootballTeamRoster(
     assists: number;
     shots: number;
     sot: number;
+    saves?: number;
+    goalsConceded?: number;
+    savePct?: number;
+    cleanSheets?: number;
     fc: number;
     fd: number;
     yc: number;
@@ -178,42 +248,64 @@ function buildFootballTeamRoster(
     ? ['VAL', 'SEV', 'BET', 'ATH', 'GIR']
     : ['GET', 'OSA', 'CEL', 'SOC', 'VIL'];
 
-  const list: PlayerProfile[] = starters.map((p) => ({
-    id: p.id,
-    sport: 'football',
-    name: p.name,
-    shortName: p.short,
-    teamId,
-    teamName,
-    teamShort,
-    number: p.num,
-    position: p.pos,
-    availability: p.avail ?? 'starter',
-    injuryNote: p.injuryNote,
-    isKeyPlayer: !!p.key,
-    pitchCoord: { x: p.x, y: p.y },
-    impact: {
-      offenseDelta: p.off,
-      defenseDelta: p.def,
-      usageShare: p.usage,
-      assistShare: p.astShare,
-    },
-    splits: makeFootballSplits({
-      minutes: 84,
-      goals: p.goals,
-      assists: p.assists,
-      shots: p.shots,
-      sot: p.sot,
-      fc: p.fc,
-      fd: p.fd,
-      yc: p.yc,
-      passes: p.passes,
-    }),
-    recentLogs: makeFootballLogs(oppSamples, p.shots, p.goals, p.assists, p.fc, p.passes),
-    sampleSizeGames: 24,
-    statsQuality: 'verified',
-    statsOriginNote: 'Datos simulados de referencia offline',
-  }));
+  const list: PlayerProfile[] = starters.map((p) => {
+    const isGk = isSandboxGoalkeeper(p.pos);
+    const savesBase = p.saves ?? 2.85;
+    const concededBase = p.goalsConceded ?? 0.92;
+    const savePctBase = p.savePct ?? 76.2;
+    const cleanSheetsBase = p.cleanSheets ?? 0.42;
+
+    return {
+      id: p.id,
+      sport: 'football',
+      name: p.name,
+      shortName: p.short,
+      teamId,
+      teamName,
+      teamShort,
+      number: p.num,
+      position: p.pos,
+      availability: p.avail ?? 'starter',
+      injuryNote: p.injuryNote,
+      isKeyPlayer: !!p.key,
+      pitchCoord: { x: p.x, y: p.y },
+      impact: {
+        offenseDelta: p.off,
+        defenseDelta: p.def,
+        usageShare: p.usage,
+        assistShare: p.astShare,
+      },
+      splits: isGk
+        ? makeFootballGkSplits({
+            minutes: 90,
+            saves: savesBase,
+            goalsConceded: concededBase,
+            savePct: savePctBase,
+            cleanSheets: cleanSheetsBase,
+            fc: p.fc,
+            fd: p.fd,
+            yc: p.yc,
+            passes: p.passes,
+          })
+        : makeFootballSplits({
+            minutes: 84,
+            goals: p.goals,
+            assists: p.assists,
+            shots: p.shots,
+            sot: p.sot,
+            fc: p.fc,
+            fd: p.fd,
+            yc: p.yc,
+            passes: p.passes,
+          }),
+      recentLogs: isGk
+        ? makeFootballGkLogs(oppSamples, savesBase, concededBase, p.passes)
+        : makeFootballLogs(oppSamples, p.shots, p.goals, p.assists, p.fc, p.passes),
+      sampleSizeGames: 24,
+      statsQuality: 'verified',
+      statsOriginNote: 'Datos simulados de referencia offline',
+    };
+  });
 
   for (const b of bench) {
     list.push({

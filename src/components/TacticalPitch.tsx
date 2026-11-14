@@ -438,9 +438,15 @@ export const TacticalPitch: React.FC<TacticalPitchProps> = ({
             </span>
           </div>
 
+          {fbNews.freshnessWarning && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-[11px] text-amber-200/95">
+              {fbNews.freshnessWarning}
+            </div>
+          )}
+
           {fbNews.items.length === 0 ? (
             <p className="text-xs text-slate-400">
-              No se detectaron titulares específicos de lesiones o convocatorias para este partido en las últimas horas.
+              No hay información reciente verificable de lesiones o convocatorias para este partido dentro de la ventana de actualidad permitida.
             </p>
           ) : (
             <div className="divide-y divide-slate-800/70">
@@ -459,16 +465,16 @@ export const TacticalPitch: React.FC<TacticalPitchProps> = ({
                       </span>
                       <span className="font-semibold text-slate-200">{item.source}</span>
                     </div>
-                    {item.publishedAt && (
-                      <span className="text-[11px] font-mono tabular-nums text-slate-400">
-                        {new Date(item.publishedAt).toLocaleString('es-ES', {
-                          day: '2-digit',
-                          month: 'short',
-                          hour: '2-digit',
-                          minute: '2-digit',
-                        })}
-                      </span>
-                    )}
+                    <span className="text-[11px] font-mono tabular-nums text-slate-400">
+                      {item.publishedAt
+                        ? new Date(item.publishedAt).toLocaleString('es-ES', {
+                            day: '2-digit',
+                            month: 'short',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })
+                        : 'Fecha no publicada por la fuente'}
+                    </span>
                   </div>
                   <p className="font-medium text-slate-100">{item.headline}</p>
                   {item.summary && <p className="text-slate-400 leading-relaxed">{item.summary}</p>}
@@ -511,9 +517,9 @@ export const TacticalPitch: React.FC<TacticalPitchProps> = ({
 
         {showBench && (
           <div className="p-4 border-t border-slate-800 space-y-4">
-            {[...homePlayers, ...awayPlayers].some((p) => p.statsQuality === 'estimated') && (
-              <p className="text-[11px] text-amber-200/90 rounded-lg border border-amber-500/25 bg-amber-950/20 px-3 py-2">
-                Nota de datos: cuando el proveedor no publica logs individuales completos por encuentro, las métricas base por jugador reflejan estimaciones posicionales marcadas en su ficha.
+            {[...homePlayers, ...awayPlayers].some((p) => p.statsQuality === 'unavailable') && (
+              <p className="text-[11px] text-slate-300 rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2">
+                Nota de datos: cuando el proveedor actual no publica registros individuales del jugador, la ficha muestra «No disponible» sin asignar promedios ficticios por posición.
               </p>
             )}
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

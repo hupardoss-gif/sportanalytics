@@ -17,12 +17,24 @@ import {
   runTemporalValidation,
 } from '../src/engine/calibrationEngine.ts';
 import {
+  buildFootballPlayerFromHistory,
   promoteOfficialToConfirmedLineup,
   selectProbableSideFromHistory,
   type EspnSoccerTeamLineupHistory,
 } from '../server/footballIntelligence.ts';
+import {
+  applyNewsAndInjuriesToNbaPlayers,
+  normalizeNbaName,
+  type ParsedInjuryRecord,
+} from '../server/nbaIntelligence.ts';
+import { evaluateMatchStatOverUnder } from '../src/engine/distributionMath.ts';
 import { evaluateFeedStaleness, evaluateMatchProvenance } from '../server/dataHealth.ts';
-import type { LoggedPrediction, PlayerProfile } from '../src/types/sports.ts';
+import {
+  mergeHydratedMatchDetails,
+  mergeMatchesAcrossSources,
+  mergeStandingsAcrossSources,
+} from '../server/liveAdapters.ts';
+import type { LoggedPrediction, MatchRecord, PlayerNewsItem, PlayerProfile, StandingEntry } from '../src/types/sports.ts';
 
 function cloneMatch<T>(m: T): T {
   return JSON.parse(JSON.stringify(m)) as T;
@@ -69,6 +81,7 @@ test('Football probable XI reduces starter confidence on cross-source discrepanc
         source: 'Marca',
         headline: 'Lucas Mediapunta es duda por molestias musculares',
         summary: 'Lucas Mediapunta tiene molestias y apunta a rotación.',
+        publishedAt: new Date().toISOString(),
         confirmed: false,
         playerNames: ['Lucas Mediapunta'],
       },
@@ -196,7 +209,9 @@ test('Player projections blend multi-splits, redistribute NBA absences cleanly, 
   assert.ok(staleNba.sampleConfidence < freshNba.sampleConfidence, 'Stale log should reduce sampleConfidence');
 
   const fbMatch = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'football')!);
-  const fbPlayer = cloneMatch(fbMatch.homePlayers[0]);
+  const fbPlayer = cloneMatch(
+    fbMatch.homePlayers.find((p) => p.position !== 'POR') ?? fbMatch.homePlayers[1]
+  );
   const fbStaleDate = new Date(new Date(fbMatch.kickoffIso).getTime() - 65 * 86_400_000)
     .toISOString()
     .slice(0, 10);
@@ -323,3 +338,506 @@ test('runTemporalValidation prevents future data leakage and produces sport/comp
   assert.ok(metrics.breakdownByCompetition.length === 3);
   assert.ok(metrics.breakdownByMarket.length === 2);
 });
+
+test('buildFootballPlayerFromHistory never invents positional stats and computeFootballPlayerProp returns unavailable', () => {
+  const player = buildFootballPlayerFromHistory(
+    {
+      athleteId: 'no-stats-9',
+      name: 'Delantero Sin Stats',
+      shortName: 'Sin Stats',
+      number: 9,
+      posCode: 'F',
+      posLabel: 'FWD',
+      recentStarts: 4,
+      recentAppearances: 5,
+    },
+    0,
+    true,
+    5,
+    'team-x',
+    'Equipo X',
+    'EQX',
+    true
+  );
+
+  assert.equal(player.statsQuality, 'unavailable');
+  assert.equal(player.sampleSizeGames, 0);
+  assert.equal(player.splits.season.goals, undefined);
+  assert.equal(player.splits.season.shots, undefined);
+  assert.equal(player.splits.season.assists, undefined);
+  assert.equal(player.splits.season.passes, undefined);
+
+  const fbMatch = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'football')!);
+  const propRes = computeFootballPlayerProp(player, fbMatch, 'shots', 1.5, 'season');
+  assert.equal(propRes.unavailable, true);
+  assert.equal(propRes.statsQuality, 'unavailable');
+  assert.equal(propRes.distribution.length, 0);
+});
+
+test('Strict publication-date freshness ignores stale and undated news in Football and NBA', () => {
+  const nowMs = Date.UTC(2026, 10, 14, 12, 0, 0);
+  const oldIso = new Date(nowMs - 14 * 86_400_000).toISOString();
+  const freshIso = new Date(nowMs - 1 * 86_400_000).toISOString();
+
+  // Football: stale (>7d) and undated news must NOT change starter status
+  const history: EspnSoccerTeamLineupHistory = {
+    teamId: 'espn-fresh',
+    teamName: 'Club Actual',
+    teamShort: 'CA',
+    formation: '4-3-3',
+    matchesAnalyzed: 3,
+    sources: ['ESPN'],
+    players: [
+      { athleteId: 'p1', name: 'Carlos Meta', shortName: 'Meta', number: 1, posCode: 'G', posLabel: 'GK', recentStarts: 3, recentAppearances: 3 },
+      { athleteId: 'p2', name: 'Marco Estrella', shortName: 'Estrella', number: 9, posCode: 'F', posLabel: 'FWD', recentStarts: 3, recentAppearances: 3 },
+    ],
+  };
+
+  const ignoredFb = selectProbableSideFromHistory(
+    history,
+    'ca',
+    'Club Actual',
+    'CA',
+    [
+      {
+        id: 'old-fb',
+        source: 'Marca',
+        headline: 'Marco Estrella lesionado y baja',
+        summary: 'Noticia antigua de hace dos semanas.',
+        publishedAt: oldIso,
+        confirmed: true,
+        playerNames: ['Marco Estrella'],
+      },
+      {
+        id: 'undated-fb',
+        source: 'AS',
+        headline: 'Marco Estrella descartado hoy',
+        summary: 'Sin fecha de publicación verificable.',
+        confirmed: false,
+        playerNames: ['Marco Estrella'],
+      },
+    ],
+    [],
+    nowMs
+  );
+  const estrellaIgnored = ignoredFb.allPlayers.find((p) => p.name === 'Marco Estrella');
+  assert.equal(estrellaIgnored?.availability, 'possible_starter');
+
+  // NBA: stale (>10d injury / >5d news) & undated news must NOT mutate availability
+  const nbaMatch = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'nba')!);
+  const targetNba = cloneMatch(nbaMatch.homePlayers[0]);
+  targetNba.availability = 'confirmed_starter';
+  targetNba.injuryNote = undefined;
+
+  const staleAndUndatedInjuries: ParsedInjuryRecord[] = [
+    {
+      athleteId: targetNba.id.replace('espn-nba-p-', ''),
+      playerName: targetNba.name,
+      normalizedName: normalizeNbaName(targetNba.name),
+      teamId: targetNba.teamId,
+      teamName: targetNba.teamName,
+      status: 'out',
+      statusTag: 'OUT',
+      confirmed: true,
+      source: 'ESPN NBA Injuries',
+      publishedAt: oldIso,
+      headline: `${targetNba.name} is OUT (old)`,
+      summary: 'Old injury report',
+    },
+    {
+      athleteId: targetNba.id.replace('espn-nba-p-', ''),
+      playerName: targetNba.name,
+      normalizedName: normalizeNbaName(targetNba.name),
+      teamId: targetNba.teamId,
+      teamName: targetNba.teamName,
+      status: 'doubtful',
+      statusTag: 'DOUBTFUL',
+      confirmed: false,
+      source: 'NBA Wire',
+      headline: `${targetNba.name} doubtful tonight`,
+      summary: 'Missing timestamp',
+    },
+  ];
+  const stalePressNews: PlayerNewsItem[] = [
+    {
+      id: 'nba-old-press',
+      source: 'ESPN NBA',
+      confirmed: false,
+      teamShort: targetNba.teamShort,
+      playerNames: [targetNba.name],
+      headline: `${targetNba.name} questionable`,
+      summary: 'Old news',
+      publishedAt: new Date(nowMs - 7 * 86_400_000).toISOString(),
+    },
+  ];
+  const untouchedNba = applyNewsAndInjuriesToNbaPlayers(
+    [targetNba],
+    staleAndUndatedInjuries,
+    stalePressNews,
+    true,
+    nowMs
+  );
+  assert.equal(untouchedNba[0].availability, 'confirmed_starter');
+
+  // Fresh injury (<2d) MUST update availability
+  const freshNbaInjury: ParsedInjuryRecord[] = [
+    {
+      athleteId: targetNba.id.replace('espn-nba-p-', ''),
+      playerName: targetNba.name,
+      normalizedName: normalizeNbaName(targetNba.name),
+      teamId: targetNba.teamId,
+      teamName: targetNba.teamName,
+      status: 'out',
+      statusTag: 'OUT',
+      confirmed: true,
+      source: 'ESPN NBA Injuries',
+      publishedAt: freshIso,
+      headline: `${targetNba.name} ruled out`,
+      summary: 'Ruled out today',
+    },
+  ];
+  const updatedNba = applyNewsAndInjuriesToNbaPlayers(
+    [targetNba],
+    freshNbaInjury,
+    [],
+    true,
+    nowMs
+  );
+  assert.equal(updatedNba[0].availability, 'out');
+});
+
+test('Team expected stats mark missing bases as unavailable and never label derived metrics as verified', () => {
+  // Unhydrated Football match with zero scoring/corners/cards/recentGames
+  const emptyFb = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'football')!);
+  emptyFb.homeTeam.attackHome = undefined;
+  emptyFb.homeTeam.defenseHome = undefined;
+  emptyFb.homeTeam.attackAway = undefined;
+  emptyFb.homeTeam.defenseAway = undefined;
+  emptyFb.homeTeam.ppgOrGpg = undefined;
+  emptyFb.homeTeam.oppgOrGapg = undefined;
+  emptyFb.homeTeam.avgCorners = undefined;
+  emptyFb.homeTeam.avgYellowCards = undefined;
+  emptyFb.homeTeam.avgShots = undefined;
+  emptyFb.homeTeam.avgShotsOnTarget = undefined;
+  emptyFb.homeTeam.recentGames = [];
+  emptyFb.awayTeam.attackHome = undefined;
+  emptyFb.awayTeam.defenseHome = undefined;
+  emptyFb.awayTeam.attackAway = undefined;
+  emptyFb.awayTeam.defenseAway = undefined;
+  emptyFb.awayTeam.ppgOrGpg = undefined;
+  emptyFb.awayTeam.oppgOrGapg = undefined;
+  emptyFb.awayTeam.avgCorners = undefined;
+  emptyFb.awayTeam.avgYellowCards = undefined;
+  emptyFb.awayTeam.avgShots = undefined;
+  emptyFb.awayTeam.avgShotsOnTarget = undefined;
+  emptyFb.awayTeam.recentGames = [];
+
+  const fbPred = computeFootballMatchPrediction(emptyFb);
+  const corners = fbPred.expectedStats.find((s) => s.key === 'corners')!;
+  const cards = fbPred.expectedStats.find((s) => s.key === 'yellow_cards')!;
+  assert.equal(corners.reliability, 'unavailable');
+  assert.equal(corners.pointEstimate, null);
+  assert.equal(corners.distributionSpec, undefined);
+  assert.equal(cards.reliability, 'unavailable');
+  assert.equal(cards.pointEstimate, null);
+
+  // When only goals/attack exist (no real corners/cards), derived values MUST be 'estimated' (never 'verified')
+  const scoringOnlyFb = cloneMatch(emptyFb);
+  scoringOnlyFb.homeTeam.ppgOrGpg = 1.9;
+  scoringOnlyFb.homeTeam.oppgOrGapg = 0.9;
+  scoringOnlyFb.awayTeam.ppgOrGpg = 1.4;
+  scoringOnlyFb.awayTeam.oppgOrGapg = 1.2;
+  const scoringOnlyPred = computeFootballMatchPrediction(scoringOnlyFb);
+  assert.equal(scoringOnlyPred.expectedStats.find((s) => s.key === 'corners')?.reliability, 'estimated');
+  assert.equal(scoringOnlyPred.expectedStats.find((s) => s.key === 'yellow_cards')?.reliability, 'estimated');
+
+  // Unhydrated NBA match missing rebounds, assists, pace & empty players
+  const emptyNba = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'nba')!);
+  emptyNba.homeTeam.avgRebounds = undefined;
+  emptyNba.homeTeam.avgAssists = undefined;
+  emptyNba.homeTeam.pace = undefined;
+  emptyNba.homeTeam.offRating = undefined;
+  emptyNba.homeTeam.defRating = undefined;
+  emptyNba.homeTeam.ppgOrGpg = undefined;
+  emptyNba.homeTeam.oppgOrGapg = undefined;
+  emptyNba.awayTeam.avgRebounds = undefined;
+  emptyNba.awayTeam.avgAssists = undefined;
+  emptyNba.awayTeam.pace = undefined;
+  emptyNba.awayTeam.offRating = undefined;
+  emptyNba.awayTeam.defRating = undefined;
+  emptyNba.awayTeam.ppgOrGpg = undefined;
+  emptyNba.awayTeam.oppgOrGapg = undefined;
+  emptyNba.homeTeam.recentGames = [];
+  emptyNba.awayTeam.recentGames = [];
+  emptyNba.homePlayers = [];
+  emptyNba.awayPlayers = [];
+
+  const nbaPred = computeNbaMatchPrediction(emptyNba);
+  for (const key of ['pace', 'reb_home', 'reb_away', 'ast_home', 'ast_away']) {
+    const stat = nbaPred.expectedStats.find((s) => s.key === key)!;
+    assert.equal(stat.reliability, 'unavailable');
+    assert.equal(stat.pointEstimate, null);
+    assert.equal(stat.distributionSpec, undefined);
+  }
+});
+
+test('runTemporalValidation strictly excludes resolved records without valid resolvedAt (zero createdAt fallback)', () => {
+  const baseTime = Date.UTC(2026, 8, 1, 12, 0, 0);
+  const validItems: LoggedPrediction[] = Array.from({ length: 18 }, (_, i) => ({
+    id: `valid-${i}`,
+    createdAt: new Date(baseTime + i * 86_400_000).toISOString(),
+    resolvedAt: new Date(baseTime + i * 86_400_000 + 3 * 3600_000).toISOString(),
+    sport: 'football',
+    competition: 'LaLiga',
+    matchId: `mv-${i}`,
+    matchLabel: `Equipo ${i}`,
+    market: 'Resultado Final (1X2)',
+    selection: 'Local',
+    predictedProb: 0.65,
+    rawPredictedProb: 0.65,
+    status: i % 2 === 0 ? 'won' : 'lost',
+  }));
+
+  const missingResolvedAt: LoggedPrediction = {
+    id: 'missing-resolved',
+    createdAt: new Date(baseTime - 10 * 86_400_000).toISOString(),
+    resolvedAt: undefined,
+    sport: 'football',
+    competition: 'LaLiga',
+    matchId: 'm-missing',
+    matchLabel: 'Sin resolvedAt',
+    market: 'Resultado Final (1X2)',
+    selection: 'Local',
+    predictedProb: 0.99,
+    rawPredictedProb: 0.99,
+    status: 'lost',
+  };
+
+  const withMissing = runTemporalValidation([...validItems, missingResolvedAt]);
+  const withoutMissing = runTemporalValidation(validItems);
+  assert.equal(withMissing.evaluatedCount, withoutMissing.evaluatedCount);
+  assert.equal(withMissing.calibratedBrier, withoutMissing.calibratedBrier);
+  assert.match(withMissing.note, /excluida/i);
+});
+
+test('Goalkeepers use exclusive saves/conceded stats cleanly and return unavailable for outfield attack stats', () => {
+  const fbMatch = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'football')!);
+  const courtois = fbMatch.homePlayers.find((p) => p.id === 'rma-1')!;
+  assert.equal(courtois.position, 'POR');
+  assert.equal(courtois.splits.season.goals, undefined);
+  assert.equal(courtois.splits.season.shots, undefined);
+  assert.ok((courtois.splits.season.saves ?? 0) > 1.5);
+  assert.ok((courtois.splits.last5?.saves ?? 0) > 0);
+  assert.ok((courtois.splits.last10?.saves ?? 0) > 0);
+
+  const savesProp = computeFootballPlayerProp(courtois, fbMatch, 'saves', 2.5, 'season');
+  assert.notEqual(savesProp.unavailable, true);
+  assert.ok(savesProp.expectedValue > 0.5 && savesProp.distribution.length > 0);
+  assert.ok(Math.abs(savesProp.probOver + savesProp.probUnder - 100) < 0.2);
+
+  const concededProp = computeFootballPlayerProp(courtois, fbMatch, 'goalsConceded', 0.5, 'season');
+  assert.notEqual(concededProp.unavailable, true);
+  assert.ok(concededProp.distribution.length > 0);
+
+  const attackMismatch = computeFootballPlayerProp(courtois, fbMatch, 'goals', 0.5, 'season');
+  assert.equal(attackMismatch.unavailable, true);
+  assert.equal(attackMismatch.distribution.length, 0);
+});
+
+test('evaluateMatchStatOverUnder computes monotonic complementary Over/Under probabilities for all match markets', () => {
+  const fbMatch = SANDBOX_MATCHES.find((m) => m.sport === 'football')!;
+  const fbPred = computeFootballMatchPrediction(fbMatch);
+  for (const stat of fbPred.expectedStats) {
+    assert.ok(stat.distributionSpec, `Expected distributionSpec on Football market ${stat.key}`);
+    const baseEval = evaluateMatchStatOverUnder(stat);
+    assert.equal(baseEval.available, true);
+    if (baseEval.available) {
+      assert.ok(Math.abs(baseEval.probOver + baseEval.probUnder - 100) < 0.2);
+      const lowEval = evaluateMatchStatOverUnder(stat, baseEval.minLine);
+      const highEval = evaluateMatchStatOverUnder(stat, baseEval.maxLine);
+      assert.ok(lowEval.available && highEval.available);
+      if (lowEval.available && highEval.available) {
+        assert.ok(
+          lowEval.probOver >= highEval.probOver,
+          `Monotonicity violated on ${stat.key}: ${lowEval.probOver} < ${highEval.probOver}`
+        );
+      }
+    }
+  }
+
+  const nbaMatch = SANDBOX_MATCHES.find((m) => m.sport === 'nba')!;
+  const nbaPred = computeNbaMatchPrediction(nbaMatch);
+  for (const stat of nbaPred.expectedStats) {
+    assert.ok(stat.distributionSpec, `Expected distributionSpec on NBA market ${stat.key}`);
+    const baseEval = evaluateMatchStatOverUnder(stat);
+    assert.equal(baseEval.available, true);
+    if (baseEval.available) {
+      assert.ok(Math.abs(baseEval.probOver + baseEval.probUnder - 100) < 0.2);
+      const lowEval = evaluateMatchStatOverUnder(stat, baseEval.minLine);
+      const highEval = evaluateMatchStatOverUnder(stat, baseEval.maxLine);
+      assert.ok(lowEval.available && highEval.available);
+      if (lowEval.available && highEval.available) {
+        assert.ok(
+          lowEval.probOver >= highEval.probOver,
+          `Monotonicity violated on ${stat.key}: ${lowEval.probOver} < ${highEval.probOver}`
+        );
+      }
+    }
+  }
+
+  // Unavailable market returns available: false
+  const unavailableEval = evaluateMatchStatOverUnder({
+    key: 'corners',
+    label: 'Córners totales esperados',
+    pointEstimate: null,
+    intervalLow: null,
+    intervalHigh: null,
+    reliability: 'unavailable',
+  });
+  assert.equal(unavailableEval.available, false);
+});
+
+test('mergeMatchesAcrossSources combines user APIs and ESPN simultaneously and detects cross-source discrepancies', () => {
+  const baseFb = cloneMatch(SANDBOX_MATCHES.find((m) => m.sport === 'football')!);
+  const fdMatch: MatchRecord = {
+    ...baseFb,
+    id: 'fd-99901',
+    venue: 'Sede oficial',
+    score: { home: 2, away: 1 },
+    homeTeam: {
+      ...baseFb.homeTeam,
+      id: 'fd-team-1',
+      name: 'Real Madrid CF',
+      record: 'Football-Data.org',
+      formRecent: [],
+      recentGames: [],
+    },
+    awayTeam: {
+      ...baseFb.awayTeam,
+      id: 'fd-team-2',
+      name: 'FC Barcelona',
+      record: 'Football-Data.org',
+      formRecent: [],
+      recentGames: [],
+    },
+    teamStatsQuality: 'unavailable',
+    dataOrigin: 'Football-Data.org v4',
+  };
+
+  const espnMatch: MatchRecord = {
+    ...baseFb,
+    id: 'espnsoc-esp.1-888',
+    venue: 'Santiago Bernabéu',
+    score: { home: 2, away: 0 }, // Intentional discrepancy with Football-Data
+    homeTeam: {
+      ...baseFb.homeTeam,
+      id: 'espnsoc-team-86',
+      name: 'Real Madrid',
+      record: '10-2-1 · 32 pts',
+      formRecent: ['W', 'W', 'D', 'W', 'W'],
+    },
+    awayTeam: {
+      ...baseFb.awayTeam,
+      id: 'espnsoc-team-83',
+      name: 'Barcelona',
+      record: '9-2-2 · 29 pts',
+      formRecent: ['W', 'L', 'W', 'W', 'D'],
+    },
+    teamStatsQuality: 'verified',
+    dataOrigin: 'ESPN Soccer Oficial',
+  };
+
+  const merged = mergeMatchesAcrossSources([
+    { provider: 'football-data', label: 'Football-Data.org v4', matches: [fdMatch] },
+    { provider: 'espn-football', label: 'ESPN Fútbol Oficial', matches: [espnMatch] },
+  ]);
+
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].id, 'fd-99901');
+  assert.equal(merged[0].sourceIds?.['football-data'], 'fd-99901');
+  assert.equal(merged[0].sourceIds?.['espn-football'], 'espnsoc-esp.1-888');
+  assert.equal(merged[0].venue, 'Santiago Bernabéu');
+  assert.equal(merged[0].homeTeam.record, '10-2-1 · 32 pts');
+  assert.deepEqual(merged[0].homeTeam.formRecent, ['W', 'W', 'D', 'W', 'W']);
+  assert.equal(merged[0].teamStatsQuality, 'verified');
+  assert.ok((merged[0].verifiedSources?.length ?? 0) === 2);
+  assert.ok(merged[0].sourceDiscrepancies?.some((d) => d.includes('Marcador distinto')));
+
+  // Hydrated merge enriches skeleton players from Football-Data with real stats/injuries from ESPN
+  const fdSkeletonPlayer: PlayerProfile = {
+    ...cloneMatch(baseFb.homePlayers[1]),
+    id: 'fd-p-101',
+    name: 'Vinicius Junior',
+    availability: 'possible_starter',
+    statsQuality: 'unavailable',
+    sampleSizeGames: 0,
+    recentLogs: [],
+  };
+  const espnRichPlayer: PlayerProfile = {
+    ...cloneMatch(baseFb.homePlayers[1]),
+    id: 'espn-p-101',
+    name: 'Vinicius Júnior',
+    availability: 'out',
+    availabilityConfidence: 'confirmed',
+    injuryNote: 'Sobrecarga confirmada',
+    statsQuality: 'verified',
+    sampleSizeGames: 12,
+  };
+
+  const fdHydratedVariant: MatchRecord = {
+    ...merged[0],
+    lineupStatus: 'provisional',
+    homePlayers: [fdSkeletonPlayer],
+    hydrationStatus: 'ok',
+  };
+  const espnHydratedVariant: MatchRecord = {
+    ...espnMatch,
+    lineupStatus: 'provisional',
+    homePlayers: [espnRichPlayer],
+    hydrationStatus: 'ok',
+  };
+
+  const hydrated = mergeHydratedMatchDetails(merged[0], [
+    { provider: 'football-data', label: 'Football-Data.org v4', match: fdHydratedVariant },
+    { provider: 'espn-football', label: 'ESPN Fútbol Oficial', match: espnHydratedVariant },
+  ]);
+
+  assert.equal(hydrated.homePlayers[0].availability, 'out');
+  assert.equal(hydrated.homePlayers[0].statsQuality, 'verified');
+  assert.equal(hydrated.homePlayers[0].sampleSizeGames, 12);
+  assert.match(hydrated.dataOrigin, /contrastado 2 fuentes/i);
+
+  // Standings merge keeps richest entry per team without duplicating
+  const stFd: StandingEntry = {
+    rank: 1,
+    teamId: 'fd-t1',
+    teamName: 'Real Madrid CF',
+    teamShort: 'RMA',
+    league: 'LaLiga',
+    played: 13,
+    won: 10,
+    drawn: 2,
+    lost: 1,
+    goalsForOrPtsFor: 28,
+    goalsAgainstOrPtsAgainst: 10,
+    diff: 18,
+    pointsOrWinPct: '32',
+    form: [],
+    homeRecord: '-',
+    awayRecord: '-',
+  };
+  const stEspn: StandingEntry = {
+    ...stFd,
+    teamId: 'espn-t1',
+    teamName: 'Real Madrid',
+    form: ['W', 'W', 'D', 'W', 'W'],
+    homeRecord: '6-1-0',
+    awayRecord: '4-1-1',
+  };
+  const mergedStandings = mergeStandingsAcrossSources([[stFd], [stEspn]]);
+  assert.equal(mergedStandings.length, 1);
+  assert.equal(mergedStandings[0].homeRecord, '6-1-0');
+  assert.deepEqual(mergedStandings[0].form, ['W', 'W', 'D', 'W', 'W']);
+});
+
+

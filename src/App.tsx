@@ -102,11 +102,13 @@ export default function App() {
         setLiveStandings(data.standings ?? []);
         setLiveErrors(data.errors ?? []);
         setLiveFeedMeta(data.feedMeta ?? null);
-        if (
+        const fbOk =
           data.config.football.connected ||
+          Object.values(data.config.footballProviders ?? {}).some((p) => p.connected);
+        const nbaOk =
           data.config.nba.connected ||
-          data.matches.length > 0
-        ) {
+          Object.values(data.config.nbaProviders ?? {}).some((p) => p.connected);
+        if (fbOk || nbaOk || data.matches.length > 0) {
           setDataMode('live');
         }
       }
@@ -526,8 +528,16 @@ export default function App() {
     </div>
   );
 
+  const activeFbProviders = Object.values(apiConfig.footballProviders ?? {})
+    .filter((p) => p.connected)
+    .map((p) => p.provider);
+  const activeNbaProviders = Object.values(apiConfig.nbaProviders ?? {})
+    .filter((p) => p.connected)
+    .map((p) => p.provider);
+  const isFootballConnected = apiConfig.football.connected || activeFbProviders.length > 0;
+  const isNbaConnected = apiConfig.nba.connected || activeNbaProviders.length > 0;
   const isCurrentSportConnected =
-    sport === 'football' ? apiConfig.football.connected : apiConfig.nba.connected;
+    sport === 'football' ? isFootballConnected : isNbaConnected;
 
   return (
     <div className="min-h-screen bg-[#070B14] text-slate-100 flex flex-col pb-20 md:pb-10">
@@ -633,7 +643,7 @@ export default function App() {
 
           {/* Data Mode Toggle (Honest Live API vs Offline Math Simulator) */}
           <div className="flex items-center gap-2">
-            {(apiConfig.football.connected || apiConfig.nba.connected) && (
+            {(isFootballConnected || isNbaConnected) && (
               <button
                 type="button"
                 onClick={() => loadConfigAndLive(true)}
@@ -738,8 +748,8 @@ export default function App() {
                 <div className="relative z-10 space-y-3">
                   <div className="text-xs text-slate-300">
                     Fútbol ·{' '}
-                    {apiConfig.football.connected
-                      ? `Conectado (${apiConfig.football.provider})`
+                    {isFootballConnected
+                      ? `Conectado (${activeFbProviders.length > 0 ? activeFbProviders.join(' + ') : apiConfig.football.provider})`
                       : 'API sin configurar'}
                   </div>
                   <h1 className="text-2xl sm:text-3xl font-bold text-white text-balance">
@@ -775,8 +785,8 @@ export default function App() {
                 <div className="relative z-10 space-y-3">
                   <div className="text-xs text-slate-300">
                     NBA ·{' '}
-                    {apiConfig.nba.connected
-                      ? `Conectado (${apiConfig.nba.provider})`
+                    {isNbaConnected
+                      ? `Conectado (${activeNbaProviders.length > 0 ? activeNbaProviders.join(' + ') : apiConfig.nba.provider})`
                       : 'API sin configurar'}
                   </div>
                   <h2 className="text-2xl sm:text-3xl font-bold text-white text-balance">

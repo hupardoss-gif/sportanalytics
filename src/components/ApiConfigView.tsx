@@ -11,8 +11,9 @@ import {
   EyeOff,
   Lock,
   Unlock,
+  PlusCircle,
 } from 'lucide-react';
-import type { ApiConfigState } from '../types/sports.ts';
+import type { ApiConfigState, ApiProviderStatus } from '../types/sports.ts';
 
 interface ApiConfigViewProps {
   config: ApiConfigState;
@@ -21,18 +22,66 @@ interface ApiConfigViewProps {
 }
 
 const FOOTBALL_PROVIDERS = [
-  { id: 'football-data', label: 'Football-Data.org v4 (football-data.org)' },
-  { id: 'espn-football', label: 'ESPN Fútbol + Competiciones Europeas (Sin clave)' },
-  { id: 'api-football', label: 'API-Football (v3.football.api-sports.io)' },
-];
+  {
+    id: 'football-data',
+    label: 'Football-Data.org v4 (football-data.org)',
+    shortLabel: 'Football-Data.org v4',
+    hint: 'football-data.org/client/home',
+    zeroKey: false,
+  },
+  {
+    id: 'espn-football',
+    label: 'ESPN Fútbol + Competiciones Europeas (Sin clave · Verificación)',
+    shortLabel: 'ESPN Fútbol Oficial',
+    hint: 'Fuente oficial sin clave (calendario, clasificaciones y contraste de datos)',
+    zeroKey: true,
+  },
+  {
+    id: 'api-football',
+    label: 'API-Football (v3.football.api-sports.io)',
+    shortLabel: 'API-Football v3',
+    hint: 'dashboard.api-football.com',
+    zeroKey: false,
+  },
+] as const;
 
 const NBA_PROVIDERS = [
-  { id: 'espn-nba', label: 'ESPN NBA Oficial (Gratis / Sin clave)' },
-  { id: 'basketballapi-net', label: 'BasketballAPI.net v1 (api.basketballapi.net)' },
-  { id: 'api-basketball', label: 'API-Basketball (v1.basketball.api-sports.io)' },
-  { id: 'api-nba', label: 'API-NBA (v2.nba.api-sports.io)' },
-  { id: 'balldontlie', label: 'BallDontLie NBA (v1)' },
-];
+  {
+    id: 'basketballapi-net',
+    label: 'BasketballAPI.net v1 (basketballapi.net)',
+    shortLabel: 'BasketballAPI.net v1',
+    hint: 'basketballapi.net/dashboard/keys',
+    zeroKey: false,
+  },
+  {
+    id: 'espn-nba',
+    label: 'ESPN NBA Oficial (Sin clave · Verificación + Lesiones)',
+    shortLabel: 'ESPN NBA Oficial',
+    hint: 'Fuente oficial sin clave (calendario, lesiones, game logs y contraste)',
+    zeroKey: true,
+  },
+  {
+    id: 'api-basketball',
+    label: 'API-Basketball (v1.basketball.api-sports.io)',
+    shortLabel: 'API-Basketball v1',
+    hint: 'dashboard.api-football.com',
+    zeroKey: false,
+  },
+  {
+    id: 'api-nba',
+    label: 'API-NBA (v2.nba.api-sports.io)',
+    shortLabel: 'API-NBA v2',
+    hint: 'dashboard.api-football.com',
+    zeroKey: false,
+  },
+  {
+    id: 'balldontlie',
+    label: 'BallDontLie NBA (v1)',
+    shortLabel: 'BallDontLie NBA',
+    hint: 'app.balldontlie.io',
+    zeroKey: false,
+  },
+] as const;
 
 export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
   config,
@@ -51,7 +100,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
   const [nbaProvider, setNbaProvider] = useState(
     NBA_PROVIDERS.some((p) => p.id === config.nba.provider)
       ? config.nba.provider
-      : 'espn-nba'
+      : 'basketballapi-net'
   );
   const [nbaKeyInput, setNbaKeyInput] = useState('');
   const [nbaShowKey, setNbaShowKey] = useState(false);
@@ -64,6 +113,14 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
 
   const fbZeroKey = fbProvider === 'espn-football';
   const nbaZeroKey = nbaProvider === 'espn-nba';
+
+  const fbProvidersMap: Record<string, ApiProviderStatus> =
+    config.footballProviders ?? { [config.football.provider]: config.football };
+  const nbaProvidersMap: Record<string, ApiProviderStatus> =
+    config.nbaProviders ?? { [config.nba.provider]: config.nba };
+
+  const selectedFbStatus = fbProvidersMap[fbProvider];
+  const selectedNbaStatus = nbaProvidersMap[nbaProvider];
 
   const security = config.security ?? {
     pinConfigured: false,
@@ -141,12 +198,14 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
               sport: 'football',
               provider: activeFbProv,
               apiKey: activeFbProv === 'espn-football' ? '' : fbKeyInput,
+              enabled: true,
             }
           : {
               sport: 'nba',
               provider: activeNbaProv,
               apiKey: activeNbaProv === 'espn-nba' || reuseFbKey ? undefined : nbaKeyInput,
               reuseFootballKey: activeNbaProv === 'espn-nba' ? false : reuseFbKey,
+              enabled: true,
             };
 
       const res = await fetch('/api/config/apis', {
@@ -165,7 +224,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
       else setNbaKeyInput('');
       await onRefreshLive();
       setFeedback(
-        `Configuración de ${sport === 'football' ? 'Fútbol' : 'NBA'} guardada y cifrada en el servidor.`
+        `Proveedor guardado para ${sport === 'football' ? 'Fútbol' : 'NBA'} manteniendo activas el resto de tus fuentes conectadas.`
       );
     } catch (err) {
       setFeedback(err instanceof Error ? err.message : 'Error guardando configuración');
@@ -175,20 +234,27 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
     }
   };
 
-  const handleTest = async (sport: 'football' | 'nba') => {
+  const handleTest = async (sport: 'football' | 'nba', overrideProvider?: string) => {
     setFeedback(null);
     if (sport === 'football') setFbBusy('test');
     else setNbaBusy('test');
 
+    const targetFbProv = overrideProvider && sport === 'football' ? overrideProvider : fbProvider;
+    const targetNbaProv = overrideProvider && sport === 'nba' ? overrideProvider : nbaProvider;
+
     try {
       const bodyPayload =
         sport === 'football'
-          ? { sport: 'football', provider: fbProvider, apiKey: fbKeyInput || undefined }
+          ? {
+              sport: 'football',
+              provider: targetFbProv,
+              apiKey: overrideProvider ? undefined : fbKeyInput || undefined,
+            }
           : {
               sport: 'nba',
-              provider: nbaProvider,
-              apiKey: reuseFbKey ? undefined : nbaKeyInput || undefined,
-              reuseFootballKey: reuseFbKey,
+              provider: targetNbaProv,
+              apiKey: overrideProvider || reuseFbKey ? undefined : nbaKeyInput || undefined,
+              reuseFootballKey: overrideProvider ? undefined : reuseFbKey,
             };
 
       const res = await fetch('/api/config/apis/test', {
@@ -220,10 +286,13 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
     }
   };
 
-  const handleClear = async (sport: 'football' | 'nba') => {
+  const handleClearProvider = async (sport: 'football' | 'nba', providerId?: string) => {
     setFeedback(null);
     try {
-      const res = await fetch(`/api/config/apis?sport=${sport}`, { method: 'DELETE' });
+      const qs = providerId
+        ? `sport=${sport}&provider=${encodeURIComponent(providerId)}`
+        : `sport=${sport}`;
+      const res = await fetch(`/api/config/apis?${qs}`, { method: 'DELETE' });
       const data = (await res.json()) as ApiConfigState & { error?: string };
       if (res.status === 401) {
         await refreshConfigOnly();
@@ -243,47 +312,112 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
     }
   };
 
-  const renderStatus = (
-    status: ApiConfigState['football'],
-    label: string,
-    fallbackHint?: string
+  const renderMultiSourceList = (
+    sport: 'football' | 'nba',
+    catalog: ReadonlyArray<{ id: string; shortLabel: string; hint: string; zeroKey: boolean }>,
+    statusMap: Record<string, ApiProviderStatus>,
+    activeId: string,
+    onSelect: (id: string) => void,
+    busy: 'save' | 'test' | null
   ) => {
-    if (status.connected) {
-      return (
-        <div className="rounded-lg border border-emerald-500/30 bg-emerald-950/25 p-3 text-xs space-y-1">
-          <div className="flex items-center gap-2 font-semibold text-emerald-400">
-            <CheckCircle2 className="w-4 h-4 shrink-0" />
-            <span>{label}: Conectado</span>
-          </div>
-          {status.accountInfo && <p className="text-slate-300">{status.accountInfo}</p>}
-          {status.maskedKey && (
-            <p className="font-mono text-slate-400">Clave cifrada: {status.maskedKey}</p>
-          )}
-        </div>
-      );
-    }
-    if (status.error) {
-      return (
-        <div className="rounded-lg border border-rose-500/30 bg-rose-950/25 p-3 text-xs space-y-1">
-          <div className="flex items-center gap-2 font-semibold text-rose-400">
-            <XCircle className="w-4 h-4 shrink-0" />
-            <span>{label}: Error de conexión</span>
-          </div>
-          <p className="text-rose-200">{status.error}</p>
-          {fallbackHint && <p className="text-slate-300 pt-1">{fallbackHint}</p>}
-        </div>
-      );
-    }
+    const connectedCount = catalog.filter((item) => statusMap[item.id]?.connected).length;
+
     return (
-      <div className="rounded-lg border border-slate-800 bg-slate-900/60 p-3 text-xs space-y-1">
-        <div className="flex items-center gap-2 font-semibold text-slate-300">
-          <KeyRound className="w-4 h-4 text-slate-400 shrink-0" />
-          <span>{label}: Sin configurar</span>
+      <div className="rounded-xl border border-slate-800/90 bg-slate-950/60 p-3.5 space-y-2.5">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+          <span className="font-semibold text-slate-200">
+            Fuentes simultáneas ({connectedCount} activas)
+          </span>
+          <span className="text-[11px] text-slate-400">
+            Se consultan y contrastan a la vez sin sobrescribirse
+          </span>
         </div>
-        <p className="text-slate-400">
-          {fallbackHint ??
-            'Pega tu clave API abajo o selecciona una fuente pública gratuita para alimentar calendarios, clasificaciones y plantillas reales.'}
-        </p>
+
+        <div className="space-y-2">
+          {catalog.map((item) => {
+            const st = statusMap[item.id];
+            const isConnected = Boolean(st?.connected);
+            const hasSavedKey = Boolean(st?.maskedKey);
+            const hasError = Boolean(st?.error);
+            const isSelected = activeId === item.id;
+
+            return (
+              <div
+                key={item.id}
+                className={`rounded-lg border px-3 py-2 text-xs transition-colors ${
+                  isSelected
+                    ? 'border-blue-500/45 bg-blue-950/15'
+                    : 'border-slate-800 bg-slate-900/50'
+                }`}
+              >
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onSelect(item.id)}
+                    className="flex items-center gap-2 text-left cursor-pointer"
+                  >
+                    {isConnected ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                    ) : hasError ? (
+                      <XCircle className="w-3.5 h-3.5 text-rose-400 shrink-0" />
+                    ) : (
+                      <KeyRound className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                    )}
+                    <span className="font-semibold text-slate-100">{item.shortLabel}</span>
+                    {st?.maskedKey && (
+                      <span className="font-mono text-[11px] text-slate-400">{st.maskedKey}</span>
+                    )}
+                    {item.zeroKey && isConnected && (
+                      <span className="text-[11px] text-emerald-300">Verificación activa</span>
+                    )}
+                  </button>
+
+                  <div className="flex items-center gap-2">
+                    {!isConnected && item.zeroKey && (
+                      <button
+                        type="button"
+                        onClick={() => void handleSave(sport, item.id)}
+                        disabled={busy !== null || !security.unlocked}
+                        className="text-[11px] text-blue-400 hover:text-blue-300 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+                      >
+                        <PlusCircle className="w-3 h-3" />
+                        Activar
+                      </button>
+                    )}
+                    {(isConnected || hasSavedKey || hasError) && (
+                      <button
+                        type="button"
+                        onClick={() => void handleTest(sport, item.id)}
+                        disabled={busy !== null || !security.unlocked}
+                        className="text-[11px] text-slate-300 hover:text-white disabled:opacity-40 cursor-pointer"
+                      >
+                        Probar
+                      </button>
+                    )}
+                    {(isConnected || hasSavedKey) && (
+                      <button
+                        type="button"
+                        onClick={() => void handleClearProvider(sport, item.id)}
+                        disabled={!security.unlocked}
+                        className="text-[11px] text-slate-400 hover:text-rose-400 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                        Quitar
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {st?.accountInfo && (
+                  <p className="text-[11px] text-slate-400 mt-1 leading-snug">{st.accountInfo}</p>
+                )}
+                {st?.error && (
+                  <p className="text-[11px] text-rose-300 mt-1 leading-snug">{st.error}</p>
+                )}
+              </div>
+            );
+          })}
+        </div>
       </div>
     );
   };
@@ -294,7 +428,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
         <div>
           <h2 className="text-xl sm:text-2xl font-bold text-white">CONFIGURACIÓN DE APIS</h2>
           <p className="text-sm text-slate-400 mt-1">
-            Introduce tus claves directamente o activa fuentes públicas oficiales. Todas las claves se cifran con AES-256-GCM en el servidor.
+            Mantén conectadas todas tus claves API a la vez junto con fuentes públicas oficiales de verificación. Todas las claves se cifran con AES-256-GCM en el servidor.
           </p>
         </div>
         <div className="flex items-center gap-2 text-xs text-emerald-400">
@@ -318,7 +452,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
               </h3>
               <p className="text-xs text-slate-400">
                 {security.unlocked
-                  ? 'Sesión de administrador desbloqueada mediante cookie HttpOnly firmada. Puedes guardar, probar o desconectar proveedores.'
+                  ? 'Sesión de administrador desbloqueada mediante cookie HttpOnly firmada. Puedes añadir, probar o quitar cualquier proveedor sin perder tus otras claves.'
                   : security.pinConfigured
                     ? 'Sesión bloqueada. Introduce tu PIN de administrador para modificar o comprobar claves API.'
                     : security.envProtected
@@ -379,24 +513,25 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
         <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-5">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-bold text-white">API DE FÚTBOL</h3>
-            {(config.football.maskedKey || config.football.connected) && (
-              <button
-                type="button"
-                onClick={() => void handleClear('football')}
-                disabled={!security.unlocked}
-                className="text-xs text-slate-400 hover:text-rose-400 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Desconectar
-              </button>
-            )}
+            <span className="text-[11px] font-medium text-slate-400">
+              Multi-fuente en paralelo
+            </span>
           </div>
 
-          {renderStatus(config.football, 'API Fútbol')}
+          {renderMultiSourceList(
+            'football',
+            FOOTBALL_PROVIDERS,
+            fbProvidersMap,
+            fbProvider,
+            setFbProvider,
+            fbBusy
+          )}
 
-          <div className="space-y-3">
+          <div className="space-y-3 pt-1 border-t border-slate-800/80">
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-slate-300">Proveedor de datos de Fútbol</span>
+              <span className="text-xs font-medium text-slate-300">
+                Configurar / actualizar proveedor de Fútbol
+              </span>
               <select
                 value={fbProvider}
                 onChange={(e) => setFbProvider(e.target.value)}
@@ -412,19 +547,24 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
 
             {fbZeroKey ? (
               <div className="rounded-lg border border-blue-500/25 bg-blue-950/20 p-3 text-xs text-blue-200">
-                Esta fuente no requiere API Key. Incluye LaLiga, Premier League, Bundesliga, Serie A, Ligue 1, Champions, Europa League y Conference League.
+                Esta fuente no requiere API Key y se ejecuta simultáneamente junto con tus APIs configuradas (Football-Data.org / API-Football) para contrastar marcadores, plantillas y ligas europeas.
               </div>
             ) : (
               <label className="block space-y-1.5">
                 <span className="text-xs font-medium text-slate-300">
-                  Clave API de Fútbol {config.football.maskedKey ? `(actual: ${config.football.maskedKey})` : ''}
+                  Clave API ({FOOTBALL_PROVIDERS.find((p) => p.id === fbProvider)?.shortLabel}){' '}
+                  {selectedFbStatus?.maskedKey ? `(guardada: ${selectedFbStatus.maskedKey})` : ''}
                 </span>
                 <div className="relative">
                   <input
                     type={fbShowKey ? 'text' : 'password'}
                     value={fbKeyInput}
                     onChange={(e) => setFbKeyInput(e.target.value)}
-                    placeholder="Pega aquí tu token de football-data.org..."
+                    placeholder={
+                      fbProvider === 'football-data'
+                        ? 'Pega aquí tu token de football-data.org/client/home...'
+                        : 'Pega aquí tu clave API de API-Football...'
+                    }
                     autoComplete="off"
                     className="w-full min-h-[44px] pl-3.5 pr-11 rounded-lg border border-slate-700 bg-slate-950 text-sm font-mono text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
                   />
@@ -438,7 +578,11 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
                   </button>
                 </div>
                 <p className="text-[11px] text-slate-400">
-                  Copia tu token desde <span className="font-mono text-blue-300">football-data.org/client/home</span>. Se complementa con competiciones europeas y clasificaciones reales.
+                  Copia tu token desde{' '}
+                  <span className="font-mono text-blue-300">
+                    {FOOTBALL_PROVIDERS.find((p) => p.id === fbProvider)?.hint}
+                  </span>
+                  . Se guarda sin eliminar tus otras fuentes activas.
                 </p>
               </label>
             )}
@@ -452,7 +596,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
               className="min-h-[44px] px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-semibold text-white transition-colors flex items-center gap-2 cursor-pointer"
             >
               {fbBusy === 'save' && <Loader2 className="w-4 h-4 animate-spin" />}
-              {fbZeroKey ? 'Activar fuente gratuita' : 'Guardar y conectar'}
+              {fbZeroKey ? 'Activar en paralelo' : 'Guardar y conectar'}
             </button>
             <button
               type="button"
@@ -474,31 +618,35 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
         <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-5">
           <div className="flex items-center justify-between">
             <h3 className="text-lg font-bold text-white">API DE NBA</h3>
-            {(config.nba.maskedKey || config.nba.connected) && !reuseFbKey && (
-              <button
-                type="button"
-                onClick={() => void handleClear('nba')}
-                disabled={!security.unlocked}
-                className="text-xs text-slate-400 hover:text-rose-400 disabled:opacity-40 flex items-center gap-1 cursor-pointer"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Desconectar
-              </button>
-            )}
+            <span className="text-[11px] font-medium text-slate-400">
+              Multi-fuente en paralelo
+            </span>
           </div>
 
-          {renderStatus(
-            config.nba,
-            'API NBA',
-            'SportAnalytics AI mantiene activo el feed público oficial ESPN NBA como respaldo automático para el calendario, clasificaciones, lesiones y game logs.'
+          {renderMultiSourceList(
+            'nba',
+            NBA_PROVIDERS,
+            nbaProvidersMap,
+            nbaProvider,
+            (id) => {
+              setNbaProvider(id);
+              setReuseFbKey(Boolean(nbaProvidersMap[id]?.reuseFootballKey));
+            },
+            nbaBusy
           )}
 
-          <div className="space-y-3">
+          <div className="space-y-3 pt-1 border-t border-slate-800/80">
             <label className="block space-y-1.5">
-              <span className="text-xs font-medium text-slate-300">Proveedor de datos de NBA</span>
+              <span className="text-xs font-medium text-slate-300">
+                Configurar / actualizar proveedor de NBA
+              </span>
               <select
                 value={nbaProvider}
-                onChange={(e) => setNbaProvider(e.target.value)}
+                onChange={(e) => {
+                  const nextId = e.target.value;
+                  setNbaProvider(nextId);
+                  setReuseFbKey(Boolean(nbaProvidersMap[nextId]?.reuseFootballKey));
+                }}
                 className="w-full min-h-[44px] px-3 rounded-lg border border-slate-700 bg-slate-900 text-sm text-slate-100"
               >
                 {NBA_PROVIDERS.map((p) => (
@@ -511,33 +659,40 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
 
             {nbaZeroKey ? (
               <div className="rounded-lg border border-blue-500/25 bg-blue-950/20 p-3 text-xs text-blue-200">
-                Fuente oficial sin clave: obtiene calendario completo de 16 días, clasificaciones Este/Oeste, reporte de lesiones (OUT/GTD), noticias externas NBA y game logs reales (L5/L10/L15).
+                Fuente oficial sin clave: se ejecuta simultáneamente junto con tus otras APIs de NBA para aportar calendario, clasificaciones, parte oficial de lesiones (OUT/GTD), noticias externas y game logs reales (L5/L10/L15).
               </div>
             ) : (
               <>
-                <label className="flex items-center gap-2.5 min-h-[40px] cursor-pointer select-none">
-                  <input
-                    type="checkbox"
-                    checked={reuseFbKey}
-                    onChange={(e) => setReuseFbKey(e.target.checked)}
-                    className="w-4 h-4 rounded border-slate-600 bg-slate-900 text-blue-600 focus:ring-blue-500"
-                  />
-                  <span className="text-xs text-slate-200">
-                    Reutilizar la misma clave de API de Fútbol (útil para API-Sports)
-                  </span>
-                </label>
+                {(nbaProvider === 'api-basketball' || nbaProvider === 'api-nba') && (
+                  <label className="flex items-center gap-2.5 min-h-[40px] cursor-pointer select-none">
+                    <input
+                      type="checkbox"
+                      checked={reuseFbKey}
+                      onChange={(e) => setReuseFbKey(e.target.checked)}
+                      className="w-4 h-4 rounded border-slate-600 bg-slate-900 text-blue-600 focus:ring-blue-500"
+                    />
+                    <span className="text-xs text-slate-200">
+                      Reutilizar clave de API-Sports de Fútbol
+                    </span>
+                  </label>
+                )}
 
                 {!reuseFbKey && (
                   <label className="block space-y-1.5">
                     <span className="text-xs font-medium text-slate-300">
-                      Clave API de NBA {config.nba.maskedKey ? `(actual: ${config.nba.maskedKey})` : ''}
+                      Clave API ({NBA_PROVIDERS.find((p) => p.id === nbaProvider)?.shortLabel}){' '}
+                      {selectedNbaStatus?.maskedKey ? `(guardada: ${selectedNbaStatus.maskedKey})` : ''}
                     </span>
                     <div className="relative">
                       <input
                         type={nbaShowKey ? 'text' : 'password'}
                         value={nbaKeyInput}
                         onChange={(e) => setNbaKeyInput(e.target.value)}
-                        placeholder="Pega aquí tu clave de basketballapi.net o API-Sports..."
+                        placeholder={
+                          nbaProvider === 'basketballapi-net'
+                            ? 'Pega aquí tu clave de basketballapi.net/dashboard/keys...'
+                            : 'Pega aquí tu clave API de NBA...'
+                        }
                         autoComplete="off"
                         className="w-full min-h-[44px] pl-3.5 pr-11 rounded-lg border border-slate-700 bg-slate-950 text-sm font-mono text-white placeholder:text-slate-500 focus:border-blue-500 focus:outline-none"
                       />
@@ -551,7 +706,11 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
                       </button>
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      Si el plan gratuito de tu API externa limita endpoints (HTTP 401/403), selecciona <span className="text-blue-300">ESPN NBA Oficial (Gratis / Sin clave)</span> arriba.
+                      Obtén o copia tu clave desde{' '}
+                      <span className="font-mono text-blue-300">
+                        {NBA_PROVIDERS.find((p) => p.id === nbaProvider)?.hint}
+                      </span>
+                      . Se combina simultáneamente con ESPN NBA y el parte oficial de lesiones.
                     </p>
                   </label>
                 )}
@@ -567,7 +726,7 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
               className="min-h-[44px] px-4 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-xs font-semibold text-white transition-colors flex items-center gap-2 cursor-pointer"
             >
               {nbaBusy === 'save' && <Loader2 className="w-4 h-4 animate-spin" />}
-              {nbaZeroKey ? 'Activar fuente gratuita' : 'Guardar y conectar'}
+              {nbaZeroKey ? 'Activar en paralelo' : 'Guardar y conectar'}
             </button>
             <button
               type="button"
@@ -582,20 +741,6 @@ export const ApiConfigView: React.FC<ApiConfigViewProps> = ({
               )}
               Comprobar conexión
             </button>
-            {nbaProvider !== 'espn-nba' && (
-              <button
-                type="button"
-                onClick={() => {
-                  setNbaProvider('espn-nba');
-                  setReuseFbKey(false);
-                  void handleSave('nba', 'espn-nba');
-                }}
-                disabled={nbaBusy !== null || !security.unlocked}
-                className="min-h-[44px] px-3 py-2 rounded-lg border border-blue-500/30 bg-blue-950/20 hover:bg-blue-950/40 disabled:opacity-50 text-xs font-semibold text-blue-300 cursor-pointer"
-              >
-                Usar ESPN NBA (Gratis)
-              </button>
-            )}
           </div>
         </section>
       </div>

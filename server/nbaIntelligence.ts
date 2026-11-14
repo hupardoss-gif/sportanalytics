@@ -62,6 +62,18 @@ export function parseValidPublishedAt(raw: unknown): string | undefined {
   return new Date(ms).toISOString();
 }
 
+export function isPublishedNewsRecent(
+  publishedAt: string | undefined,
+  maxAgeDays: number,
+  nowMs = Date.now()
+): boolean {
+  if (!publishedAt) return false;
+  const ts = Date.parse(publishedAt);
+  if (!Number.isFinite(ts)) return false;
+  if (ts > nowMs + 12 * 3600_000) return false;
+  return nowMs - ts <= maxAgeDays * 86_400_000;
+}
+
 function decodeXml(raw: string): string {
   return raw
     .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
@@ -337,6 +349,8 @@ export async function fetchNbaExternalNews(params: {
 }): Promise<{
   items: PlayerNewsItem[];
   sourcesChecked: string[];
+  rejectedStaleCount: number;
+  freshnessWarning?: string;
 }> {
   const {
     homeEspnId,
@@ -359,8 +373,14 @@ export async function fetchNbaExternalNews(params: {
 
   const items: PlayerNewsItem[] = [];
   const seenHeadlines = new Set<string>();
+  const nowMs = Date.now();
+  let rejectedStaleCount = 0;
 
-  const pushUnique = (item: PlayerNewsItem) => {
+  const pushUnique = (item: PlayerNewsItem, maxAgeDays: number) => {
+    if (!isPublishedNewsRecent(item.publishedAt, maxAgeDays, nowMs)) {
+      rejectedStaleCount += 1;
+      return;
+    }
     const key = normalizeNbaName(item.headline).slice(0, 64);
     if (!key || seenHeadlines.has(key)) return;
     seenHeadlines.add(key);
@@ -369,20 +389,23 @@ export async function fetchNbaExternalNews(params: {
 
   for (const inj of injuriesForMatch) {
     const teamTag = inj.teamId === homeEspnId ? homeShort : awayShort;
-    pushUnique({
-      id: `inj-${inj.teamId}-${inj.normalizedName}`,
-      source: inj.source,
-      publishedAt: inj.publishedAt,
-      headline: inj.headline,
-      summary: inj.summary,
-      url: inj.url,
-      confirmed: inj.confirmed,
-      playerNames: [inj.playerName],
-      teamShort: teamTag,
-      statusTag: inj.minutesRestriction
-        ? `${inj.statusTag} · Límite min.`
-        : inj.statusTag,
-    });
+    pushUnique(
+      {
+        id: `inj-${inj.teamId}-${inj.normalizedName}`,
+        source: inj.source,
+        publishedAt: inj.publishedAt,
+        headline: inj.headline,
+        summary: inj.summary,
+        url: inj.url,
+        confirmed: inj.confirmed,
+        playerNames: [inj.playerName],
+        teamShort: teamTag,
+        statusTag: inj.minutesRestriction
+          ? `${inj.statusTag} · Límite min.`
+          : inj.statusTag,
+      },
+      10
+    );
   }
 
   const [homeNewsRes, awayNewsRes, rssItems] = await Promise.all([
@@ -459,18 +482,21 @@ export async function fetchNbaExternalNews(params: {
             ? 'Rotación / Quinteto'
             : 'Prensa equipo';
 
-      pushUnique({
-        id: `espn-art-${String(art.id ?? headline.slice(0, 20))}`,
-        source: 'ESPN NBA News',
-        publishedAt: parseValidPublishedAt(art.published),
-        headline,
-        summary: desc || headline,
-        url: String(((art.links as AnyObj | undefined)?.web as AnyObj | undefined)?.href ?? '') || undefined,
-        confirmed: false,
-        playerNames: matchedPlayers,
-        teamShort: teamShortTag,
-        statusTag,
-      });
+      pushUnique(
+        {
+          id: `espn-art-${String(art.id ?? headline.slice(0, 20))}`,
+          source: 'ESPN NBA News',
+          publishedAt: parseValidPublishedAt(art.published),
+          headline,
+          summary: desc || headline,
+          url: String(((art.links as AnyObj | undefined)?.web as AnyObj | undefined)?.href ?? '') || undefined,
+          confirmed: false,
+          playerNames: matchedPlayers,
+          teamShort: teamShortTag,
+          statusTag,
+        },
+        5
+      );
     }
   };
 
@@ -484,18 +510,21 @@ export async function fetchNbaExternalNews(params: {
     const matchedPlayers = findMatchedPlayers(`${r.title} ${r.summary}`);
     if (!hitsHome && !hitsAway && matchedPlayers.length === 0) continue;
 
-    pushUnique({
-      id: `rss-${normalizeNbaName(r.source)}-${normalizeNbaName(r.title).slice(0, 24)}`,
-      source: r.source,
-      publishedAt: r.publishedAt,
-      headline: r.title,
-      summary: r.summary,
-      url: r.url,
-      confirmed: false,
-      playerNames: matchedPlayers,
-      teamShort: hitsHome && !hitsAway ? homeShort : hitsAway && !hitsHome ? awayShort : undefined,
-      statusTag: 'Prensa / Rumor',
-    });
+    pushUnique(
+      {
+        id: `rss-${normalizeNbaName(r.source)}-${normalizeNbaName(r.title).slice(0, 24)}`,
+        source: r.source,
+        publishedAt: r.publishedAt,
+        headline: r.title,
+        summary: r.summary,
+        url: r.url,
+        confirmed: false,
+        playerNames: matchedPlayers,
+        teamShort: hitsHome && !hitsAway ? homeShort : hitsAway && !hitsHome ? awayShort : undefined,
+        statusTag: 'Prensa / Rumor',
+      },
+      5
+    );
   }
 
   items.sort((a, b) => {
@@ -504,9 +533,20 @@ export async function fetchNbaExternalNews(params: {
     return tb - ta;
   });
 
+  const freshnessWarning =
+    items.length === 0
+      ? rejectedStaleCount > 0
+        ? `No hay partes ni noticias recientes verificables (${rejectedStaleCount} antiguos o sin fecha fueron descartados).`
+        : 'No se encontraron noticias recientes verificables con fecha de publicación para este partido.'
+      : rejectedStaleCount > 0
+        ? `Se descartaron ${rejectedStaleCount} elementos antiguos o sin fecha verificable.`
+        : undefined;
+
   return {
     items: items.slice(0, 18),
     sourcesChecked,
+    rejectedStaleCount,
+    freshnessWarning,
   };
 }
 
@@ -655,16 +695,20 @@ export function applyNewsAndInjuriesToNbaPlayers(
   players: PlayerProfile[],
   injuries: ParsedInjuryRecord[],
   newsItems: PlayerNewsItem[],
-  lineupConfirmed: boolean
+  lineupConfirmed: boolean,
+  nowMs = Date.now()
 ): PlayerProfile[] {
+  const recentInjuries = injuries.filter((i) => isPublishedNewsRecent(i.publishedAt, 10, nowMs));
+  const recentNews = newsItems.filter((n) => isPublishedNewsRecent(n.publishedAt, 5, nowMs));
+
   return players.map((p) => {
     const norm = normalizeNbaName(p.name);
     const espnId = p.id.replace('espn-nba-p-', '');
-    const inj = injuries.find(
+    const inj = recentInjuries.find(
       (i) => (i.athleteId && i.athleteId === espnId) || i.normalizedName === norm
     );
 
-    const playerArticle = newsItems.find((n) =>
+    const playerArticle = recentNews.find((n) =>
       (n.playerNames ?? []).some((pn) => normalizeNbaName(pn) === norm)
     );
 

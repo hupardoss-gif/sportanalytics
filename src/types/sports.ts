@@ -43,7 +43,9 @@ export type FootballPropStat =
   | 'foulsDrawn'
   | 'yellowCards'
   | 'redCards'
-  | 'passes';
+  | 'passes'
+  | 'saves'
+  | 'goalsConceded';
 
 export type NbaPropStat =
   | 'points'
@@ -71,6 +73,10 @@ export interface StatSplitValues {
   yellowCards?: number;
   redCards?: number;
   passes?: number;
+  saves?: number;
+  goalsConceded?: number;
+  savePct?: number;
+  cleanSheets?: number;
   // NBA metrics
   points?: number;
   rebounds?: number;
@@ -225,6 +231,8 @@ export interface FootballNewsBundle {
     citations?: Array<{ title: string; url: string }>;
   };
   items: PlayerNewsItem[];
+  rejectedStaleCount?: number;
+  freshnessWarning?: string;
 }
 
 export interface DataProvenanceMeta {
@@ -288,12 +296,17 @@ export interface MatchRecord {
       citations?: Array<{ title: string; url: string }>;
     };
     items: PlayerNewsItem[];
+    rejectedStaleCount?: number;
+    freshnessWarning?: string;
   };
   footballNews?: FootballNewsBundle;
   teamStatsQuality?: DataReliability;
   hydrationStatus?: 'idle' | 'ok' | 'partial' | 'not_published' | 'provider_unavailable' | 'query_error' | 'network_error';
   hydrationNote?: string;
   provenance?: DataProvenanceMeta;
+  sourceIds?: Record<string, string>;
+  verifiedSources?: string[];
+  sourceDiscrepancies?: string[];
   dataOrigin: string;
   updatedAt: string;
   isOfflineReference?: boolean;
@@ -319,6 +332,17 @@ export interface StandingEntry {
   awayRecord: string;
 }
 
+export interface MatchStatDistributionSpec {
+  kind: 'poisson' | 'negbin' | 'normal';
+  mean: number;
+  overdispersion?: number;
+  stdDev?: number;
+  minLine: number;
+  maxLine: number;
+  step: number;
+  defaultLine: number;
+}
+
 export interface StatExpectationWithInterval {
   key: string;
   label: string;
@@ -328,6 +352,7 @@ export interface StatExpectationWithInterval {
   unit?: string;
   reliability: DataReliability;
   note?: string;
+  distributionSpec?: MatchStatDistributionSpec;
 }
 
 export interface FootballPredictionResult {
@@ -427,6 +452,8 @@ export interface PropProjectionResult {
     h2hAvg?: number;
     weightsNote: string;
   };
+  unavailable?: boolean;
+  unavailableReason?: string;
   distribution: PropDistributionBin[];
 }
 
@@ -534,7 +561,9 @@ export type NbaProviderId = 'espn-nba' | 'basketballapi-net' | 'api-basketball' 
 
 export interface ApiProviderStatus {
   connected: boolean;
+  enabled?: boolean;
   provider: string;
+  role?: 'primary' | 'verification' | 'complementary';
   maskedKey: string | null;
   reuseFootballKey?: boolean;
   lastChecked: string | null;
@@ -569,5 +598,7 @@ export interface LiveFeedMeta {
 export interface ApiConfigState {
   football: ApiProviderStatus;
   nba: ApiProviderStatus;
+  footballProviders?: Record<string, ApiProviderStatus>;
+  nbaProviders?: Record<string, ApiProviderStatus>;
   security?: ApiSecurityStatus;
 }

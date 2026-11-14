@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   BookmarkPlus,
@@ -13,6 +13,9 @@ import {
   ShieldCheck,
   AlertTriangle,
   Target,
+  Minus,
+  Plus,
+  SlidersHorizontal,
 } from 'lucide-react';
 import type {
   AvailabilityStatus,
@@ -30,6 +33,7 @@ import {
   buildNbaMatchExplanation,
   computeNbaMatchPrediction,
 } from '../engine/nbaModel.ts';
+import { evaluateMatchStatOverUnder } from '../engine/distributionMath.ts';
 import { TacticalPitch } from './TacticalPitch.tsx';
 import { BasketballCourt } from './BasketballCourt.tsx';
 import { AiExplanationBox, type AiExplanationPayload } from './AiExplanationBox.tsx';
@@ -139,6 +143,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiData, setAiData] = useState<AiExplanationPayload | null>(null);
   const [savedToast, setSavedToast] = useState(false);
+  const [matchStatLines, setMatchStatLines] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    setMatchStatLines({});
+    setAiData(null);
+  }, [match.id]);
 
   const effectiveHomePlayers = useMemo(
     () =>
@@ -357,6 +367,16 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </span>
         </div>
 
+        {match.sourceDiscrepancies && match.sourceDiscrepancies.length > 0 && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">Diferencias detectadas al contrastar fuentes:</span>{' '}
+              {match.sourceDiscrepancies.join(' · ')}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-3 items-center gap-6">
           <div>
             <p className="text-xs text-slate-400">Local · {match.homeTeam.record}</p>
@@ -561,13 +581,23 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                   <div>
                     <span className="text-slate-400 block">Córners esperados</span>
                     <span className="text-base font-bold font-mono tabular-nums text-white">
-                      {footballPred.expectedCorners.toFixed(1)}
+                      {(() => {
+                        const c = footballPred.expectedStats.find((s) => s.key === 'corners');
+                        return c && c.reliability !== 'unavailable' && c.pointEstimate !== null
+                          ? c.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                   <div>
                     <span className="text-slate-400 block">Tarjetas esperadas</span>
                     <span className="text-base font-bold font-mono tabular-nums text-white">
-                      {(footballPred.expectedCardsHome + footballPred.expectedCardsAway).toFixed(1)}
+                      {(() => {
+                        const yc = footballPred.expectedStats.find((s) => s.key === 'yellow_cards');
+                        return yc && yc.reliability !== 'unavailable' && yc.pointEstimate !== null
+                          ? yc.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                 </div>
@@ -662,7 +692,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                   <div>
                     <span className="text-slate-400 block">Ritmo (posesiones)</span>
                     <span className="text-base font-bold font-mono tabular-nums text-blue-300">
-                      {nbaPred.expectedPace.toFixed(1)}
+                      {(() => {
+                        const p = nbaPred.expectedStats.find((s) => s.key === 'pace');
+                        return p && p.reliability !== 'unavailable' && p.pointEstimate !== null
+                          ? p.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                   <div>
@@ -730,9 +765,9 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                             </span>
                           </div>
                           <span className="font-mono tabular-nums text-blue-400">
-                            {(p.splits.season.points ?? 0).toFixed(1)} PTS ·{' '}
-                            {(p.splits.season.rebounds ?? 0).toFixed(1)} REB ·{' '}
-                            {(p.splits.season.assists ?? 0).toFixed(1)} AST
+                            {p.statsQuality === 'unavailable' || p.splits.season.points === undefined
+                              ? 'Stats ind. N/D'
+                              : `${p.splits.season.points.toFixed(1)} PTS · ${(p.splits.season.rebounds ?? 0).toFixed(1)} REB · ${(p.splits.season.assists ?? 0).toFixed(1)} AST`}
                           </span>
                         </button>
                       ))}
@@ -868,47 +903,141 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {(footballPred?.expectedStats ?? nbaPred?.expectedStats ?? []).map((item) => (
-              <div
-                key={item.key}
-                className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-2"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <span className="text-xs font-medium text-slate-300">{item.label}</span>
-                  <span
-                    className={`px-2 py-0.5 rounded border text-[10px] font-semibold shrink-0 ${
-                      item.reliability === 'verified'
-                        ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
-                        : item.reliability === 'estimated'
-                          ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
-                          : 'border-rose-500/35 bg-rose-950/25 text-rose-300'
-                    }`}
-                  >
-                    {item.reliability === 'verified'
-                      ? 'Verificado'
-                      : item.reliability === 'estimated'
-                        ? 'Estimación'
-                        : 'No disponible'}
-                  </span>
-                </div>
+            {(footballPred?.expectedStats ?? nbaPred?.expectedStats ?? []).map((item) => {
+              const evalOu = evaluateMatchStatOverUnder(item, matchStatLines[item.key]);
+              const isUnavailable =
+                item.reliability === 'unavailable' || item.pointEstimate === null || !evalOu.available;
 
-                <div className="flex items-baseline justify-between gap-2">
-                  <span className="text-2xl font-bold font-mono tabular-nums text-white">
-                    {item.pointEstimate !== null ? item.pointEstimate : 'N/D'}
-                    {item.unit ? (
-                      <span className="text-xs font-normal text-slate-400 ml-1">{item.unit}</span>
-                    ) : null}
-                  </span>
-                  {item.intervalLow !== null && item.intervalHigh !== null && (
-                    <span className="text-xs font-mono tabular-nums text-blue-300">
-                      80%: [{item.intervalLow} – {item.intervalHigh}]
-                    </span>
+              const setLineForMarket = (nextVal: number) => {
+                if (!evalOu.available) return;
+                const clamped = Math.max(
+                  evalOu.minLine,
+                  Math.min(evalOu.maxLine, +(Math.round(nextVal / evalOu.step) * evalOu.step).toFixed(2))
+                );
+                setMatchStatLines((prev) => ({ ...prev, [item.key]: clamped }));
+              };
+
+              return (
+                <div
+                  key={item.key}
+                  className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-3 flex flex-col justify-between"
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="text-xs font-medium text-slate-200">{item.label}</span>
+                      <span
+                        className={`px-2 py-0.5 rounded border text-[10px] font-semibold shrink-0 ${
+                          item.reliability === 'verified'
+                            ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+                            : item.reliability === 'estimated'
+                              ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+                              : 'border-rose-500/35 bg-rose-950/25 text-rose-300'
+                        }`}
+                      >
+                        {item.reliability === 'verified'
+                          ? 'Verificado'
+                          : item.reliability === 'estimated'
+                            ? 'Estimación'
+                            : 'No disponible'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-2xl font-bold font-mono tabular-nums text-white">
+                        {item.pointEstimate !== null ? item.pointEstimate : 'N/D'}
+                        {item.pointEstimate !== null && item.unit ? (
+                          <span className="text-xs font-normal text-slate-400 ml-1">{item.unit}</span>
+                        ) : null}
+                      </span>
+                      {item.intervalLow !== null && item.intervalHigh !== null && (
+                        <span className="text-xs font-mono tabular-nums text-blue-300">
+                          80%: [{item.intervalLow} – {item.intervalHigh}]
+                        </span>
+                      )}
+                    </div>
+
+                    {item.note && <p className="text-[11px] text-slate-400">{item.note}</p>}
+                  </div>
+
+                  {isUnavailable ? (
+                    <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
+                      Sin datos base suficientes para simular líneas Over / Under en este mercado.
+                    </div>
+                  ) : (
+                    <div className="pt-3 border-t border-slate-800/80 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-blue-400" />
+                          <span>Línea:</span>
+                          <span className="font-mono tabular-nums font-bold text-white text-sm">
+                            {evalOu.line.toFixed(evalOu.step >= 1 ? 1 : 1)}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setLineForMarket(evalOu.line - evalOu.step)}
+                            aria-label={`Reducir línea de ${item.label}`}
+                            className="w-8 h-8 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                          >
+                            <Minus className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLineForMarket(evalOu.line + evalOu.step)}
+                            aria-label={`Aumentar línea de ${item.label}`}
+                            className="w-8 h-8 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <input
+                        type="range"
+                        min={evalOu.minLine}
+                        max={evalOu.maxLine}
+                        step={evalOu.step}
+                        value={evalOu.line}
+                        onChange={(e) => setLineForMarket(parseFloat(e.target.value))}
+                        aria-label={`Deslizador Over/Under para ${item.label}`}
+                        className="analytics-slider"
+                      />
+
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-semibold text-emerald-400 font-mono tabular-nums">
+                            Supera (&gt; {evalOu.line}): {evalOu.probOver.toFixed(1)}%
+                          </span>
+                          <span className="font-semibold text-slate-300 font-mono tabular-nums">
+                            Debajo: {evalOu.probUnder.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="h-2.5 w-full rounded-full overflow-hidden bg-slate-800 flex">
+                          <div
+                            style={{ width: `${evalOu.probOver}%` }}
+                            className="bg-emerald-500 transition-all duration-150"
+                          />
+                          <div
+                            style={{ width: `${evalOu.probUnder}%` }}
+                            className="bg-slate-600 transition-all duration-150"
+                          />
+                        </div>
+                        <p className="text-[10px] text-slate-500">
+                          Estimación de probabilidad del modelo (
+                          {item.distributionSpec?.kind === 'poisson'
+                            ? 'Poisson'
+                            : item.distributionSpec?.kind === 'negbin'
+                              ? 'Binomial Negativa'
+                              : 'Normal'}
+                          )
+                        </p>
+                      </div>
+                    </div>
                   )}
                 </div>
-
-                {item.note && <p className="text-[11px] text-slate-400">{item.note}</p>}
-              </div>
-            ))}
+              );
+            })}
           </div>
 
           {match.sport === 'football' && footballPred && (
@@ -937,7 +1066,9 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               <div>
                 <span className="text-slate-400 block">Tarjetas ({match.homeTeam.shortName} / {match.awayTeam.shortName})</span>
                 <span className="text-sm font-bold font-mono tabular-nums text-white">
-                  {footballPred.expectedCardsHome.toFixed(1)} / {footballPred.expectedCardsAway.toFixed(1)}
+                  {footballPred.expectedStats.find((s) => s.key === 'yellow_cards')?.reliability === 'unavailable'
+                    ? 'N/D'
+                    : `${footballPred.expectedCardsHome.toFixed(1)} / ${footballPred.expectedCardsAway.toFixed(1)}`}
                 </span>
               </div>
             </div>

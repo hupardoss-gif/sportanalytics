@@ -381,9 +381,13 @@ function buildBreakdownByKey(
  * predictions j < i of the same sport whose resolution timestamp <= createdAt(i).
  */
 export function runTemporalValidation(predictions: LoggedPrediction[]): TemporalValidationResult {
-  const resolved = predictions
-    .filter((p) => !p.isReferenceExample && (p.status === 'won' || p.status === 'lost'))
+  const realFinished = predictions.filter(
+    (p) => !p.isReferenceExample && (p.status === 'won' || p.status === 'lost')
+  );
+  const resolved = realFinished
+    .filter((p) => Boolean(p.resolvedAt) && Number.isFinite(Date.parse(p.resolvedAt!)))
     .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+  const excludedMissingResolvedAt = realFinished.length - resolved.length;
 
   if (resolved.length === 0) {
     return {
@@ -398,7 +402,10 @@ export function runTemporalValidation(predictions: LoggedPrediction[]): Temporal
       improvementBrierPct: 0,
       activeRatePct: 0,
       leakFreeVerified: true,
-      note: 'Sin predicciones reales resueltas para ejecutar validación temporal walk-forward.',
+      note:
+        excludedMissingResolvedAt > 0
+          ? `Sin predicciones con fecha de resolución verificable (${excludedMissingResolvedAt} excluidas por falta de resolvedAt para evitar fuga temporal).`
+          : 'Sin predicciones reales resueltas para ejecutar validación temporal walk-forward.',
     };
   }
 
@@ -415,12 +422,14 @@ export function runTemporalValidation(predictions: LoggedPrediction[]): Temporal
   for (let i = 0; i < resolved.length; i++) {
     const item = resolved[i];
     const tItem = new Date(item.createdAt).getTime();
+    if (!Number.isFinite(tItem)) continue;
 
-    // Strictly causal history: resolved at or before prediction time tItem (or earlier sequence index when timestamps match)
+    // Strictly causal history: ONLY predictions with verifiable resolvedAt <= prediction createdAt(i)
     const causalHistory = resolved.slice(0, i).filter((past) => {
       if (past.sport !== item.sport) return false;
-      const pastResolvedMs = new Date(past.resolvedAt ?? past.createdAt).getTime();
-      return Number.isFinite(pastResolvedMs) && Number.isFinite(tItem) ? pastResolvedMs <= tItem : true;
+      if (!past.resolvedAt) return false;
+      const pastResolvedMs = Date.parse(past.resolvedAt);
+      return Number.isFinite(pastResolvedMs) && pastResolvedMs <= tItem;
     });
 
     if (causalHistory.length < MIN_CALIBRATION_SAMPLES) {
@@ -457,7 +466,7 @@ export function runTemporalValidation(predictions: LoggedPrediction[]): Temporal
       improvementBrierPct: 0,
       activeRatePct: 0,
       leakFreeVerified: true,
-      note: `En fase de calentamiento (${skippedWarmup}/${MIN_CALIBRATION_SAMPLES} muestras mínimas previas necesarias para evaluación fuera de muestra sin fuga temporal).`,
+      note: `En fase de calentamiento (${skippedWarmup}/${MIN_CALIBRATION_SAMPLES} muestras mínimas previas necesarias${excludedMissingResolvedAt > 0 ? `; ${excludedMissingResolvedAt} excluidas sin resolvedAt` : ''}).`,
     };
   }
 
@@ -482,7 +491,7 @@ export function runTemporalValidation(predictions: LoggedPrediction[]): Temporal
     improvementBrierPct,
     activeRatePct: (activeCount / evaluatedCount) * 100,
     leakFreeVerified: true,
-    note: `Walk-forward causal completado sobre ${evaluatedCount} predicciones (${skippedWarmup} en calentamiento): Brier ${baseBrier.toFixed(3)} → ${calibratedBrier.toFixed(3)}, ECE ${baseEcePct.toFixed(1)}% → ${calibratedEcePct.toFixed(1)}%.`,
+    note: `Walk-forward causal completado sobre ${evaluatedCount} predicciones (${skippedWarmup} en calentamiento${excludedMissingResolvedAt > 0 ? `, ${excludedMissingResolvedAt} excluidas sin resolvedAt` : ''}): Brier ${baseBrier.toFixed(3)} → ${calibratedBrier.toFixed(3)}, ECE ${baseEcePct.toFixed(1)}% → ${calibratedEcePct.toFixed(1)}%.`,
   };
 }
 

@@ -17,59 +17,32 @@ import {
   applyThreeWayCalibration,
   fitEmpiricalCalibrationProfile,
 } from './calibrationEngine.ts';
+import {
+  evaluateMatchStatOverUnder,
+  negBinPmf,
+  normalCdf,
+  poissonPmf,
+} from './distributionMath.ts';
 
-function factorial(n: number): number {
-  let res = 1;
-  for (let i = 2; i <= n; i++) res *= i;
-  return res;
+export { evaluateMatchStatOverUnder };
+
+export function isGoalkeeperPosition(position?: string): boolean {
+  const pos = (position ?? '').trim().toUpperCase();
+  return pos === 'GK' || pos === 'G' || pos.includes('PORTERO') || pos.includes('GOALKEEPER');
 }
 
-function poissonPmf(k: number, lambda: number): number {
-  if (lambda <= 0) return k === 0 ? 1 : 0;
-  return (Math.exp(-lambda) * Math.pow(lambda, k)) / factorial(k);
-}
-
-/** Negative Binomial PMF parameterized by mean mu and overdispersion alpha (Var = mu + alpha * mu^2) */
-function negBinPmf(k: number, mu: number, alpha: number): number {
-  if (mu <= 0) return k === 0 ? 1 : 0;
-  if (alpha <= 0.001) return poissonPmf(k, mu);
-  const r = 1 / alpha;
-  const p = r / (r + mu);
-  const logGamma = (z: number): number => {
-    const g = 7;
-    const c = [
-      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-      771.32342877765313, -176.61502916214059, 12.507343278686905,
-      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
-    ];
-    if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - logGamma(1 - z);
-    z -= 1;
-    let x = c[0];
-    for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
-    const t = z + g + 0.5;
-    return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
-  };
-  const logPmf =
-    logGamma(k + r) -
-    logGamma(k + 1) -
-    logGamma(r) +
-    r * Math.log(p) +
-    k * Math.log(1 - p);
-  return Math.exp(logPmf);
-}
-
-function normalCdf(x: number, mean: number, stdDev: number): number {
-  const z = (x - mean) / (Math.max(0.05, stdDev) * Math.SQRT2);
-  const sign = z < 0 ? -1 : 1;
-  const az = Math.abs(z);
-  const t = 1 / (1 + 0.3275911 * az);
-  const y =
-    1 -
-    (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
-      t) *
-      Math.exp(-az * az);
-  return 0.5 * (1 + sign * y);
-}
+export const FOOTBALL_GK_STATS: FootballPropStat[] = ['saves', 'goalsConceded'];
+export const FOOTBALL_FIELD_STATS: FootballPropStat[] = [
+  'shots',
+  'shotsOnTarget',
+  'goals',
+  'assists',
+  'passes',
+  'foulsCommitted',
+  'foulsDrawn',
+  'yellowCards',
+  'redCards',
+];
 
 function getAvailabilityFactor(status: AvailabilityStatus): number {
   switch (status) {
@@ -413,100 +386,337 @@ export function computeFootballMatchPrediction(
   const sotHInt = poissonInterval80(expectedShotsOnTargetHome, 1.12);
   const sotAInt = poissonInterval80(expectedShotsOnTargetAway, 1.12);
 
-  const goalRel: DataReliability = hasHomeMetrics && hasAwayMetrics ? 'verified' : hasHomeMetrics || hasAwayMetrics ? 'estimated' : 'unavailable';
-  const cornersRel: DataReliability =
-    match.homeTeam.avgCorners !== undefined && match.awayTeam.avgCorners !== undefined
-      ? 'verified'
-      : 'estimated';
-  const cardsRel: DataReliability =
-    match.homeTeam.avgYellowCards !== undefined && match.awayTeam.avgYellowCards !== undefined
-      ? 'verified'
-      : 'estimated';
+  const hasRealCorners =
+    match.homeTeam.avgCorners !== undefined && match.awayTeam.avgCorners !== undefined;
+  const hasPartialCorners =
+    match.homeTeam.avgCorners !== undefined || match.awayTeam.avgCorners !== undefined;
+  const hasRealCards =
+    match.homeTeam.avgYellowCards !== undefined && match.awayTeam.avgYellowCards !== undefined;
+  const hasPartialCards =
+    match.homeTeam.avgYellowCards !== undefined || match.awayTeam.avgYellowCards !== undefined;
+  const hasAnyTeamScoringBasis = hasHomeMetrics || hasAwayMetrics;
+
+  const cornersRel: DataReliability = hasRealCorners
+    ? 'verified'
+    : hasPartialCorners || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const cardsRel: DataReliability = hasRealCards
+    ? 'verified'
+    : hasPartialCards || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+
+  const xgHomeRel: DataReliability = hasHomeMetrics
+    ? 'verified'
+    : hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const xgAwayRel: DataReliability = hasAwayMetrics
+    ? 'verified'
+    : hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const goalRel: DataReliability =
+    hasHomeMetrics && hasAwayMetrics ? 'verified' : hasAnyTeamScoringBasis ? 'estimated' : 'unavailable';
+  const shotsHomeRel: DataReliability = hasRealShotsHome
+    ? 'verified'
+    : hasHomeMetrics || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const shotsAwayRel: DataReliability = hasRealShotsAway
+    ? 'verified'
+    : hasAwayMetrics || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const sotHomeRel: DataReliability = hasRealSotHome
+    ? 'verified'
+    : hasHomeMetrics || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+  const sotAwayRel: DataReliability = hasRealSotAway
+    ? 'verified'
+    : hasAwayMetrics || hasAnyTeamScoringBasis
+      ? 'estimated'
+      : 'unavailable';
+
+  const halfStepNear = (mean: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, Math.floor(mean) + 0.5));
 
   const expectedStats: StatExpectationWithInterval[] = [
-    {
-      key: 'xg_home',
-      label: `Goles / xG esperados (${match.homeTeam.shortName})`,
-      pointEstimate: +lambdaHome.toFixed(2),
-      intervalLow: Math.max(0, +(lambdaHome - 1.28 * Math.sqrt(lambdaHome)).toFixed(2)),
-      intervalHigh: +(lambdaHome + 1.28 * Math.sqrt(lambdaHome)).toFixed(2),
-      unit: 'goles',
-      reliability: hasHomeMetrics ? 'verified' : 'estimated',
-    },
-    {
-      key: 'xg_away',
-      label: `Goles / xG esperados (${match.awayTeam.shortName})`,
-      pointEstimate: +lambdaAway.toFixed(2),
-      intervalLow: Math.max(0, +(lambdaAway - 1.28 * Math.sqrt(lambdaAway)).toFixed(2)),
-      intervalHigh: +(lambdaAway + 1.28 * Math.sqrt(lambdaAway)).toFixed(2),
-      unit: 'goles',
-      reliability: hasAwayMetrics ? 'verified' : 'estimated',
-    },
-    {
-      key: 'goals_total',
-      label: 'Goles totales esperados',
-      pointEstimate: +expectedGoalsTotal.toFixed(2),
-      intervalLow: Math.max(0, +(expectedGoalsTotal - 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2)),
-      intervalHigh: +(expectedGoalsTotal + 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2),
-      unit: 'goles',
-      reliability: goalRel,
-    },
-    {
-      key: 'shots_home',
-      label: `Tiros totales (${match.homeTeam.shortName})`,
-      pointEstimate: +expectedShotsHome.toFixed(1),
-      intervalLow: shotsHInt[0],
-      intervalHigh: shotsHInt[1],
-      unit: 'tiros',
-      reliability: hasRealShotsHome ? 'verified' : 'estimated',
-      note: hasRealShotsHome ? 'Promedio verificado del equipo' : 'Estimado desde volumen ofensivo xG',
-    },
-    {
-      key: 'shots_away',
-      label: `Tiros totales (${match.awayTeam.shortName})`,
-      pointEstimate: +expectedShotsAway.toFixed(1),
-      intervalLow: shotsAInt[0],
-      intervalHigh: shotsAInt[1],
-      unit: 'tiros',
-      reliability: hasRealShotsAway ? 'verified' : 'estimated',
-      note: hasRealShotsAway ? 'Promedio verificado del equipo' : 'Estimado desde volumen ofensivo xG',
-    },
-    {
-      key: 'sot_home',
-      label: `Tiros a puerta (${match.homeTeam.shortName})`,
-      pointEstimate: +expectedShotsOnTargetHome.toFixed(1),
-      intervalLow: sotHInt[0],
-      intervalHigh: sotHInt[1],
-      unit: 'a puerta',
-      reliability: hasRealSotHome ? 'verified' : 'estimated',
-    },
-    {
-      key: 'sot_away',
-      label: `Tiros a puerta (${match.awayTeam.shortName})`,
-      pointEstimate: +expectedShotsOnTargetAway.toFixed(1),
-      intervalLow: sotAInt[0],
-      intervalHigh: sotAInt[1],
-      unit: 'a puerta',
-      reliability: hasRealSotAway ? 'verified' : 'estimated',
-    },
-    {
-      key: 'corners',
-      label: 'Córners totales esperados',
-      pointEstimate: +cornersMean.toFixed(1),
-      intervalLow: cornersInt[0],
-      intervalHigh: cornersInt[1],
-      unit: 'córners',
-      reliability: cornersRel,
-    },
-    {
-      key: 'yellow_cards',
-      label: 'Tarjetas amarillas esperadas',
-      pointEstimate: +cardsTotalMean.toFixed(1),
-      intervalLow: cardsInt[0],
-      intervalHigh: cardsInt[1],
-      unit: 'tarjetas',
-      reliability: cardsRel,
-    },
+    xgHomeRel === 'unavailable'
+      ? {
+          key: 'xg_home',
+          label: `Goles / xG esperados (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'goles',
+          reliability: 'unavailable',
+          note: 'Sin métricas ofensivas/defensivas suficientes del equipo',
+        }
+      : {
+          key: 'xg_home',
+          label: `Goles / xG esperados (${match.homeTeam.shortName})`,
+          pointEstimate: +lambdaHome.toFixed(2),
+          intervalLow: Math.max(0, +(lambdaHome - 1.28 * Math.sqrt(lambdaHome)).toFixed(2)),
+          intervalHigh: +(lambdaHome + 1.28 * Math.sqrt(lambdaHome)).toFixed(2),
+          unit: 'goles',
+          reliability: xgHomeRel,
+          note: hasHomeMetrics ? 'Basado en tasas xG/goles reales' : 'Estimado desde fortaleza del rival y liga',
+          distributionSpec: {
+            kind: 'poisson',
+            mean: +lambdaHome.toFixed(3),
+            minLine: 0.5,
+            maxLine: 4.5,
+            step: 0.5,
+            defaultLine: halfStepNear(lambdaHome, 0.5, 4.5),
+          },
+        },
+    xgAwayRel === 'unavailable'
+      ? {
+          key: 'xg_away',
+          label: `Goles / xG esperados (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'goles',
+          reliability: 'unavailable',
+          note: 'Sin métricas ofensivas/defensivas suficientes del equipo',
+        }
+      : {
+          key: 'xg_away',
+          label: `Goles / xG esperados (${match.awayTeam.shortName})`,
+          pointEstimate: +lambdaAway.toFixed(2),
+          intervalLow: Math.max(0, +(lambdaAway - 1.28 * Math.sqrt(lambdaAway)).toFixed(2)),
+          intervalHigh: +(lambdaAway + 1.28 * Math.sqrt(lambdaAway)).toFixed(2),
+          unit: 'goles',
+          reliability: xgAwayRel,
+          note: hasAwayMetrics ? 'Basado en tasas xG/goles reales' : 'Estimado desde fortaleza del rival y liga',
+          distributionSpec: {
+            kind: 'poisson',
+            mean: +lambdaAway.toFixed(3),
+            minLine: 0.5,
+            maxLine: 4.5,
+            step: 0.5,
+            defaultLine: halfStepNear(lambdaAway, 0.5, 4.5),
+          },
+        },
+    goalRel === 'unavailable'
+      ? {
+          key: 'goals_total',
+          label: 'Goles totales esperados',
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'goles',
+          reliability: 'unavailable',
+          note: 'Sin datos reales de ambos equipos para calcular total de goles',
+        }
+      : {
+          key: 'goals_total',
+          label: 'Goles totales esperados',
+          pointEstimate: +expectedGoalsTotal.toFixed(2),
+          intervalLow: Math.max(0, +(expectedGoalsTotal - 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2)),
+          intervalHigh: +(expectedGoalsTotal + 1.28 * Math.sqrt(expectedGoalsTotal)).toFixed(2),
+          unit: 'goles',
+          reliability: goalRel,
+          note: goalRel === 'verified' ? 'Suma Poisson bivariante con tasas reales' : 'Estimación parcial del modelo',
+          distributionSpec: {
+            kind: 'poisson',
+            mean: +expectedGoalsTotal.toFixed(3),
+            minLine: 0.5,
+            maxLine: 6.5,
+            step: 0.5,
+            defaultLine: halfStepNear(expectedGoalsTotal, 0.5, 6.5),
+          },
+        },
+    shotsHomeRel === 'unavailable'
+      ? {
+          key: 'shots_home',
+          label: `Tiros totales (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'tiros',
+          reliability: 'unavailable',
+          note: 'Sin datos de tiros ni métricas base del equipo',
+        }
+      : {
+          key: 'shots_home',
+          label: `Tiros totales (${match.homeTeam.shortName})`,
+          pointEstimate: +expectedShotsHome.toFixed(1),
+          intervalLow: shotsHInt[0],
+          intervalHigh: shotsHInt[1],
+          unit: 'tiros',
+          reliability: shotsHomeRel,
+          note: hasRealShotsHome ? 'Promedio verificado del equipo' : 'Estimación del modelo desde xG ofensivo',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +expectedShotsHome.toFixed(2),
+            overdispersion: 0.08,
+            minLine: 5.5,
+            maxLine: 26.5,
+            step: 1,
+            defaultLine: halfStepNear(expectedShotsHome, 5.5, 26.5),
+          },
+        },
+    shotsAwayRel === 'unavailable'
+      ? {
+          key: 'shots_away',
+          label: `Tiros totales (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'tiros',
+          reliability: 'unavailable',
+          note: 'Sin datos de tiros ni métricas base del equipo',
+        }
+      : {
+          key: 'shots_away',
+          label: `Tiros totales (${match.awayTeam.shortName})`,
+          pointEstimate: +expectedShotsAway.toFixed(1),
+          intervalLow: shotsAInt[0],
+          intervalHigh: shotsAInt[1],
+          unit: 'tiros',
+          reliability: shotsAwayRel,
+          note: hasRealShotsAway ? 'Promedio verificado del equipo' : 'Estimación del modelo desde xG ofensivo',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +expectedShotsAway.toFixed(2),
+            overdispersion: 0.08,
+            minLine: 4.5,
+            maxLine: 24.5,
+            step: 1,
+            defaultLine: halfStepNear(expectedShotsAway, 4.5, 24.5),
+          },
+        },
+    sotHomeRel === 'unavailable'
+      ? {
+          key: 'sot_home',
+          label: `Tiros a puerta (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'a puerta',
+          reliability: 'unavailable',
+          note: 'Sin datos de tiros a puerta ni métricas base del equipo',
+        }
+      : {
+          key: 'sot_home',
+          label: `Tiros a puerta (${match.homeTeam.shortName})`,
+          pointEstimate: +expectedShotsOnTargetHome.toFixed(1),
+          intervalLow: sotHInt[0],
+          intervalHigh: sotHInt[1],
+          unit: 'a puerta',
+          reliability: sotHomeRel,
+          note: hasRealSotHome ? 'Promedio verificado del equipo' : 'Estimación del modelo desde xG ofensivo',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +expectedShotsOnTargetHome.toFixed(2),
+            overdispersion: 0.1,
+            minLine: 1.5,
+            maxLine: 11.5,
+            step: 0.5,
+            defaultLine: halfStepNear(expectedShotsOnTargetHome, 1.5, 11.5),
+          },
+        },
+    sotAwayRel === 'unavailable'
+      ? {
+          key: 'sot_away',
+          label: `Tiros a puerta (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'a puerta',
+          reliability: 'unavailable',
+          note: 'Sin datos de tiros a puerta ni métricas base del equipo',
+        }
+      : {
+          key: 'sot_away',
+          label: `Tiros a puerta (${match.awayTeam.shortName})`,
+          pointEstimate: +expectedShotsOnTargetAway.toFixed(1),
+          intervalLow: sotAInt[0],
+          intervalHigh: sotAInt[1],
+          unit: 'a puerta',
+          reliability: sotAwayRel,
+          note: hasRealSotAway ? 'Promedio verificado del equipo' : 'Estimación del modelo desde xG ofensivo',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +expectedShotsOnTargetAway.toFixed(2),
+            overdispersion: 0.1,
+            minLine: 1.5,
+            maxLine: 10.5,
+            step: 0.5,
+            defaultLine: halfStepNear(expectedShotsOnTargetAway, 1.5, 10.5),
+          },
+        },
+    cornersRel === 'unavailable'
+      ? {
+          key: 'corners',
+          label: 'Córners totales esperados',
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'córners',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedios históricos de córners ni métricas base suficientes',
+        }
+      : {
+          key: 'corners',
+          label: 'Córners totales esperados',
+          pointEstimate: +cornersMean.toFixed(1),
+          intervalLow: cornersInt[0],
+          intervalHigh: cornersInt[1],
+          unit: 'córners',
+          reliability: cornersRel,
+          note:
+            cornersRel === 'verified'
+              ? 'Basado en promedios reales de córners de ambos equipos'
+              : 'Estimación del modelo derivada de xG y presión ofensiva',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +cornersMean.toFixed(2),
+            overdispersion: 0.06,
+            minLine: 4.5,
+            maxLine: 16.5,
+            step: 0.5,
+            defaultLine: halfStepNear(cornersMean, 4.5, 16.5),
+          },
+        },
+    cardsRel === 'unavailable'
+      ? {
+          key: 'yellow_cards',
+          label: 'Tarjetas amarillas esperadas',
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'tarjetas',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedios disciplinarios ni métricas base suficientes',
+        }
+      : {
+          key: 'yellow_cards',
+          label: 'Tarjetas amarillas esperadas',
+          pointEstimate: +cardsTotalMean.toFixed(1),
+          intervalLow: cardsInt[0],
+          intervalHigh: cardsInt[1],
+          unit: 'tarjetas',
+          reliability: cardsRel,
+          note:
+            cardsRel === 'verified'
+              ? 'Basado en promedios disciplinarios verificados de ambos equipos'
+              : 'Estimación del modelo derivada de contexto de partido',
+          distributionSpec: {
+            kind: 'negbin',
+            mean: +cardsTotalMean.toFixed(2),
+            overdispersion: 0.08,
+            minLine: 1.5,
+            maxLine: 9.5,
+            step: 0.5,
+            defaultLine: halfStepNear(cardsTotalMean, 1.5, 9.5),
+          },
+        },
   ];
 
   return {
@@ -554,6 +764,8 @@ export const FOOTBALL_STAT_CONFIG: Record<
   yellowCards: { label: 'Tarjetas amarillas', min: 0.5, max: 1.5, step: 0.5, overdispersion: 0.05 },
   redCards: { label: 'Tarjetas rojas', min: 0.5, max: 1.5, step: 0.5, overdispersion: 0.02 },
   passes: { label: 'Pases completados', min: 19.5, max: 99.5, step: 1, overdispersion: 0.12, isNormal: true },
+  saves: { label: 'Paradas del portero', min: 0.5, max: 9.5, step: 0.5, overdispersion: 0.16 },
+  goalsConceded: { label: 'Goles encajados', min: 0.5, max: 4.5, step: 0.5, overdispersion: 0.09 },
 };
 
 function evaluatePlayerLogFreshness(
@@ -590,8 +802,8 @@ function evaluatePlayerLogFreshness(
 
 /**
  * Computes Football Player Prop Over/Under distribution combining Season, L5, L10,
- * Home/Away context, opponent defense, expected minutes/starter role, freshness check,
- * and zero-sum normalized teammate redistribution.
+ * Home/Away context, opponent defense/shots, expected minutes/starter role, freshness check,
+ * goalkeeper-specific modeling, and zero-sum normalized teammate redistribution.
  */
 export function computeFootballPlayerProp(
   player: PlayerProfile,
@@ -603,19 +815,66 @@ export function computeFootballPlayerProp(
 ): PropProjectionResult {
   const cfg = FOOTBALL_STAT_CONFIG[statKey];
   const isHome = player.teamId === match.homeTeam.id;
+  const isGk = isGoalkeeperPosition(player.position);
   const teamPlayers =
     teammatesOverride ?? (isHome ? match.homePlayers : match.awayPlayers);
 
   const statsQuality: DataReliability =
-    player.statsQuality ?? (player.sampleSizeGames >= 5 ? 'verified' : player.sampleSizeGames > 0 ? 'estimated' : 'estimated');
+    player.statsQuality ??
+    (player.sampleSizeGames >= 5 ? 'verified' : player.sampleSizeGames > 0 ? 'estimated' : 'unavailable');
 
   const seasonData = player.splits.season;
+  const rawSeasonOpt = seasonData[statKey];
+
+  const gkAttackStatMismatch =
+    isGk && ['goals', 'assists', 'shots', 'shotsOnTarget'].includes(statKey);
+  const unavailableStat =
+    gkAttackStatMismatch ||
+    statsQuality === 'unavailable' ||
+    rawSeasonOpt === undefined ||
+    !Number.isFinite(rawSeasonOpt);
+
+  if (unavailableStat) {
+    const line = customLine ?? cfg.min;
+    return {
+      statKey,
+      statLabel: cfg.label,
+      line,
+      minLine: cfg.min,
+      maxLine: cfg.max,
+      step: cfg.step,
+      expectedValue: 0,
+      median: 0,
+      stdDev: 0,
+      intervalLow: 0,
+      intervalHigh: 0,
+      probOver: 0,
+      probUnder: 0,
+      expectedMinutes: 0,
+      absenceAdjustmentPct: 0,
+      sampleConfidence: 0,
+      sampleSizeGames: player.sampleSizeGames,
+      statsQuality: 'unavailable',
+      statsOriginNote:
+        player.statsOriginNote ??
+        (gkAttackStatMismatch
+          ? 'Métrica ofensiva de jugador de campo no aplicable a porteros'
+          : 'Estadísticas individuales reales no disponibles en esta fuente'),
+      dataFreshness: 'unknown',
+      unavailable: true,
+      unavailableReason: gkAttackStatMismatch
+        ? `La estadística "${cfg.label}" no aplica a porteros; consulta Paradas o Goles encajados.`
+        : `No hay registros individuales reales de "${cfg.label}" para ${player.name}.`,
+      distribution: [],
+    };
+  }
+
   const last5Data = player.splits.last5 ?? seasonData;
   const last10Data = player.splits.last10 ?? seasonData;
   const venueData = isHome ? (player.splits.home ?? seasonData) : (player.splits.away ?? seasonData);
   const splitData = player.splits[timeframe] ?? seasonData;
 
-  const rawSeasonVal = seasonData[statKey] ?? 0;
+  const rawSeasonVal = rawSeasonOpt;
   const rawLast5Val = last5Data[statKey] ?? rawSeasonVal;
   const rawLast10Val = last10Data[statKey] ?? rawSeasonVal;
   const rawVenueVal = venueData[statKey] ?? rawSeasonVal;
@@ -640,19 +899,21 @@ export function computeFootballPlayerProp(
   );
 
   const availFactor = getAvailabilityFactor(player.availability);
-  const starterMinutes = Math.max(45, splitData.minutes || 82);
+  const starterMinutes = Math.max(45, splitData.minutes || (isGk ? 90 : 82));
   const expectedMinutes =
     player.availability === 'out' || player.availability === 'suspended'
       ? 0
       : player.availability === 'bench'
-        ? Math.min(34, starterMinutes * 0.38)
+        ? isGk
+          ? 0
+          : Math.min(34, starterMinutes * 0.38)
         : player.availability === 'doubtful'
           ? starterMinutes * 0.62
           : starterMinutes;
   const minutesRatio =
     player.splits.season.minutes > 0 ? expectedMinutes / player.splits.season.minutes : availFactor;
 
-  // Normalized zero-sum redistribution among active teammates
+  // Normalized zero-sum redistribution among active teammates (outfield players only)
   let missingUsage = 0;
   let missingAssists = 0;
   let activeUsageWeight = Math.max(0.05, player.impact.usageShare * availFactor);
@@ -673,7 +934,7 @@ export function computeFootballPlayerProp(
   }
 
   let teammateBoost = 0;
-  if (availFactor > 0) {
+  if (availFactor > 0 && !isGk) {
     if (statKey === 'shots' || statKey === 'shotsOnTarget' || statKey === 'goals') {
       const share = (player.impact.usageShare * availFactor) / Math.max(0.25, activeUsageWeight);
       teammateBoost = Math.min(0.26, missingUsage * share * 1.45);
@@ -683,11 +944,21 @@ export function computeFootballPlayerProp(
     }
   }
 
+  const oppTeam = isHome ? match.awayTeam : match.homeTeam;
   const oppDef = isHome ? (match.awayTeam.defenseAway ?? 1.15) : (match.homeTeam.defenseHome ?? 1.05);
+  const oppAtk = isHome
+    ? (oppTeam.attackAway ?? oppTeam.ppgOrGpg ?? 1.28)
+    : (oppTeam.attackHome ?? oppTeam.ppgOrGpg ?? 1.38);
+  const oppSot = oppTeam.avgShotsOnTarget ?? oppAtk * 3.1 + 0.45;
+
   const oppMultiplier =
-    statKey === 'goals' || statKey === 'assists' || statKey === 'shots' || statKey === 'shotsOnTarget'
-      ? Math.max(0.78, Math.min(1.26, oppDef / 1.12))
-      : 1.0;
+    statKey === 'saves'
+      ? Math.max(0.75, Math.min(1.38, oppSot / 4.2))
+      : statKey === 'goalsConceded'
+        ? Math.max(0.72, Math.min(1.42, oppAtk / 1.32))
+        : statKey === 'goals' || statKey === 'assists' || statKey === 'shots' || statKey === 'shotsOnTarget'
+          ? Math.max(0.78, Math.min(1.26, oppDef / 1.12))
+          : 1.0;
 
   const expectedValue = Math.max(
     0,
@@ -874,22 +1145,31 @@ export function buildFootballMatchExplanation(
         ? `Ligero favoritismo visitante para ${a.name} (${(pred.probAway * 100).toFixed(1)}% vs ${(pred.probHome * 100).toFixed(1)}%)`
         : `Duelo muy equilibrado entre ${h.shortName} (${(pred.probHome * 100).toFixed(1)}%) y ${a.shortName} (${(pred.probAway * 100).toFixed(1)}%)`;
 
+  const homeShotsStat = pred.expectedStats.find((s) => s.key === 'shots_home');
+  const awayShotsStat = pred.expectedStats.find((s) => s.key === 'shots_away');
+  const cornersStat = pred.expectedStats.find((s) => s.key === 'corners');
+  const cardsStat = pred.expectedStats.find((s) => s.key === 'yellow_cards');
+
   const homeFavoringFactors: string[] = [
-    `Localía y producción esperada de ${pred.lambdaHome.toFixed(2)} xG (${pred.expectedShotsHome.toFixed(1)} tiros totales est.).`,
+    `Localía y producción esperada de ${pred.lambdaHome.toFixed(2)} xG${
+      homeShotsStat?.pointEstimate != null ? ` (${homeShotsStat.pointEstimate.toFixed(1)} tiros totales est.)` : ''
+    }.`,
   ];
   if (h.homeRecord) homeFavoringFactors.push(`Balance en casa registrado: ${h.homeRecord}.`);
   if (h.formRecent.length > 0) homeFavoringFactors.push(`Forma L${h.formRecent.length}: ${h.formRecent.join('-')} (${homePtsL5} de ${h.formRecent.length * 3} pts).`);
   if (h.ppgOrGpg !== undefined) homeFavoringFactors.push(`Promedio ofensivo reciente: ${h.ppgOrGpg.toFixed(2)} goles/partido.`);
 
   const awayFavoringFactors: string[] = [
-    `Proyección ofensiva visitante de ${pred.lambdaAway.toFixed(2)} xG (${pred.expectedShotsAway.toFixed(1)} tiros est.).`,
+    `Proyección ofensiva visitante de ${pred.lambdaAway.toFixed(2)} xG${
+      awayShotsStat?.pointEstimate != null ? ` (${awayShotsStat.pointEstimate.toFixed(1)} tiros est.)` : ''
+    }.`,
   ];
   if (a.awayRecord) awayFavoringFactors.push(`Rendimiento fuera de casa: ${a.awayRecord}.`);
   if (a.formRecent.length > 0) awayFavoringFactors.push(`Forma L${a.formRecent.length}: ${a.formRecent.join('-')} (${awayPtsL5} de ${a.formRecent.length * 3} pts).`);
   if (a.ppgOrGpg !== undefined) awayFavoringFactors.push(`Media anotadora: ${a.ppgOrGpg.toFixed(2)} goles/partido.`);
 
-  const homeStrengthsWeaknesses = `${h.shortName}: ${h.ppgOrGpg !== undefined ? `${h.ppgOrGpg.toFixed(2)} GF` : 'GF base'} / ${h.oppgOrGapg !== undefined ? `${h.oppgOrGapg.toFixed(2)} GC` : 'GC base'} · Formación ${h.formation ?? '4-3-3'}.`;
-  const awayStrengthsWeaknesses = `${a.shortName}: ${a.ppgOrGpg !== undefined ? `${a.ppgOrGpg.toFixed(2)} GF` : 'GF base'} / ${a.oppgOrGapg !== undefined ? `${a.oppgOrGapg.toFixed(2)} GC` : 'GC base'} · Formación ${a.formation ?? '4-2-3-1'}.`;
+  const homeStrengthsWeaknesses = `${h.shortName}: ${h.ppgOrGpg !== undefined ? `${h.ppgOrGpg.toFixed(2)} GF` : 'GF N/D'} / ${h.oppgOrGapg !== undefined ? `${h.oppgOrGapg.toFixed(2)} GC` : 'GC N/D'} · Formación ${h.formation ?? 'N/D'}.`;
+  const awayStrengthsWeaknesses = `${a.shortName}: ${a.ppgOrGpg !== undefined ? `${a.ppgOrGpg.toFixed(2)} GF` : 'GF N/D'} / ${a.oppgOrGapg !== undefined ? `${a.oppgOrGapg.toFixed(2)} GC` : 'GC N/D'} · Formación ${a.formation ?? 'N/D'}.`;
 
   const h2hAssessment =
     match.h2hSummary.played >= 4
@@ -900,7 +1180,13 @@ export function buildFootballMatchExplanation(
 
   const tacticalMatchups = [
     `Ritmo esperado del partido: ${pred.expectedGoalsTotal.toFixed(2)} goles totales (BTTS ${(pred.bttsYes * 100).toFixed(1)}% · Over 2.5 ${(pred.over25 * 100).toFixed(1)}%).`,
-    `Volumen territorial estimado: ${pred.expectedCorners.toFixed(1)} córners y ${(pred.expectedCardsHome + pred.expectedCardsAway).toFixed(1)} tarjetas amarillas.`,
+    cornersStat?.pointEstimate != null || cardsStat?.pointEstimate != null
+      ? `Volumen territorial estimado: ${
+          cornersStat?.pointEstimate != null ? `${cornersStat.pointEstimate.toFixed(1)} córners` : 'córners N/D'
+        } y ${
+          cardsStat?.pointEstimate != null ? `${cardsStat.pointEstimate.toFixed(1)} tarjetas amarillas` : 'tarjetas N/D'
+        }.`
+      : 'Sin datos históricos suficientes de córners o tarjetas para estimar volumen territorial.',
   ];
 
   const uncertaintiesAndLimits = [...pred.modelWarnings];

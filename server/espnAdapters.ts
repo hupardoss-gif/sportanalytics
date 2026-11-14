@@ -509,20 +509,20 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
           const rawAvgOppg = getStatVal(['avgPointsAgainst']);
           const rawTotOppg = getStatVal(['pointsAgainst']) / safePlayed;
 
-          const avgPpg = rawAvgPpg > 50 ? rawAvgPpg : rawTotPpg > 50 ? rawTotPpg : 114.5;
-          const avgOppg = rawAvgOppg > 50 ? rawAvgOppg : rawTotOppg > 50 ? rawTotOppg : 114.5;
-          const pct = getStatDisp(['winPercent']) || (wins / safePlayed).toFixed(3);
+          const avgPpg = rawAvgPpg > 50 ? rawAvgPpg : rawTotPpg > 50 ? rawTotPpg : undefined;
+          const avgOppg = rawAvgOppg > 50 ? rawAvgOppg : rawTotOppg > 50 ? rawTotOppg : undefined;
+          const pct = getStatDisp(['winPercent']) || (played > 0 ? (wins / safePlayed).toFixed(3) : '0.000');
           const homeRec = getStatDisp(['Home', 'home']);
           const awayRec = getStatDisp(['Road', 'away']);
 
-          // Bayesian shrinkage toward league mean (114.5) when early in the season (k=16)
-          const shrink = played / (played + 16);
-          const shrunkPpg = 114.5 + shrink * (avgPpg - 114.5);
-          const shrunkOppg = 114.5 + shrink * (avgOppg - 114.5);
-          const offRating = Math.max(104, Math.min(124, shrunkPpg * (114.5 / 114.0)));
-          const defRating = Math.max(104, Math.min(124, shrunkOppg * (114.5 / 114.0)));
+          if (teamId && played > 0 && avgPpg !== undefined && avgOppg !== undefined) {
+            // Bayesian shrinkage toward league mean (114.5) when early in the season (k=16)
+            const shrink = played / (played + 16);
+            const shrunkPpg = 114.5 + shrink * (avgPpg - 114.5);
+            const shrunkOppg = 114.5 + shrink * (avgOppg - 114.5);
+            const offRating = Math.max(104, Math.min(124, shrunkPpg * (114.5 / 114.0)));
+            const defRating = Math.max(104, Math.min(124, shrunkOppg * (114.5 / 114.0)));
 
-          if (teamId) {
             teamMetaMap.set(teamId, {
               played,
               record: `${wins}-${losses}`,
@@ -545,9 +545,12 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
             played,
             won: wins,
             lost: losses,
-            goalsForOrPtsFor: Math.round(avgPpg * 10) / 10,
-            goalsAgainstOrPtsAgainst: Math.round(avgOppg * 10) / 10,
-            diff: Math.round((avgPpg - avgOppg) * 10) / 10,
+            goalsForOrPtsFor: avgPpg !== undefined ? Math.round(avgPpg * 10) / 10 : 0,
+            goalsAgainstOrPtsAgainst: avgOppg !== undefined ? Math.round(avgOppg * 10) / 10 : 0,
+            diff:
+              avgPpg !== undefined && avgOppg !== undefined
+                ? Math.round((avgPpg - avgOppg) * 10) / 10
+                : 0,
             pointsOrWinPct: pct,
             form: [],
             homeRecord: homeRec,
@@ -650,7 +653,6 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
         oppgOrGapg: hMeta?.oppg,
         offRating: hMeta?.offRating,
         defRating: hMeta?.defRating,
-        pace: 99.5,
         formRecent: [],
         restDays: 2,
       },
@@ -667,7 +669,6 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
         oppgOrGapg: aMeta?.oppg,
         offRating: aMeta?.offRating,
         defRating: aMeta?.defRating,
-        pace: 99.5,
         formRecent: [],
         restDays: 2,
       },
@@ -1223,15 +1224,8 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
 
         const fallbackSplit: StatSplitValues = {
           games: 0,
-          minutes: isStarterAvail ? 28 : 16,
+          minutes: 0,
           starterRate: isStarterAvail ? 0.85 : 0.15,
-          points: 0,
-          rebounds: 0,
-          assists: 0,
-          threes: 0,
-          steals: 0,
-          blocks: 0,
-          turnovers: 0,
         };
 
         const splits = gl?.splits ?? {
@@ -1487,6 +1481,8 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
             : 'GEMINI_API_KEY no configurada en el servidor (Settings > Secrets). Se muestran únicamente los partes oficiales NBA y noticias en vivo (ESPN, RotoWire, Yahoo Sports y CBS Sports).',
         },
         items: externalNews.items,
+        rejectedStaleCount: externalNews.rejectedStaleCount,
+        freshnessWarning: externalNews.freshnessWarning,
       },
       hydrationStatus: homePlayers.length > 0 ? 'ok' : 'not_published',
       hydrationNote: hasCurrentBoxscore
@@ -1606,6 +1602,49 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
         const isFwd = posCode === 'F';
         const isMid = posCode === 'M';
 
+        const rawStats = Array.isArray(entry.stats) ? (entry.stats as AnyObj[]) : [];
+        const getEntryStat = (names: string[]): number | undefined => {
+          const found = rawStats.find((s) => names.includes(String(s.name ?? '')));
+          const v = found?.value !== undefined ? Number(found.value) : NaN;
+          return Number.isFinite(v) ? v : undefined;
+        };
+        const statGoals = getEntryStat(['totalGoals', 'goals']);
+        const statAssists = getEntryStat(['goalAssists', 'assists']);
+        const statShots = getEntryStat(['totalShots', 'shots']);
+        const statSot = getEntryStat(['shotsOnTarget']);
+        const statFouls = getEntryStat(['foulsCommitted']);
+        const statYellows = getEntryStat(['yellowCards']);
+        const statReds = getEntryStat(['redCards']);
+        const statSaves = getEntryStat(['saves']);
+        const statConceded = getEntryStat(['goalsConceded', 'goalsAgainst']);
+        const hasRealEntryStats =
+          posCode === 'G'
+            ? statSaves !== undefined || statConceded !== undefined
+            : statGoals !== undefined || statShots !== undefined || statAssists !== undefined;
+
+        const baseSplit: StatSplitValues = hasRealEntryStats
+          ? {
+              games: 1,
+              minutes: isStarter ? 85 : 25,
+              starterRate: isStarter ? 1 : 0,
+              ...(posCode === 'G'
+                ? { saves: statSaves, goalsConceded: statConceded }
+                : {
+                    goals: statGoals,
+                    assists: statAssists,
+                    shots: statShots,
+                    shotsOnTarget: statSot,
+                    foulsCommitted: statFouls,
+                    yellowCards: statYellows,
+                    redCards: statReds,
+                  }),
+            }
+          : {
+              games: 0,
+              minutes: 0,
+              starterRate: isStarter ? 0.85 : 0.2,
+            };
+
         return {
           id: `espnsoc-p-${String(ath.id ?? `${teamShort}-${idx}`)}`,
           sport: 'football',
@@ -1629,18 +1668,20 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
             assistShare: isMid ? 0.18 : isFwd ? 0.13 : 0.04,
           },
           splits: {
-            season: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last5: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last10: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last15: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            home: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isFwd ? 0.95 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            away: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.28 : isMid ? 0.11 : 0.04, assists: isMid ? 0.17 : 0.08, shots: isFwd ? 2.1 : isMid ? 1.05 : 0.4, shotsOnTarget: isFwd ? 0.85 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            h2h: { games: 0, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
+            season: baseSplit,
+            last5: baseSplit,
+            last10: baseSplit,
+            last15: baseSplit,
+            home: baseSplit,
+            away: baseSplit,
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.2 },
           },
           recentLogs: [],
-          sampleSizeGames: 0,
-          statsQuality: 'estimated',
-          statsOriginNote: 'Estimación posicional (el proveedor no expone historial individual por partido)',
+          sampleSizeGames: hasRealEntryStats ? 1 : 0,
+          statsQuality: hasRealEntryStats ? 'estimated' : 'unavailable',
+          statsOriginNote: hasRealEntryStats
+            ? 'Estadísticas del encuentro ESPN (sin historial completo de temporada)'
+            : 'Estadísticas individuales reales no disponibles en esta fuente',
         };
       });
 

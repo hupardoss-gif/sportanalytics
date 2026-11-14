@@ -62,11 +62,17 @@ function mapNbaSlotCoord(pos: string, idx: number): { x: number; y: number } {
 
 const TOP_FOOTBALL_LEAGUE_IDS = new Set([140, 39, 2, 135, 78, 61, 3, 141, 45]);
 
+export interface FetchAdapterOptions {
+  includeEspnFallback?: boolean;
+}
+
 export async function fetchFootballCalendarAndStandings(
   provider: string,
-  apiKey: string
+  apiKey: string,
+  options: FetchAdapterOptions = {}
 ): Promise<{ matches: MatchRecord[]; standings: StandingEntry[] }> {
   const fetchedAt = new Date().toISOString();
+  const includeEspnFallback = options.includeEspnFallback !== false;
 
   if (provider === 'api-football') {
     const dates = [isoDateOffset(-1), isoDateOffset(0), isoDateOffset(1), isoDateOffset(2)];
@@ -250,7 +256,9 @@ export async function fetchFootballCalendarAndStandings(
         { headers },
         10000
       ).catch(() => null),
-      fetchEspnSoccerEnrichment().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] })),
+      includeEspnFallback
+        ? fetchEspnSoccerEnrichment().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
     ]);
 
     if (!win1Res.ok) throw new Error(`Football-Data.org HTTP ${win1Res.status}`);
@@ -504,15 +512,17 @@ export async function fetchFootballCalendarAndStandings(
         };
       });
 
-    const extraEspnMatches = espnEnrich.matches.filter(
-      (em) =>
-        !fdMatches.some(
-          (fm) =>
-            teamsMatch(fm.homeTeam.name, em.homeTeam.name) &&
-            teamsMatch(fm.awayTeam.name, em.awayTeam.name) &&
-            Math.abs(new Date(fm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+    const extraEspnMatches = includeEspnFallback
+      ? espnEnrich.matches.filter(
+          (em) =>
+            !fdMatches.some(
+              (fm) =>
+                teamsMatch(fm.homeTeam.name, em.homeTeam.name) &&
+                teamsMatch(fm.awayTeam.name, em.awayTeam.name) &&
+                Math.abs(new Date(fm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+            )
         )
-    );
+      : [];
 
     return { matches: [...fdMatches, ...extraEspnMatches], standings: standingsList };
   }
@@ -522,9 +532,11 @@ export async function fetchFootballCalendarAndStandings(
 
 export async function fetchNbaCalendarAndStandings(
   provider: string,
-  apiKey: string
+  apiKey: string,
+  options: FetchAdapterOptions = {}
 ): Promise<{ matches: MatchRecord[]; standings: StandingEntry[] }> {
   const fetchedAt = new Date().toISOString();
+  const includeEspnFallback = options.includeEspnFallback !== false;
 
   if (provider === 'espn-nba') {
     return fetchEspnNbaCalendarAndStandings();
@@ -537,7 +549,9 @@ export async function fetchNbaCalendarAndStandings(
       fetchWithTimeout(`https://api.balldontlie.io/v1/games?${query}&per_page=40`, {
         headers: { Authorization: apiKey },
       }, 10000),
-      fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] })),
+      includeEspnFallback
+        ? fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
     ]);
     if (!res.ok) throw new Error(`BallDontLie HTTP ${res.status}`);
     const json = (await res.json()) as {
@@ -649,7 +663,9 @@ export async function fetchNbaCalendarAndStandings(
           };
         })
       ),
-      fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] })),
+      includeEspnFallback
+        ? fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
     ]);
 
     const matches: MatchRecord[] = responses
@@ -810,10 +826,12 @@ export async function fetchNbaCalendarAndStandings(
 
     if (authError) throw new Error(authError);
 
-    const espnNba = await fetchEspnNbaCalendarAndStandings().catch(() => ({
-      matches: [] as MatchRecord[],
-      standings: [] as StandingEntry[],
-    }));
+    const espnNba = includeEspnFallback
+      ? await fetchEspnNbaCalendarAndStandings().catch(() => ({
+          matches: [] as MatchRecord[],
+          standings: [] as StandingEntry[],
+        }))
+      : { matches: [] as MatchRecord[], standings: [] as StandingEntry[] };
 
     const rawGames = buckets.flat();
     const seenIds = new Set<string>();
@@ -1021,15 +1039,17 @@ export async function fetchNbaCalendarAndStandings(
       // Standings optional if not enabled on plan
     }
 
-    const extraEspnNba = espnNba.matches.filter(
-      (em) =>
-        !matches.some(
-          (bm) =>
-            teamsMatch(bm.homeTeam.name, em.homeTeam.name) &&
-            teamsMatch(bm.awayTeam.name, em.awayTeam.name) &&
-            Math.abs(new Date(bm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+    const extraEspnNba = includeEspnFallback
+      ? espnNba.matches.filter(
+          (em) =>
+            !matches.some(
+              (bm) =>
+                teamsMatch(bm.homeTeam.name, em.homeTeam.name) &&
+                teamsMatch(bm.awayTeam.name, em.awayTeam.name) &&
+                Math.abs(new Date(bm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+            )
         )
-    );
+      : [];
 
     return {
       matches: [...matches, ...extraEspnNba],
@@ -1130,18 +1150,18 @@ export async function hydrateLiveMatchDetails(
               assistShare: isMid ? 0.19 : isForward ? 0.14 : 0.04,
             },
             splits: {
-              season: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.98 : 0.42, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 50 : 35 },
-              last5: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.98 : 0.42, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 50 : 35 },
-              last10: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.98 : 0.42, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 50 : 35 },
-              last15: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.98 : 0.42, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 50 : 35 },
-              home: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.34 : isMid ? 0.14 : 0.04, assists: isMid ? 0.21 : 0.09, shots: isForward ? 2.4 : isMid ? 1.2 : 0.4, shotsOnTarget: isForward ? 1.0 : 0.45, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 51 : 35 },
-              away: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isForward ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.4, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.17, redCards: 0.01, passes: isMid ? 49 : 35 },
-              h2h: { games: 0, minutes: 80, starterRate: 0.85, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.98 : 0.42, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 50 : 35 },
+              season: { games: 0, minutes: 0, starterRate: 0.85 },
+              last5: { games: 0, minutes: 0, starterRate: 0.85 },
+              last10: { games: 0, minutes: 0, starterRate: 0.85 },
+              last15: { games: 0, minutes: 0, starterRate: 0.85 },
+              home: { games: 0, minutes: 0, starterRate: 0.85 },
+              away: { games: 0, minutes: 0, starterRate: 0.85 },
+              h2h: { games: 0, minutes: 0, starterRate: 0.85 },
             },
             recentLogs: [],
             sampleSizeGames: 0,
-            statsQuality: 'estimated',
-            statsOriginNote: 'Alineación API-Football; promedios individuales estimados por posición',
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Alineación API-Football; estadísticas individuales reales no disponibles en esta fuente',
           });
         });
 
@@ -1163,18 +1183,18 @@ export async function hydrateLiveMatchDetails(
             isKeyPlayer: false,
             impact: { offenseDelta: 0.08, defenseDelta: 0.04, usageShare: 0.06, assistShare: 0.06 },
             splits: {
-              season: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last5: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last10: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last15: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              home: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              away: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              h2h: { games: 0, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
+              season: { games: 0, minutes: 0, starterRate: 0.2 },
+              last5: { games: 0, minutes: 0, starterRate: 0.2 },
+              last10: { games: 0, minutes: 0, starterRate: 0.2 },
+              last15: { games: 0, minutes: 0, starterRate: 0.2 },
+              home: { games: 0, minutes: 0, starterRate: 0.2 },
+              away: { games: 0, minutes: 0, starterRate: 0.2 },
+              h2h: { games: 0, minutes: 0, starterRate: 0.2 },
             },
             recentLogs: [],
             sampleSizeGames: 0,
-            statsQuality: 'estimated',
-            statsOriginNote: 'Suplente confirmado; promedios estimados por rol',
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Suplente API-Football; estadísticas individuales reales no disponibles en esta fuente',
           });
         });
       }
@@ -1198,18 +1218,18 @@ export async function hydrateLiveMatchDetails(
             isKeyPlayer: true,
             impact: { offenseDelta: 0.18, defenseDelta: 0.09, usageShare: 0.12, assistShare: 0.12 },
             splits: {
-              season: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last5: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last10: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last15: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              home: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              away: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              h2h: { games: 0, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
+              season: { games: 0, minutes: 0, starterRate: 0 },
+              last5: { games: 0, minutes: 0, starterRate: 0 },
+              last10: { games: 0, minutes: 0, starterRate: 0 },
+              last15: { games: 0, minutes: 0, starterRate: 0 },
+              home: { games: 0, minutes: 0, starterRate: 0 },
+              away: { games: 0, minutes: 0, starterRate: 0 },
+              h2h: { games: 0, minutes: 0, starterRate: 0 },
             },
             recentLogs: [],
             sampleSizeGames: 0,
-            statsQuality: 'estimated',
-            statsOriginNote: 'Parte médico oficial API-Football',
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Parte médico oficial API-Football; sin estadísticas individuales',
           });
         }
       }
@@ -1349,9 +1369,6 @@ export async function hydrateLiveMatchDetails(
       arr.slice(0, 10).map((p, idx) => {
         const isStarter = idx < 5;
         const pos = p.position || (['PG', 'SG', 'SF', 'PF', 'C'][idx % 5]);
-        const basePts = isStarter ? 15.5 - idx * 1.1 : 8.2;
-        const baseReb = pos.includes('C') || pos.includes('F') ? 6.5 : 3.8;
-        const baseAst = pos.includes('G') ? 4.8 : 2.2;
         return {
           id: `bdl-p-${p.id}`,
           sport: 'nba',
@@ -1373,18 +1390,18 @@ export async function hydrateLiveMatchDetails(
             assistShare: pos.includes('G') ? 0.24 : 0.12,
           },
           splits: {
-            season: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last5: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last10: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last15: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            home: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            away: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            h2h: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 1.9 : 0.8, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
+            season: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last5: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last10: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last15: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            home: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            away: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
           },
           recentLogs: [],
           sampleSizeGames: 0,
-          statsQuality: 'estimated',
-          statsOriginNote: 'Plantilla BallDontLie (sin game logs individuales consultados)',
+          statsQuality: 'unavailable',
+          statsOriginNote: 'Plantilla BallDontLie (estadísticas individuales reales no disponibles en esta fuente)',
         };
       });
 
@@ -1593,18 +1610,18 @@ export async function hydrateLiveMatchDetails(
             assistShare: isMid ? 0.18 : isForward ? 0.13 : 0.04,
           },
           splits: {
-            season: { games: 0, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
-            last5: { games: 0, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
-            last10: { games: 0, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
-            last15: { games: 0, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
-            home: { games: 0, minutes: isStarter ? 79 : 27, starterRate: isStarter ? 0.86 : 0.2, goals: isForward ? 0.35 : isMid ? 0.14 : 0.04, assists: isMid ? 0.21 : 0.09, shots: isForward ? 2.4 : isMid ? 1.2 : 0.4, shotsOnTarget: isForward ? 1.0 : 0.44, foulsCommitted: 0.9, foulsDrawn: 1.2, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 49 : 35 },
-            away: { games: 0, minutes: isStarter ? 77 : 25, starterRate: isStarter ? 0.82 : 0.2, goals: isForward ? 0.29 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isForward ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isForward ? 0.9 : 0.4, foulsCommitted: 1.0, foulsDrawn: 1.1, yellowCards: 0.17, redCards: 0.01, passes: isMid ? 47 : 33 },
-            h2h: { games: 0, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
+            season: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last5: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last10: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last15: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            home: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            away: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
           },
           recentLogs: [],
           sampleSizeGames: 0,
-          statsQuality: 'estimated',
-          statsOriginNote: 'Plantilla oficial Football-Data.org; promedios individuales estimados por demarcación',
+          statsQuality: 'unavailable',
+          statsOriginNote: 'Plantilla oficial Football-Data.org; estadísticas individuales reales no disponibles en esta fuente',
         };
       };
 
@@ -1840,11 +1857,26 @@ export async function hydrateLiveMatchDetails(
         const isDoubtful = statusStr.includes('doubt') || statusStr.includes('quest') || statusStr.includes('day');
         const isStarter = !isOut && idx < 5;
 
-        const hasRealAvg = p.ppg !== undefined || p.points_per_game !== undefined;
-        const avgPts = Number(p.ppg ?? p.points_per_game ?? (isStarter ? 15.5 - idx * 1.1 : 8.2));
-        const avgReb = Number(p.rpg ?? p.rebounds_per_game ?? (pos.includes('C') || pos.includes('F') ? 6.5 : 3.8));
-        const avgAst = Number(p.apg ?? p.assists_per_game ?? (pos.includes('G') ? 4.8 : 2.2));
-        const avg3pm = Number(p.fg3m ?? (pos.includes('G') ? 1.9 : 0.8));
+        const rawPts = p.ppg ?? p.points_per_game;
+        const rawReb = p.rpg ?? p.rebounds_per_game;
+        const rawAst = p.apg ?? p.assists_per_game;
+        const raw3pm = p.fg3m;
+        const hasRealAvg = rawPts !== undefined && Number.isFinite(Number(rawPts));
+        const realSplit = hasRealAvg
+          ? {
+              games: 0,
+              minutes: isStarter ? 30 : 19,
+              starterRate: isStarter ? 0.85 : 0.15,
+              points: Number(rawPts),
+              ...(rawReb !== undefined && Number.isFinite(Number(rawReb)) ? { rebounds: Number(rawReb) } : {}),
+              ...(rawAst !== undefined && Number.isFinite(Number(rawAst)) ? { assists: Number(rawAst) } : {}),
+              ...(raw3pm !== undefined && Number.isFinite(Number(raw3pm)) ? { threes: Number(raw3pm) } : {}),
+            }
+          : {
+              games: 0,
+              minutes: 0,
+              starterRate: isStarter ? 0.85 : 0.15,
+            };
 
         return {
           id: `bapi-p-${String(p.id ?? `${teamShort}-${idx}`)}`,
@@ -1869,20 +1901,20 @@ export async function hydrateLiveMatchDetails(
             assistShare: pos.includes('G') ? 0.24 : 0.12,
           },
           splits: {
-            season: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last5: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last10: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last15: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            home: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            away: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            h2h: { games: 0, minutes: isStarter ? 30 : 19, starterRate: isStarter ? 0.85 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
+            season: realSplit,
+            last5: realSplit,
+            last10: realSplit,
+            last15: realSplit,
+            home: realSplit,
+            away: realSplit,
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
           },
           recentLogs: [],
           sampleSizeGames: 0,
-          statsQuality: 'estimated',
+          statsQuality: hasRealAvg ? 'estimated' : 'unavailable',
           statsOriginNote: hasRealAvg
             ? 'Promedios globales BasketballAPI.net (sin desglose partido a partido)'
-            : 'Estimación posicional (plan sin estadísticas individuales)',
+            : 'Estadísticas individuales reales no disponibles en esta fuente',
         };
       });
 
@@ -1937,4 +1969,442 @@ export async function hydrateLiveMatchDetails(
   }
 
   return baseMatch;
+}
+
+const GENERIC_VENUES = new Set([
+  'sede oficial',
+  'estadio oficial',
+  'pabellón oficial',
+  'nba arena',
+  'estadio',
+  '',
+]);
+
+const GENERIC_RECORDS = new Set([
+  'football-data.org',
+  'api-football',
+  'basketballapi.net',
+  'balldontlie',
+  'api-sports nba',
+  '',
+]);
+
+function isBetterVenue(candidate: string | undefined, current: string | undefined): boolean {
+  const c = (candidate ?? '').trim();
+  const cur = (current ?? '').trim();
+  if (!c) return false;
+  if (GENERIC_VENUES.has(c.toLowerCase())) return false;
+  if (!cur || GENERIC_VENUES.has(cur.toLowerCase())) return true;
+  return c.length > cur.length && cur === 'Sede oficial';
+}
+
+function isBetterRecord(candidate: string | undefined, current: string | undefined): boolean {
+  const c = (candidate ?? '').trim();
+  const cur = (current ?? '').trim();
+  if (!c || GENERIC_RECORDS.has(c.toLowerCase())) return false;
+  if (!cur || GENERIC_RECORDS.has(cur.toLowerCase())) return true;
+  return false;
+}
+
+function qualityRank(q: MatchRecord['teamStatsQuality']): number {
+  if (q === 'verified') return 3;
+  if (q === 'estimated') return 2;
+  return 1;
+}
+
+function mergeTeamInfo(primary: MatchRecord['homeTeam'], secondary: MatchRecord['homeTeam']): MatchRecord['homeTeam'] {
+  return {
+    ...primary,
+    shortName:
+      primary.shortName && primary.shortName.length >= 2 && primary.shortName !== 'LOC' && primary.shortName !== 'VIS'
+        ? primary.shortName
+        : secondary.shortName,
+    formation: primary.formation ?? secondary.formation,
+    record: isBetterRecord(secondary.record, primary.record) ? secondary.record : primary.record,
+    homeRecord: primary.homeRecord && primary.homeRecord !== '-' ? primary.homeRecord : secondary.homeRecord,
+    awayRecord: primary.awayRecord && primary.awayRecord !== '-' ? primary.awayRecord : secondary.awayRecord,
+    playedGames: primary.playedGames ?? secondary.playedGames,
+    ppgOrGpg: primary.ppgOrGpg ?? secondary.ppgOrGpg,
+    oppgOrGapg: primary.oppgOrGapg ?? secondary.oppgOrGapg,
+    formRecent: primary.formRecent.length > 0 ? primary.formRecent : secondary.formRecent,
+    recentGames:
+      (primary.recentGames?.length ?? 0) >= (secondary.recentGames?.length ?? 0)
+        ? primary.recentGames
+        : secondary.recentGames,
+    restDays: primary.restDays !== 4 && primary.restDays !== 2 ? primary.restDays : secondary.restDays ?? primary.restDays,
+    isBackToBack: primary.isBackToBack ?? secondary.isBackToBack,
+    attackHome: primary.attackHome ?? secondary.attackHome,
+    attackAway: primary.attackAway ?? secondary.attackAway,
+    defenseHome: primary.defenseHome ?? secondary.defenseHome,
+    defenseAway: primary.defenseAway ?? secondary.defenseAway,
+    avgCorners: primary.avgCorners ?? secondary.avgCorners,
+    avgYellowCards: primary.avgYellowCards ?? secondary.avgYellowCards,
+    avgShots: primary.avgShots ?? secondary.avgShots,
+    avgShotsOnTarget: primary.avgShotsOnTarget ?? secondary.avgShotsOnTarget,
+    offRating: primary.offRating ?? secondary.offRating,
+    defRating: primary.defRating ?? secondary.defRating,
+    pace: primary.pace ?? secondary.pace,
+    homeCourtBoost: primary.homeCourtBoost ?? secondary.homeCourtBoost,
+    avgRebounds: primary.avgRebounds ?? secondary.avgRebounds,
+    avgAssists: primary.avgAssists ?? secondary.avgAssists,
+  };
+}
+
+export interface MultiSourceMatchBatch {
+  provider: string;
+  label: string;
+  matches: MatchRecord[];
+}
+
+/**
+ * Merges and cross-checks equivalent matches across multiple simultaneously active providers.
+ * Preserves per-provider sourceIds so match hydration can query ALL connected sources in parallel,
+ * enriches missing metrics across sources, and flags genuine score/status/time discrepancies.
+ */
+export function mergeMatchesAcrossSources(batches: MultiSourceMatchBatch[]): MatchRecord[] {
+  const canonical: MatchRecord[] = [];
+
+  for (const batch of batches) {
+    for (const rawMatch of batch.matches) {
+      const incoming: MatchRecord = {
+        ...rawMatch,
+        sourceIds: {
+          ...(rawMatch.sourceIds ?? {}),
+          [batch.provider]: rawMatch.id,
+        },
+        verifiedSources: Array.from(
+          new Set([...(rawMatch.verifiedSources ?? [batch.label || rawMatch.dataOrigin])])
+        ),
+      };
+
+      const incomingTs = new Date(incoming.kickoffIso).getTime();
+      const existingIdx = canonical.findIndex((existing) => {
+        if (existing.sport !== incoming.sport) return false;
+        const existingTs = new Date(existing.kickoffIso).getTime();
+        const timeDiff = Math.abs(existingTs - incomingTs);
+        if (!Number.isFinite(timeDiff) || timeDiff > 36 * 3600_000) return false;
+        return (
+          teamsMatch(existing.homeTeam.name, incoming.homeTeam.name) &&
+          teamsMatch(existing.awayTeam.name, incoming.awayTeam.name)
+        );
+      });
+
+      if (existingIdx === -1) {
+        canonical.push(incoming);
+        continue;
+      }
+
+      const current = canonical[existingIdx];
+      const discrepancies = [...(current.sourceDiscrepancies ?? [])];
+
+      if (
+        current.score &&
+        incoming.score &&
+        (current.score.home !== incoming.score.home || current.score.away !== incoming.score.away)
+      ) {
+        discrepancies.push(
+          `Marcador distinto: ${current.verifiedSources?.[0] ?? current.dataOrigin} (${current.score.home}-${current.score.away}) vs ${batch.label} (${incoming.score.home}-${incoming.score.away})`
+        );
+      }
+
+      if (
+        current.status !== incoming.status &&
+        ((current.status === 'finished' && incoming.status !== 'finished') ||
+          (incoming.status === 'finished' && current.status !== 'finished'))
+      ) {
+        discrepancies.push(
+          `Estado distinto: ${current.verifiedSources?.[0] ?? current.dataOrigin} (${current.status}) vs ${batch.label} (${incoming.status})`
+        );
+      }
+
+      const kickoffDiffMin = Math.round(
+        Math.abs(new Date(current.kickoffIso).getTime() - incomingTs) / 60_000
+      );
+      if (Number.isFinite(kickoffDiffMin) && kickoffDiffMin > 20 && kickoffDiffMin <= 24 * 60) {
+        discrepancies.push(`Diferencia horaria entre fuentes (${kickoffDiffMin} min)`);
+      }
+
+      const mergedSources = Array.from(
+        new Set([
+          ...(current.verifiedSources ?? [current.dataOrigin]),
+          ...(incoming.verifiedSources ?? [batch.label]),
+        ])
+      );
+
+      const resolvedStatus: MatchStatus =
+        current.status === 'live' || incoming.status === 'live'
+          ? 'live'
+          : current.status === 'finished' || incoming.status === 'finished'
+            ? 'finished'
+            : current.status;
+
+      const resolvedLineupStatus =
+        current.lineupStatus === 'confirmed' || incoming.lineupStatus === 'confirmed'
+          ? 'confirmed'
+          : current.lineupStatus === 'provisional' || incoming.lineupStatus === 'provisional'
+            ? 'provisional'
+            : 'unknown';
+
+      const mergedQuality =
+        qualityRank(incoming.teamStatsQuality) > qualityRank(current.teamStatsQuality)
+          ? incoming.teamStatsQuality
+          : current.teamStatsQuality;
+
+      canonical[existingIdx] = {
+        ...current,
+        status: resolvedStatus,
+        minuteOrClock: current.minuteOrClock ?? incoming.minuteOrClock,
+        venue: isBetterVenue(incoming.venue, current.venue) ? incoming.venue : current.venue,
+        score: current.score ?? incoming.score,
+        lineupStatus: resolvedLineupStatus,
+        homeTeam: mergeTeamInfo(current.homeTeam, incoming.homeTeam),
+        awayTeam: mergeTeamInfo(current.awayTeam, incoming.awayTeam),
+        teamStats:
+          current.teamStats && current.teamStats.length > 0 ? current.teamStats : incoming.teamStats,
+        teamStatsQuality: mergedQuality,
+        h2hSummary:
+          current.h2hSummary.played >= incoming.h2hSummary.played
+            ? current.h2hSummary
+            : incoming.h2hSummary,
+        sourceIds: {
+          ...(current.sourceIds ?? {}),
+          ...(incoming.sourceIds ?? {}),
+        },
+        verifiedSources: mergedSources,
+        sourceDiscrepancies: discrepancies.length > 0 ? Array.from(new Set(discrepancies)) : undefined,
+        dataOrigin:
+          mergedSources.length > 1
+            ? `${mergedSources.join(' + ')} (verificado ${mergedSources.length} fuentes)`
+            : mergedSources[0] ?? current.dataOrigin,
+        updatedAt:
+          incoming.updatedAt > current.updatedAt ? incoming.updatedAt : current.updatedAt,
+      };
+    }
+  }
+
+  return canonical;
+}
+
+export function mergeStandingsAcrossSources(batches: StandingEntry[][]): StandingEntry[] {
+  const byKey = new Map<string, StandingEntry>();
+
+  for (const list of batches) {
+    for (const row of list) {
+      const leagueKey = (row.league || 'league').toLowerCase().trim();
+      let matchedKey: string | null = null;
+      for (const [k, existing] of byKey.entries()) {
+        if (existing.league.toLowerCase().trim() !== leagueKey) continue;
+        if (
+          (row.conference && existing.conference && row.conference !== existing.conference)
+        ) {
+          continue;
+        }
+        if (teamsMatch(existing.teamName, row.teamName)) {
+          matchedKey = k;
+          break;
+        }
+      }
+
+      if (!matchedKey) {
+        const key = `${leagueKey}:${row.conference ?? ''}:${row.teamName.toLowerCase()}`;
+        byKey.set(key, row);
+      } else {
+        const cur = byKey.get(matchedKey)!;
+        const curRichness =
+          (cur.played > 0 ? 2 : 0) +
+          (cur.form.length > 0 ? 1 : 0) +
+          (cur.homeRecord !== '-' ? 1 : 0) +
+          (cur.goalsForOrPtsFor > 0 ? 1 : 0);
+        const rowRichness =
+          (row.played > 0 ? 2 : 0) +
+          (row.form.length > 0 ? 1 : 0) +
+          (row.homeRecord !== '-' ? 1 : 0) +
+          (row.goalsForOrPtsFor > 0 ? 1 : 0);
+
+        const winner = rowRichness > curRichness ? row : cur;
+        const loser = winner === cur ? row : cur;
+        byKey.set(matchedKey, {
+          ...winner,
+          form: winner.form.length > 0 ? winner.form : loser.form,
+          homeRecord: winner.homeRecord !== '-' ? winner.homeRecord : loser.homeRecord,
+          awayRecord: winner.awayRecord !== '-' ? winner.awayRecord : loser.awayRecord,
+          goalsForOrPtsFor: winner.goalsForOrPtsFor || loser.goalsForOrPtsFor,
+          goalsAgainstOrPtsAgainst: winner.goalsAgainstOrPtsAgainst || loser.goalsAgainstOrPtsAgainst,
+        });
+      }
+    }
+  }
+
+  return Array.from(byKey.values());
+}
+
+function normalizePlayerLookupName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function enrichPlayerListFromSecondary(
+  primary: PlayerProfile[],
+  secondary: PlayerProfile[]
+): PlayerProfile[] {
+  if (primary.length === 0) return secondary;
+  if (secondary.length === 0) return primary;
+
+  const secByName = new Map<string, PlayerProfile>();
+  for (const sp of secondary) {
+    secByName.set(normalizePlayerLookupName(sp.name), sp);
+  }
+
+  return primary.map((p) => {
+    const match = secByName.get(normalizePlayerLookupName(p.name));
+    if (!match) return p;
+
+    const pHasRealStats =
+      p.statsQuality === 'verified' ||
+      (p.statsQuality === 'estimated' && p.sampleSizeGames > 0);
+    const secHasRealStats =
+      match.statsQuality === 'verified' ||
+      (match.statsQuality === 'estimated' && match.sampleSizeGames > 0);
+
+    const betterSplits = !pHasRealStats && secHasRealStats ? match.splits : p.splits;
+    const betterLogs = p.recentLogs.length >= match.recentLogs.length ? p.recentLogs : match.recentLogs;
+    const betterQuality = !pHasRealStats && secHasRealStats ? match.statsQuality : p.statsQuality;
+    const betterOrigin =
+      !pHasRealStats && secHasRealStats ? match.statsOriginNote : p.statsOriginNote;
+
+    // Cross-verify injury / confirmed out flags across sources
+    const secConfirmedAbsence =
+      match.availabilityConfidence === 'confirmed' &&
+      (match.availability === 'out' || match.availability === 'suspended' || match.availability === 'doubtful');
+    const keepConfirmedStarter =
+      p.availability === 'confirmed_starter' && p.availabilityConfidence === 'confirmed';
+
+    const mergedAvailability =
+      !keepConfirmedStarter && secConfirmedAbsence && p.availability !== 'out'
+        ? match.availability
+        : p.availability;
+
+    return {
+      ...p,
+      photoUrl: p.photoUrl ?? match.photoUrl,
+      availability: mergedAvailability,
+      availabilityConfidence:
+        !keepConfirmedStarter && secConfirmedAbsence
+          ? match.availabilityConfidence
+          : p.availabilityConfidence,
+      injuryNote: p.injuryNote ?? match.injuryNote,
+      minutesRestriction: p.minutesRestriction ?? match.minutesRestriction,
+      latestNews: p.latestNews ?? match.latestNews,
+      splits: betterSplits,
+      recentLogs: betterLogs,
+      sampleSizeGames: Math.max(p.sampleSizeGames, match.sampleSizeGames),
+      statsQuality: betterQuality,
+      statsOriginNote: betterOrigin,
+      lastLogDate: p.lastLogDate ?? match.lastLogDate,
+      dataFreshness: p.dataFreshness ?? match.dataFreshness,
+    };
+  });
+}
+
+/**
+ * Combines multiple hydrated MatchRecord results for the same fixture obtained from
+ * concurrently running providers (e.g. football-data + espn-football, or basketballapi-net + espn-nba).
+ */
+export function mergeHydratedMatchDetails(
+  baseMatch: MatchRecord,
+  variants: Array<{ provider: string; label: string; match: MatchRecord }>
+): MatchRecord {
+  if (variants.length === 0) return baseMatch;
+
+  // Prefer confirmed lineup, then most hydrated players / verified team stats
+  const ranked = [...variants].sort((a, b) => {
+    const scoreVariant = (m: MatchRecord): number => {
+      let s = 0;
+      if (m.hydrationStatus === 'ok') s += 40;
+      if (m.lineupStatus === 'confirmed') s += 35;
+      else if (m.lineupStatus === 'provisional') s += 15;
+      if (m.homePlayers.length > 0 && m.awayPlayers.length > 0) s += 20;
+      if (m.homePlayers.some((p) => p.statsQuality === 'verified' || p.sampleSizeGames > 0)) s += 25;
+      if ((m.homeTeam.recentGames?.length ?? 0) > 0) s += 15;
+      if (m.h2hSummary.played > 0) s += 10;
+      return s;
+    };
+    return scoreVariant(b.match) - scoreVariant(a.match);
+  });
+
+  let merged = { ...ranked[0].match };
+  const discrepancies = new Set<string>(baseMatch.sourceDiscrepancies ?? []);
+  const allSources = new Set<string>(baseMatch.verifiedSources ?? []);
+  const mergedSourceIds: Record<string, string> = { ...(baseMatch.sourceIds ?? {}) };
+
+  for (const v of variants) {
+    mergedSourceIds[v.provider] = v.match.sourceIds?.[v.provider] ?? v.match.id;
+    allSources.add(v.label);
+    for (const d of v.match.sourceDiscrepancies ?? []) discrepancies.add(d);
+  }
+
+  for (let i = 1; i < ranked.length; i++) {
+    const sec = ranked[i].match;
+    if (
+      merged.score &&
+      sec.score &&
+      (merged.score.home !== sec.score.home || merged.score.away !== sec.score.away)
+    ) {
+      discrepancies.add(
+        `Marcador distinto al contrastar fuentes (${merged.score.home}-${merged.score.away} vs ${sec.score.home}-${sec.score.away})`
+      );
+    }
+
+    merged = {
+      ...merged,
+      venue: isBetterVenue(sec.venue, merged.venue) ? sec.venue : merged.venue,
+      score: merged.score ?? sec.score,
+      homeTeam: mergeTeamInfo(merged.homeTeam, sec.homeTeam),
+      awayTeam: mergeTeamInfo(merged.awayTeam, sec.awayTeam),
+      homePlayers: enrichPlayerListFromSecondary(merged.homePlayers, sec.homePlayers),
+      awayPlayers: enrichPlayerListFromSecondary(merged.awayPlayers, sec.awayPlayers),
+      probableLineup: merged.probableLineup ?? sec.probableLineup,
+      confirmedLineup: merged.confirmedLineup ?? sec.confirmedLineup,
+      h2hSummary: merged.h2hSummary.played >= sec.h2hSummary.played ? merged.h2hSummary : sec.h2hSummary,
+      teamStats:
+        merged.teamStats && merged.teamStats.length > 0 ? merged.teamStats : sec.teamStats,
+      teamStatsQuality:
+        qualityRank(sec.teamStatsQuality) > qualityRank(merged.teamStatsQuality)
+          ? sec.teamStatsQuality
+          : merged.teamStatsQuality,
+      footballNews: merged.footballNews ?? sec.footballNews,
+      nbaNews: merged.nbaNews ?? sec.nbaNews,
+    };
+  }
+
+  const verifiedList = Array.from(allSources).filter(Boolean);
+  const nowIso = new Date().toISOString();
+  const originLabel =
+    verifiedList.length > 1
+      ? `${verifiedList.join(' + ')} (contrastado ${verifiedList.length} fuentes)`
+      : verifiedList[0] ?? merged.dataOrigin;
+
+  return {
+    ...merged,
+    id: baseMatch.id,
+    sourceIds: mergedSourceIds,
+    verifiedSources: verifiedList,
+    sourceDiscrepancies: discrepancies.size > 0 ? Array.from(discrepancies) : undefined,
+    dataOrigin: originLabel,
+    updatedAt: nowIso,
+    provenance: {
+      source: originLabel,
+      fetchedAt: nowIso,
+      status: merged.hydrationStatus === 'ok' ? 'ok' : merged.provenance?.status ?? 'partial',
+      isStale: Boolean(merged.provenance?.isStale),
+      staleAgeMinutes: 0,
+      dataType: merged.provenance?.dataType ?? (merged.teamStatsQuality === 'verified' ? 'real' : 'estimated'),
+      errorMessage: merged.provenance?.errorMessage,
+    },
+  };
 }

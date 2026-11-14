@@ -8,8 +8,16 @@ import type {
   PlayerProfile,
 } from '../src/types/sports.ts';
 import { fetchWithTimeout } from './httpUtils.ts';
-import { normalizeNbaName, parseValidPublishedAt } from './nbaIntelligence.ts';
+import { isPublishedNewsRecent, normalizeNbaName, parseValidPublishedAt } from './nbaIntelligence.ts';
 import { teamsMatch } from './espnAdapters.ts';
+
+export function isFootballNewsRecent(
+  publishedAt: string | undefined,
+  maxAgeDays = 7,
+  nowMs = Date.now()
+): boolean {
+  return isPublishedNewsRecent(publishedAt, maxAgeDays, nowMs);
+}
 
 type AnyObj = Record<string, unknown>;
 
@@ -79,6 +87,8 @@ export interface FootballNewsResult {
   fetchedAt: string;
   sourcesChecked: string[];
   items: PlayerNewsItem[];
+  rejectedStaleCount?: number;
+  freshnessWarning?: string;
 }
 
 export interface FootballGroundingFinding {
@@ -213,7 +223,7 @@ function buildGridCoord(idx: number, total: number, posCode: 'G' | 'D' | 'M' | '
   return { x: fwdSlots[idx % fwdSlots.length], y: 22 };
 }
 
-function buildFootballPlayerFromHistory(
+export function buildFootballPlayerFromHistory(
   entry: EspnSoccerTeamLineupHistory['players'][number],
   idx: number,
   isStarter: boolean,
@@ -256,6 +266,12 @@ function buildFootballPlayerFromHistory(
         ? `Titular en ${entry.recentStarts} de los últimos ${matchesAnalyzed} partidos analizados`
         : 'Estimado desde plantilla oficial del club';
 
+  const emptySplit = (games = 0) => ({
+    games,
+    minutes: 0,
+    starterRate: freq,
+  });
+
   return {
     id: `espnsoc-p-${entry.athleteId || `${teamShort}-${idx}`}`,
     sport: 'football',
@@ -280,20 +296,18 @@ function buildFootballPlayerFromHistory(
       assistShare: isMid ? 0.18 : isFwd ? 0.13 : 0.04,
     },
     splits: {
-      season: { games: matchesAnalyzed, minutes: isStarter ? 80 : 25, starterRate: freq, goals: isFwd ? 0.31 : isMid ? 0.12 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.92 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-      last5: { games: Math.min(5, matchesAnalyzed), minutes: isStarter ? 80 : 25, starterRate: freq, goals: isFwd ? 0.31 : isMid ? 0.12 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.92 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-      last10: { games: Math.min(10, matchesAnalyzed), minutes: isStarter ? 80 : 25, starterRate: freq, goals: isFwd ? 0.31 : isMid ? 0.12 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.92 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-      last15: { games: matchesAnalyzed, minutes: isStarter ? 80 : 25, starterRate: freq, goals: isFwd ? 0.31 : isMid ? 0.12 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.92 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-      home: { games: matchesAnalyzed, minutes: isStarter ? 81 : 25, starterRate: freq, goals: isFwd ? 0.34 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.08, shots: isFwd ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isFwd ? 0.96 : 0.42, foulsCommitted: 0.9, foulsDrawn: 1.15, yellowCards: 0.14, redCards: 0.01, passes: isMid ? 47 : 33 },
-      away: { games: matchesAnalyzed, minutes: isStarter ? 79 : 25, starterRate: freq, goals: isFwd ? 0.28 : isMid ? 0.11 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.1 : isMid ? 1.05 : 0.4, shotsOnTarget: isFwd ? 0.88 : 0.38, foulsCommitted: 0.95, foulsDrawn: 1.05, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 45 : 31 },
-      h2h: { games: 0, minutes: isStarter ? 80 : 25, starterRate: freq, goals: isFwd ? 0.31 : isMid ? 0.12 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.92 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
+      season: emptySplit(0),
+      last5: emptySplit(0),
+      last10: emptySplit(0),
+      last15: emptySplit(0),
+      home: emptySplit(0),
+      away: emptySplit(0),
+      h2h: emptySplit(0),
     },
     recentLogs: [],
-    sampleSizeGames: matchesAnalyzed,
-    statsQuality: 'estimated',
-    statsOriginNote: matchesAnalyzed > 0
-      ? `Frecuencia titular verificada en ${matchesAnalyzed} partidos ESPN; tasas por demarcación`
-      : 'Estimación posicional desde plantilla del club',
+    sampleSizeGames: 0,
+    statsQuality: 'unavailable',
+    statsOriginNote: 'Estadísticas individuales reales no disponibles en esta fuente',
   };
 }
 
@@ -539,6 +553,8 @@ export async function fetchFootballExternalNews(params: {
 
   const items: PlayerNewsItem[] = [];
   const seenHeadlines = new Set<string>();
+  const nowMs = Date.now();
+  let rejectedStaleCount = 0;
 
   for (const st of rawStories) {
     const combined = `${st.title} ${st.summary}`.toLowerCase();
@@ -549,6 +565,11 @@ export async function fetchFootballExternalNews(params: {
     });
     const mentionsTeam = teamAliases.some((al) => al.length >= 3 && combined.includes(al));
     if (!mentionsTeam && matchedPlayers.length === 0) continue;
+
+    if (!isFootballNewsRecent(st.pubDate, 7, nowMs)) {
+      rejectedStaleCount += 1;
+      continue;
+    }
 
     const key = st.title.toLowerCase().slice(0, 65);
     if (seenHeadlines.has(key)) continue;
@@ -568,10 +589,23 @@ export async function fetchFootballExternalNews(params: {
     });
   }
 
+  items.sort((a, b) => Date.parse(b.publishedAt || '0') - Date.parse(a.publishedAt || '0'));
+
+  const freshnessWarning =
+    items.length === 0
+      ? rejectedStaleCount > 0
+        ? `No hay noticias recientes verificables (últimos 7 días); ${rejectedStaleCount} artículos antiguos o sin fecha fueron descartados.`
+        : 'No se encontraron noticias recientes verificables con fecha de publicación para este partido.'
+      : rejectedStaleCount > 0
+        ? `Se descartaron ${rejectedStaleCount} noticias antiguas (>7 días) o sin fecha verificable.`
+        : undefined;
+
   const result: FootballNewsResult = {
     fetchedAt,
     sourcesChecked: sourcesChecked.length > 0 ? sourcesChecked : ['ESPN FC'],
     items: items.slice(0, 14),
+    rejectedStaleCount,
+    freshnessWarning,
   };
   FOOTBALL_NEWS_CACHE.set(cacheKey, { expiresAt: Date.now() + 180_000, payload: result });
   return result;
@@ -714,7 +748,8 @@ export function selectProbableSideFromHistory(
   teamName: string,
   teamShort: string,
   newsItems: PlayerNewsItem[],
-  groundingFindings: FootballGroundingFinding[]
+  groundingFindings: FootballGroundingFinding[],
+  nowMs = Date.now()
 ): {
   starters: PlayerProfile[];
   subs: PlayerProfile[];
@@ -724,13 +759,15 @@ export function selectProbableSideFromHistory(
   avgStarterConfidence: number;
 } {
   const discrepancies: string[] = [];
+  const recentNews = newsItems.filter((n) => isFootballNewsRecent(n.publishedAt, 7, nowMs));
+  const recentFindings = groundingFindings.filter((f) => isFootballNewsRecent(f.publishedAt, 7, nowMs));
 
   const enriched = history.players.map((entry) => {
     const normEntry = normalizeNbaName(entry.name);
-    const relatedNews = newsItems.filter((n) =>
+    const relatedNews = recentNews.filter((n) =>
       (n.playerNames ?? []).some((pn) => normalizeNbaName(pn) === normEntry)
     );
-    const gFinding = groundingFindings.find(
+    const gFinding = recentFindings.find(
       (f) =>
         normalizeNbaName(f.playerName) === normEntry ||
         normEntry.includes(normalizeNbaName(f.playerName))
@@ -1030,7 +1067,11 @@ export async function buildProbableFootballLineups(params: {
         }),
   ]);
 
-  const gFindings = grounding.findings ?? [];
+  const nowMs = Date.now();
+  const gFindings = (grounding.findings ?? []).filter((f) =>
+    isFootballNewsRecent(parseValidPublishedAt(f.publishedAt), 7, nowMs)
+  );
+  const droppedGroundingCount = (grounding.findings?.length ?? 0) - gFindings.length;
   const mergedNews = [...externalNews.items];
   const sourcesConsulted = Array.from(
     new Set([
@@ -1055,6 +1096,7 @@ export async function buildProbableFootballLineups(params: {
     });
   }
 
+  const totalRejectedStale = (externalNews.rejectedStaleCount ?? 0) + droppedGroundingCount;
   const footballNews: FootballNewsBundle = {
     fetchedAt: nowIso,
     sourcesChecked: sourcesConsulted,
@@ -1066,6 +1108,13 @@ export async function buildProbableFootballLineups(params: {
       citations: grounding.citations,
     },
     items: mergedNews.slice(0, 18),
+    rejectedStaleCount: totalRejectedStale,
+    freshnessWarning:
+      mergedNews.length === 0
+        ? totalRejectedStale > 0
+          ? `Sin información reciente suficiente: se descartaron ${totalRejectedStale} noticias antiguas (>7 días) o sin fecha.`
+          : 'Sin noticias recientes verificables con fecha de publicación para este partido.'
+        : externalNews.freshnessWarning,
   };
 
   if (!homeHist && !awayHist) {

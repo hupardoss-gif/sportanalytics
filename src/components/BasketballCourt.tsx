@@ -412,10 +412,16 @@ export const BasketballCourt: React.FC<BasketballCourtProps> = ({
             </div>
           )}
 
+          {news?.freshnessWarning && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3.5 py-2 text-[11px] text-amber-200/95">
+              {news.freshnessWarning}
+            </div>
+          )}
+
           {/* Real External News & Injury Feed */}
           {!news || news.items.length === 0 ? (
             <p className="text-xs text-slate-400 py-2">
-              No se encontraron partes médicos recientes ni noticias de última hora para este partido en las fuentes externas consultadas.
+              No hay partes médicos ni noticias recientes verificables para este partido dentro de la ventana de actualidad permitida.
             </p>
           ) : (
             <div className="max-h-[300px] overflow-y-auto divide-y divide-slate-800/80 pr-1">
@@ -547,17 +553,23 @@ export const BasketballCourt: React.FC<BasketballCourtProps> = ({
 
                               <div className="text-[11px] text-slate-400 font-mono tabular-nums">
                                 {p.position} ·{' '}
-                                <span className="text-blue-300 font-semibold">
-                                  {dynPts.expectedMinutes.toFixed(0)} min est.
-                                </span>{' '}
-                                · Proy: {dynPts.expectedValue.toFixed(1)} PTS ·{' '}
-                                {dynReb.expectedValue.toFixed(1)} REB ·{' '}
-                                {dynAst.expectedValue.toFixed(1)} AST
-                                {dynPts.absenceAdjustmentPct > 1 && (
-                                  <span className="text-emerald-400">
-                                    {' '}
-                                    (+{dynPts.absenceAdjustmentPct.toFixed(0)}% uso)
-                                  </span>
+                                {p.statsQuality === 'unavailable' || p.splits.season.points === undefined ? (
+                                  <span className="text-slate-300">Stats individuales: N/D</span>
+                                ) : (
+                                  <>
+                                    <span className="text-blue-300 font-semibold">
+                                      {dynPts.expectedMinutes.toFixed(0)} min est.
+                                    </span>{' '}
+                                    · Proy: {dynPts.expectedValue.toFixed(1)} PTS ·{' '}
+                                    {dynReb.expectedValue.toFixed(1)} REB ·{' '}
+                                    {dynAst.expectedValue.toFixed(1)} AST
+                                    {dynPts.absenceAdjustmentPct > 1 && (
+                                      <span className="text-emerald-400">
+                                        {' '}
+                                        (+{dynPts.absenceAdjustmentPct.toFixed(0)}% uso)
+                                      </span>
+                                    )}
+                                  </>
                                 )}
                               </div>
 

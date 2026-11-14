@@ -16,9 +16,14 @@ import {
   fetchFootballCalendarAndStandings,
   fetchNbaCalendarAndStandings,
   hydrateLiveMatchDetails,
+  mergeHydratedMatchDetails,
+  mergeMatchesAcrossSources,
+  mergeStandingsAcrossSources,
+  type MultiSourceMatchBatch,
 } from './server/liveAdapters.ts';
 import {
   fetchEspnNbaCalendarAndStandings,
+  fetchEspnSoccerEnrichment,
   teamsMatch,
 } from './server/espnAdapters.ts';
 import {
@@ -60,39 +65,147 @@ const PORT = 3000;
 const VAULT_PATH = path.resolve(process.cwd(), '.sportanalytics-vault.json');
 const HISTORY_PATH = path.resolve(process.cwd(), '.sportanalytics-history.json');
 
+const FOOTBALL_PROVIDER_IDS = ['football-data', 'api-football', 'espn-football'] as const;
+const NBA_PROVIDER_IDS = ['basketballapi-net', 'espn-nba', 'api-basketball', 'api-nba', 'balldontlie'] as const;
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  'football-data': 'Football-Data.org v4',
+  'api-football': 'API-Football',
+  'espn-football': 'ESPN Fútbol Oficial',
+  'basketballapi-net': 'BasketballAPI.net v1',
+  'espn-nba': 'ESPN NBA Oficial',
+  'api-basketball': 'API-Basketball v1',
+  'api-nba': 'API-NBA v2',
+  'balldontlie': 'BallDontLie NBA',
+};
+
 interface StoredSportConfig {
   provider: string;
   apiKey: string;
   connected: boolean;
+  enabled?: boolean;
   lastChecked: string | null;
   accountInfo: string | null;
   error: string | null;
+}
+
+interface StoredNbaConfig extends StoredSportConfig {
+  reuseFootballKey?: boolean;
 }
 
 interface StoredVault {
   adminPinHash?: string;
   football: StoredSportConfig;
   nba: StoredSportConfig & { reuseFootballKey: boolean };
+  footballProviders?: Record<string, StoredSportConfig>;
+  nbaProviders?: Record<string, StoredNbaConfig>;
 }
+
+const DEFAULT_FOOTBALL_PROVIDERS: Record<string, StoredSportConfig> = {
+  'football-data': {
+    provider: 'football-data',
+    apiKey: '',
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'api-football': {
+    provider: 'api-football',
+    apiKey: '',
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'espn-football': {
+    provider: 'espn-football',
+    apiKey: '',
+    connected: true,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: 'ESPN Soccer Oficial · Ligas europeas y UEFA (verificación simultánea sin clave)',
+    error: null,
+  },
+};
+
+const DEFAULT_NBA_PROVIDERS: Record<string, StoredNbaConfig> = {
+  'basketballapi-net': {
+    provider: 'basketballapi-net',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'espn-nba': {
+    provider: 'espn-nba',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: true,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: 'ESPN NBA Oficial · Calendario, lesiones, game logs y clasificaciones (verificación simultánea sin clave)',
+    error: null,
+  },
+  'api-basketball': {
+    provider: 'api-basketball',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'api-nba': {
+    provider: 'api-nba',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'balldontlie': {
+    provider: 'balldontlie',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+};
 
 const DEFAULT_VAULT: StoredVault = {
   football: {
     provider: 'football-data',
     apiKey: '',
     connected: false,
+    enabled: true,
     lastChecked: null,
     accountInfo: null,
     error: null,
   },
   nba: {
-    provider: 'espn-nba',
+    provider: 'basketballapi-net',
     apiKey: '',
     reuseFootballKey: false,
     connected: false,
+    enabled: true,
     lastChecked: null,
     accountInfo: null,
     error: null,
   },
+  footballProviders: structuredClone(DEFAULT_FOOTBALL_PROVIDERS),
+  nbaProviders: structuredClone(DEFAULT_NBA_PROVIDERS),
 };
 
 function maskKey(key: string): string | null {
@@ -100,16 +213,151 @@ function maskKey(key: string): string | null {
   return `••••••••${key.slice(-4)}`;
 }
 
+function getEffectiveNbaKey(vault: StoredVault, providerId: string): string {
+  const entry = vault.nbaProviders?.[providerId];
+  const reuse = entry?.reuseFootballKey ?? (vault.nba.provider === providerId ? vault.nba.reuseFootballKey : false);
+  if (reuse) {
+    return (
+      vault.footballProviders?.['api-football']?.apiKey ||
+      vault.football.apiKey ||
+      ''
+    );
+  }
+  return entry?.apiKey || (vault.nba.provider === providerId ? vault.nba.apiKey : '') || '';
+}
+
+function getActiveFootballProviders(vault: StoredVault): Array<{ provider: string; apiKey: string; label: string }> {
+  const providers = vault.footballProviders ?? {};
+  const orderedIds = ['football-data', 'api-football', 'espn-football'];
+  const active: Array<{ provider: string; apiKey: string; label: string }> = [];
+  for (const pid of orderedIds) {
+    const cfg = providers[pid];
+    if (!cfg || cfg.enabled === false) continue;
+    const isZeroKey = pid === 'espn-football';
+    if (isZeroKey || Boolean(cfg.apiKey.trim())) {
+      active.push({
+        provider: pid,
+        apiKey: isZeroKey ? '' : cfg.apiKey.trim(),
+        label: PROVIDER_DISPLAY_NAMES[pid] ?? pid,
+      });
+    }
+  }
+  return active;
+}
+
+function getActiveNbaProviders(vault: StoredVault): Array<{ provider: string; apiKey: string; label: string }> {
+  const providers = vault.nbaProviders ?? {};
+  const orderedIds = ['basketballapi-net', 'api-basketball', 'api-nba', 'balldontlie', 'espn-nba'];
+  const active: Array<{ provider: string; apiKey: string; label: string }> = [];
+  for (const pid of orderedIds) {
+    const cfg = providers[pid];
+    if (!cfg || cfg.enabled === false) continue;
+    const isZeroKey = pid === 'espn-nba';
+    const effKey = isZeroKey ? '' : getEffectiveNbaKey(vault, pid).trim();
+    if (isZeroKey || Boolean(effKey)) {
+      active.push({
+        provider: pid,
+        apiKey: effKey,
+        label: PROVIDER_DISPLAY_NAMES[pid] ?? pid,
+      });
+    }
+  }
+  return active;
+}
+
 async function readVault(): Promise<StoredVault> {
   try {
     const raw = await fs.readFile(VAULT_PATH, 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoredVault>;
-    const fbKey = await decryptVaultSecret(parsed.football?.apiKey ?? '');
-    const nbaKey = await decryptVaultSecret(parsed.nba?.apiKey ?? '');
+    const legacyFbKey = await decryptVaultSecret(parsed.football?.apiKey ?? '');
+    const legacyNbaKey = await decryptVaultSecret(parsed.nba?.apiKey ?? '');
+
+    const footballProviders: Record<string, StoredSportConfig> = structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+    for (const pid of FOOTBALL_PROVIDER_IDS) {
+      const existing = parsed.footballProviders?.[pid];
+      if (existing) {
+        footballProviders[pid] = {
+          ...footballProviders[pid],
+          ...existing,
+          provider: pid,
+          apiKey: await decryptVaultSecret(existing.apiKey ?? ''),
+          enabled: existing.enabled !== false,
+        };
+      }
+    }
+    // Preserve legacy single-provider football entry transparently
+    if (parsed.football?.provider && FOOTBALL_PROVIDER_IDS.includes(parsed.football.provider as (typeof FOOTBALL_PROVIDER_IDS)[number])) {
+      const lPid = parsed.football.provider;
+      const prev = footballProviders[lPid];
+      if (!prev?.apiKey && legacyFbKey) {
+        footballProviders[lPid] = {
+          ...prev,
+          ...parsed.football,
+          provider: lPid,
+          apiKey: legacyFbKey,
+          enabled: true,
+        };
+      } else if (!parsed.footballProviders?.[lPid] && parsed.football.connected) {
+        footballProviders[lPid] = {
+          ...prev,
+          ...parsed.football,
+          provider: lPid,
+          apiKey: legacyFbKey || prev.apiKey,
+          enabled: true,
+        };
+      }
+    }
+
+    const nbaProviders: Record<string, StoredNbaConfig> = structuredClone(DEFAULT_NBA_PROVIDERS);
+    for (const pid of NBA_PROVIDER_IDS) {
+      const existing = parsed.nbaProviders?.[pid];
+      if (existing) {
+        nbaProviders[pid] = {
+          ...nbaProviders[pid],
+          ...existing,
+          provider: pid,
+          apiKey: await decryptVaultSecret(existing.apiKey ?? ''),
+          enabled: existing.enabled !== false,
+        };
+      }
+    }
+    // Preserve legacy single-provider NBA entry transparently (e.g. basketballapi-net key)
+    if (parsed.nba?.provider && NBA_PROVIDER_IDS.includes(parsed.nba.provider as (typeof NBA_PROVIDER_IDS)[number])) {
+      const lPid = parsed.nba.provider;
+      const prev = nbaProviders[lPid];
+      if (!prev?.apiKey && (legacyNbaKey || parsed.nba.reuseFootballKey)) {
+        nbaProviders[lPid] = {
+          ...prev,
+          ...parsed.nba,
+          provider: lPid,
+          apiKey: legacyNbaKey,
+          enabled: true,
+        };
+      } else if (!parsed.nbaProviders?.[lPid] && (parsed.nba.connected || parsed.nba.error)) {
+        nbaProviders[lPid] = {
+          ...prev,
+          ...parsed.nba,
+          provider: lPid,
+          apiKey: legacyNbaKey || prev.apiKey,
+          enabled: true,
+        };
+      }
+    }
+
     return {
       adminPinHash: typeof parsed.adminPinHash === 'string' ? parsed.adminPinHash : undefined,
-      football: { ...DEFAULT_VAULT.football, ...(parsed.football ?? {}), apiKey: fbKey },
-      nba: { ...DEFAULT_VAULT.nba, ...(parsed.nba ?? {}), apiKey: nbaKey },
+      football: {
+        ...DEFAULT_VAULT.football,
+        ...(parsed.football ?? {}),
+        apiKey: legacyFbKey || footballProviders[parsed.football?.provider ?? 'football-data']?.apiKey || '',
+      },
+      nba: {
+        ...DEFAULT_VAULT.nba,
+        ...(parsed.nba ?? {}),
+        apiKey: legacyNbaKey || nbaProviders[parsed.nba?.provider ?? 'basketballapi-net']?.apiKey || '',
+      },
+      footballProviders,
+      nbaProviders,
     };
   } catch {
     return structuredClone(DEFAULT_VAULT);
@@ -117,6 +365,21 @@ async function readVault(): Promise<StoredVault> {
 }
 
 async function writeVault(vault: StoredVault): Promise<void> {
+  const encFootballProviders: Record<string, StoredSportConfig> = {};
+  for (const [pid, cfg] of Object.entries(vault.footballProviders ?? {})) {
+    encFootballProviders[pid] = {
+      ...cfg,
+      apiKey: await encryptVaultSecret(cfg.apiKey ?? ''),
+    };
+  }
+  const encNbaProviders: Record<string, StoredNbaConfig> = {};
+  for (const [pid, cfg] of Object.entries(vault.nbaProviders ?? {})) {
+    encNbaProviders[pid] = {
+      ...cfg,
+      apiKey: await encryptVaultSecret(cfg.apiKey ?? ''),
+    };
+  }
+
   const encryptedPayload: StoredVault = {
     adminPinHash: vault.adminPinHash,
     football: {
@@ -127,36 +390,91 @@ async function writeVault(vault: StoredVault): Promise<void> {
       ...vault.nba,
       apiKey: await encryptVaultSecret(vault.nba.apiKey),
     },
+    footballProviders: encFootballProviders,
+    nbaProviders: encNbaProviders,
   };
   await writeFileAtomic(VAULT_PATH, JSON.stringify(encryptedPayload, null, 2), 0o600);
 }
 
 async function toPublicConfig(vault: StoredVault, req?: express.Request): Promise<ApiConfigState> {
-  const effectiveNbaKey = vault.nba.reuseFootballKey
-    ? vault.football.apiKey
-    : vault.nba.apiKey;
-  const fbZeroKey = vault.football.provider === 'espn-football';
-  const nbaZeroKey = vault.nba.provider === 'espn-nba';
   const unlocked = req ? await isConfigRequestAuthorized(req, vault) : false;
+
+  const fbMap: ApiConfigState['footballProviders'] = {};
+  for (const pid of FOOTBALL_PROVIDER_IDS) {
+    const cfg = vault.footballProviders?.[pid] ?? DEFAULT_FOOTBALL_PROVIDERS[pid];
+    const isZeroKey = pid === 'espn-football';
+    const hasCreds = isZeroKey || Boolean(cfg.apiKey.trim());
+    fbMap[pid] = {
+      connected: cfg.enabled !== false && cfg.connected && hasCreds,
+      enabled: cfg.enabled !== false,
+      provider: pid,
+      role: isZeroKey ? 'verification' : 'primary',
+      maskedKey: isZeroKey ? null : maskKey(cfg.apiKey),
+      lastChecked: cfg.lastChecked,
+      accountInfo: cfg.accountInfo,
+      error: cfg.error,
+    };
+  }
+
+  const nbaMap: ApiConfigState['nbaProviders'] = {};
+  for (const pid of NBA_PROVIDER_IDS) {
+    const cfg = vault.nbaProviders?.[pid] ?? DEFAULT_NBA_PROVIDERS[pid];
+    const isZeroKey = pid === 'espn-nba';
+    const effKey = isZeroKey ? '' : getEffectiveNbaKey(vault, pid);
+    const hasCreds = isZeroKey || Boolean(effKey.trim());
+    nbaMap[pid] = {
+      connected: cfg.enabled !== false && cfg.connected && hasCreds,
+      enabled: cfg.enabled !== false,
+      provider: pid,
+      role: isZeroKey ? 'verification' : 'primary',
+      maskedKey: isZeroKey ? null : maskKey(effKey),
+      reuseFootballKey: Boolean(cfg.reuseFootballKey),
+      lastChecked: cfg.lastChecked,
+      accountInfo: cfg.accountInfo,
+      error: cfg.error,
+    };
+  }
+
+  const fbSummaryTarget =
+    fbMap[vault.football.provider]?.connected
+      ? fbMap[vault.football.provider]
+      : Object.values(fbMap).find((p) => p.connected && p.role === 'primary') ??
+        Object.values(fbMap).find((p) => p.connected) ??
+        fbMap[vault.football.provider] ??
+        fbMap['football-data'];
+
+  const nbaSummaryTarget =
+    nbaMap[vault.nba.provider]?.connected
+      ? nbaMap[vault.nba.provider]
+      : Object.values(nbaMap).find((p) => p.connected && p.role === 'primary') ??
+        Object.values(nbaMap).find((p) => p.connected) ??
+        nbaMap[vault.nba.provider] ??
+        nbaMap['basketballapi-net'];
+
+  const activeFbNames = Object.values(fbMap)
+    .filter((p) => p.connected)
+    .map((p) => PROVIDER_DISPLAY_NAMES[p.provider] ?? p.provider);
+  const activeNbaNames = Object.values(nbaMap)
+    .filter((p) => p.connected)
+    .map((p) => PROVIDER_DISPLAY_NAMES[p.provider] ?? p.provider);
 
   return {
     football: {
-      connected: vault.football.connected && (fbZeroKey || Boolean(vault.football.apiKey)),
-      provider: vault.football.provider,
-      maskedKey: fbZeroKey ? null : maskKey(vault.football.apiKey),
-      lastChecked: vault.football.lastChecked,
-      accountInfo: vault.football.accountInfo,
-      error: vault.football.error,
+      ...fbSummaryTarget,
+      accountInfo:
+        activeFbNames.length > 1
+          ? `Conectadas simultáneamente (${activeFbNames.length}): ${activeFbNames.join(' + ')}`
+          : fbSummaryTarget.accountInfo,
     },
     nba: {
-      connected: vault.nba.connected && (nbaZeroKey || Boolean(effectiveNbaKey)),
-      provider: vault.nba.provider,
-      maskedKey: nbaZeroKey ? null : maskKey(effectiveNbaKey),
-      reuseFootballKey: vault.nba.reuseFootballKey,
-      lastChecked: vault.nba.lastChecked,
-      accountInfo: vault.nba.accountInfo,
-      error: vault.nba.error,
+      ...nbaSummaryTarget,
+      accountInfo:
+        activeNbaNames.length > 1
+          ? `Conectadas simultáneamente (${activeNbaNames.length}): ${activeNbaNames.join(' + ')}`
+          : nbaSummaryTarget.accountInfo,
     },
+    footballProviders: fbMap,
+    nbaProviders: nbaMap,
     security: {
       pinConfigured: Boolean(vault.adminPinHash),
       unlocked,
@@ -328,16 +646,32 @@ async function testProviderConnection(
       if (yestRes.ok) {
         return {
           ok: true,
-          accountInfo: 'BasketballAPI.net v1 · Plan Free conectado (resultados de hoy y ayer)',
+          accountInfo:
+            'BasketballAPI.net v1 · Plan Free conectado (partidos/resultados de hoy y ayer; combinado simultáneamente con ESPN NBA)',
           error: null,
         };
       }
 
-      const errBody = await yestRes.text().catch(() => '');
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayRes = await fetchWithTimeout(
+        `https://api.basketballapi.net/v1/games?date=${todayStr}`,
+        { headers },
+        9000
+      );
+      if (todayRes.ok) {
+        return {
+          ok: true,
+          accountInfo:
+            'BasketballAPI.net v1 · Conectado al calendario diario (combinado simultáneamente con ESPN NBA)',
+          error: null,
+        };
+      }
+
+      const errBody = await todayRes.text().catch(() => '') || await yestRes.text().catch(() => '');
       return {
         ok: false,
         accountInfo: null,
-        error: `BasketballAPI.net devolvió HTTP ${yestRes.status}. ${errBody ? errBody.slice(0, 140) : 'Verifica tu clave API.'}`,
+        error: `BasketballAPI.net devolvió HTTP ${todayRes.status || yestRes.status}. ${errBody ? errBody.slice(0, 140) : 'Verifica tu plan o clave API.'}`,
       };
     }
 
@@ -406,11 +740,12 @@ async function startServer() {
 
   app.post('/api/config/apis', requireConfigAdmin, async (req, res) => {
     try {
-      const { sport, provider, apiKey, reuseFootballKey } = req.body as {
+      const { sport, provider, apiKey, reuseFootballKey, enabled } = req.body as {
         sport: 'football' | 'nba';
         provider?: string;
         apiKey?: string;
         reuseFootballKey?: boolean;
+        enabled?: boolean;
       };
 
       if (sport !== 'football' && sport !== 'nba') {
@@ -421,47 +756,90 @@ async function startServer() {
       const now = new Date().toISOString();
 
       if (sport === 'football') {
-        if (provider) vault.football.provider = provider;
-        if (typeof apiKey === 'string' && apiKey.trim()) {
-          vault.football.apiKey = apiKey.trim();
-        }
-        const test = await testProviderConnection(
-          'football',
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        vault.football.connected = test.ok;
-        vault.football.accountInfo = test.accountInfo;
-        vault.football.error = test.error;
-        vault.football.lastChecked = now;
+        vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+        const targetProv = provider && FOOTBALL_PROVIDER_IDS.includes(provider as (typeof FOOTBALL_PROVIDER_IDS)[number])
+          ? provider
+          : vault.football.provider;
+        const entry = {
+          ...(vault.footballProviders[targetProv] ?? DEFAULT_FOOTBALL_PROVIDERS[targetProv]),
+          provider: targetProv,
+        };
 
-        if (vault.nba.reuseFootballKey && vault.football.apiKey) {
-          const nbaTest = await testProviderConnection(
-            'nba',
-            vault.nba.provider,
-            vault.football.apiKey
-          );
-          vault.nba.connected = nbaTest.ok;
-          vault.nba.accountInfo = nbaTest.accountInfo;
-          vault.nba.error = nbaTest.error;
-          vault.nba.lastChecked = now;
+        if (typeof apiKey === 'string' && apiKey.trim() && targetProv !== 'espn-football') {
+          entry.apiKey = apiKey.trim();
+        }
+        if (enabled === false) {
+          entry.enabled = false;
+          entry.connected = false;
+          entry.lastChecked = now;
+        } else {
+          entry.enabled = true;
+          const test = await testProviderConnection('football', targetProv, entry.apiKey);
+          entry.connected = test.ok;
+          entry.accountInfo = test.accountInfo;
+          entry.error = test.error;
+          entry.lastChecked = now;
+        }
+
+        vault.footballProviders[targetProv] = entry;
+        // Keep vault.football synced with primary keyed provider without dropping other providers
+        if (targetProv !== 'espn-football' || !vault.football.apiKey) {
+          vault.football = { ...entry };
+        }
+
+        // Re-check any NBA API-Sports provider reusing football key
+        const apiFbKey = vault.footballProviders['api-football']?.apiKey || vault.football.apiKey;
+        if (apiFbKey && vault.nbaProviders) {
+          for (const nbaPid of ['api-basketball', 'api-nba'] as const) {
+            const nbaEntry = vault.nbaProviders[nbaPid];
+            if (nbaEntry?.reuseFootballKey && nbaEntry.enabled !== false) {
+              const nbaTest = await testProviderConnection('nba', nbaPid, apiFbKey);
+              nbaEntry.connected = nbaTest.ok;
+              nbaEntry.accountInfo = nbaTest.accountInfo;
+              nbaEntry.error = nbaTest.error;
+              nbaEntry.lastChecked = now;
+            }
+          }
         }
       } else {
-        if (provider) vault.nba.provider = provider;
+        vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+        const targetProv = provider && NBA_PROVIDER_IDS.includes(provider as (typeof NBA_PROVIDER_IDS)[number])
+          ? provider
+          : vault.nba.provider;
+        const entry: StoredNbaConfig = {
+          ...(vault.nbaProviders[targetProv] ?? DEFAULT_NBA_PROVIDERS[targetProv]),
+          provider: targetProv,
+        };
+
         if (typeof reuseFootballKey === 'boolean') {
-          vault.nba.reuseFootballKey = reuseFootballKey;
+          entry.reuseFootballKey = targetProv === 'espn-nba' ? false : reuseFootballKey;
         }
-        if (typeof apiKey === 'string' && apiKey.trim() && !vault.nba.reuseFootballKey) {
-          vault.nba.apiKey = apiKey.trim();
+        if (typeof apiKey === 'string' && apiKey.trim() && !entry.reuseFootballKey && targetProv !== 'espn-nba') {
+          entry.apiKey = apiKey.trim();
         }
-        const keyToUse = vault.nba.reuseFootballKey
-          ? vault.football.apiKey
-          : vault.nba.apiKey;
-        const test = await testProviderConnection('nba', vault.nba.provider, keyToUse);
-        vault.nba.connected = test.ok;
-        vault.nba.accountInfo = test.accountInfo;
-        vault.nba.error = test.error;
-        vault.nba.lastChecked = now;
+
+        if (enabled === false) {
+          entry.enabled = false;
+          entry.connected = false;
+          entry.lastChecked = now;
+        } else {
+          entry.enabled = true;
+          vault.nbaProviders[targetProv] = entry;
+          const keyToUse = targetProv === 'espn-nba' ? '' : getEffectiveNbaKey(vault, targetProv);
+          const test = await testProviderConnection('nba', targetProv, keyToUse);
+          entry.connected = test.ok;
+          entry.accountInfo = test.accountInfo;
+          entry.error = test.error;
+          entry.lastChecked = now;
+        }
+
+        vault.nbaProviders[targetProv] = entry;
+        if (targetProv !== 'espn-nba' || !vault.nba.apiKey) {
+          vault.nba = {
+            ...entry,
+            reuseFootballKey: Boolean(entry.reuseFootballKey),
+          };
+        }
       }
 
       liveCache = null;
@@ -496,25 +874,55 @@ async function startServer() {
       let targetKey = apiKey?.trim() ?? '';
       if (!targetKey) {
         if (sport === 'football') {
-          targetKey = vault.football.apiKey;
+          targetKey = vault.footballProviders?.[targetProvider]?.apiKey || vault.football.apiKey;
         } else {
           const useFb =
-            typeof reuseFootballKey === 'boolean' ? reuseFootballKey : vault.nba.reuseFootballKey;
-          targetKey = useFb ? vault.football.apiKey : vault.nba.apiKey;
+            typeof reuseFootballKey === 'boolean'
+              ? reuseFootballKey
+              : vault.nbaProviders?.[targetProvider]?.reuseFootballKey;
+          targetKey = useFb
+            ? vault.footballProviders?.['api-football']?.apiKey || vault.football.apiKey
+            : vault.nbaProviders?.[targetProvider]?.apiKey || vault.nba.apiKey;
         }
       }
 
       const result = await testProviderConnection(sport, targetProvider, targetKey);
       if (sport === 'football') {
-        vault.football.connected = result.ok;
-        vault.football.accountInfo = result.accountInfo;
-        vault.football.error = result.error;
-        vault.football.lastChecked = now;
+        vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+        const cur = vault.footballProviders[targetProvider] ?? DEFAULT_FOOTBALL_PROVIDERS[targetProvider];
+        vault.footballProviders[targetProvider] = {
+          ...cur,
+          provider: targetProvider,
+          apiKey: targetKey || cur.apiKey,
+          enabled: result.ok ? true : cur.enabled,
+          connected: result.ok,
+          accountInfo: result.accountInfo,
+          error: result.error,
+          lastChecked: now,
+        };
+        if (vault.football.provider === targetProvider) {
+          vault.football = { ...vault.footballProviders[targetProvider] };
+        }
       } else {
-        vault.nba.connected = result.ok;
-        vault.nba.accountInfo = result.accountInfo;
-        vault.nba.error = result.error;
-        vault.nba.lastChecked = now;
+        vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+        const cur = vault.nbaProviders[targetProvider] ?? DEFAULT_NBA_PROVIDERS[targetProvider];
+        vault.nbaProviders[targetProvider] = {
+          ...cur,
+          provider: targetProvider,
+          apiKey: reuseFootballKey ? cur.apiKey : (targetKey || cur.apiKey),
+          reuseFootballKey: typeof reuseFootballKey === 'boolean' ? reuseFootballKey : cur.reuseFootballKey,
+          enabled: result.ok ? true : cur.enabled,
+          connected: result.ok,
+          accountInfo: result.accountInfo,
+          error: result.error,
+          lastChecked: now,
+        };
+        if (vault.nba.provider === targetProvider) {
+          vault.nba = {
+            ...vault.nbaProviders[targetProvider],
+            reuseFootballKey: Boolean(vault.nbaProviders[targetProvider].reuseFootballKey),
+          };
+        }
       }
       liveCache = null;
       await writeVault(vault);
@@ -528,19 +936,69 @@ async function startServer() {
 
   app.delete('/api/config/apis', requireConfigAdmin, async (req, res) => {
     const sport = (req.query.sport as string) || 'all';
+    const provider = typeof req.query.provider === 'string' ? req.query.provider : undefined;
     const vault = await readVault();
+
     if (sport === 'football' || sport === 'all') {
-      vault.football = structuredClone(DEFAULT_VAULT.football);
+      vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+      if (provider && vault.footballProviders[provider]) {
+        if (provider === 'espn-football') {
+          vault.footballProviders[provider] = {
+            ...DEFAULT_FOOTBALL_PROVIDERS[provider],
+            connected: false,
+            enabled: false,
+          };
+        } else {
+          vault.footballProviders[provider] = structuredClone(DEFAULT_FOOTBALL_PROVIDERS[provider]);
+        }
+        if (vault.football.provider === provider) {
+          const fallback = Object.values(vault.footballProviders).find((p) => p.connected && p.enabled !== false);
+          vault.football = fallback ? { ...fallback } : structuredClone(DEFAULT_VAULT.football);
+        }
+      } else {
+        for (const pid of FOOTBALL_PROVIDER_IDS) {
+          if (pid !== 'espn-football') {
+            vault.footballProviders[pid] = structuredClone(DEFAULT_FOOTBALL_PROVIDERS[pid]);
+          }
+        }
+        vault.football = structuredClone(DEFAULT_VAULT.football);
+      }
     }
+
     if (sport === 'nba' || sport === 'all') {
-      vault.nba = structuredClone(DEFAULT_VAULT.nba);
+      vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+      if (provider && vault.nbaProviders[provider]) {
+        if (provider === 'espn-nba') {
+          vault.nbaProviders[provider] = {
+            ...DEFAULT_NBA_PROVIDERS[provider],
+            connected: false,
+            enabled: false,
+          };
+        } else {
+          vault.nbaProviders[provider] = structuredClone(DEFAULT_NBA_PROVIDERS[provider]);
+        }
+        if (vault.nba.provider === provider) {
+          const fallback = Object.values(vault.nbaProviders).find((p) => p.connected && p.enabled !== false);
+          vault.nba = fallback
+            ? { ...fallback, reuseFootballKey: Boolean(fallback.reuseFootballKey) }
+            : structuredClone(DEFAULT_VAULT.nba);
+        }
+      } else {
+        for (const pid of NBA_PROVIDER_IDS) {
+          if (pid !== 'espn-nba') {
+            vault.nbaProviders[pid] = structuredClone(DEFAULT_NBA_PROVIDERS[pid]);
+          }
+        }
+        vault.nba = structuredClone(DEFAULT_VAULT.nba);
+      }
     }
+
     liveCache = null;
     await writeVault(vault);
     res.json(await toPublicConfig(vault, req));
   });
 
-  // 2. Live Sports Data Proxy Routes (Multi-day Calendar, Standings & On-Demand Match Hydration)
+  // 2. Live Sports Data Proxy Routes (Simultaneous Multi-Source Calendar, Cross-Check, Standings & Hydration)
   app.get('/api/sports/live', async (req, res) => {
     const forceRefresh = req.query.refresh === '1';
     const vault = await readVault();
@@ -558,72 +1016,114 @@ async function startServer() {
       });
     }
 
-    const matches: MatchRecord[] = [];
-    const standings: StandingEntry[] = [];
     const errors: string[] = [];
     const sources: LiveFeedSourceStatus[] = [];
 
-    const fbProvider =
-      vault.football.connected &&
-      (vault.football.provider === 'espn-football' || vault.football.apiKey)
-        ? vault.football.provider
-        : 'espn-football';
-    const fbKey = fbProvider === vault.football.provider ? vault.football.apiKey : '';
+    const activeFbProviders = getActiveFootballProviders(vault);
+    const fbList = activeFbProviders.length > 0
+      ? activeFbProviders
+      : [{ provider: 'espn-football', apiKey: '', label: PROVIDER_DISPLAY_NAMES['espn-football'] }];
 
-    try {
-      const fb = await fetchFootballCalendarAndStandings(fbProvider, fbKey);
-      matches.push(...fb.matches);
-      standings.push(...fb.standings);
-      sources.push({
-        sport: 'football',
-        provider: fbProvider,
-        status: 'ok',
-        updatedAt: new Date().toISOString(),
-        matchCount: fb.matches.length,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Error obteniendo calendario de fútbol';
-      errors.push(msg);
-      sources.push({
-        sport: 'football',
-        provider: fbProvider,
-        status: 'error',
-        updatedAt: new Date().toISOString(),
-        matchCount: 0,
-        error: msg,
-      });
-    }
+    const activeNbaProviders = getActiveNbaProviders(vault);
+    const nbaList = activeNbaProviders.length > 0
+      ? activeNbaProviders
+      : [{ provider: 'espn-nba', apiKey: '', label: PROVIDER_DISPLAY_NAMES['espn-nba'] }];
 
-    const nbaKey = vault.nba.reuseFootballKey ? vault.football.apiKey : vault.nba.apiKey;
-    const nbaProvider =
-      vault.nba.connected && (vault.nba.provider === 'espn-nba' || nbaKey)
-        ? vault.nba.provider
-        : 'espn-nba';
-    const effNbaKey = nbaProvider === vault.nba.provider ? nbaKey : '';
+    const [fbSettled, nbaSettled] = await Promise.all([
+      Promise.allSettled(
+        fbList.map(async (src) => {
+          const data = await fetchFootballCalendarAndStandings(src.provider, src.apiKey, {
+            includeEspnFallback: false,
+          });
+          return { src, data };
+        })
+      ),
+      Promise.allSettled(
+        nbaList.map(async (src) => {
+          const data = await fetchNbaCalendarAndStandings(src.provider, src.apiKey, {
+            includeEspnFallback: false,
+          });
+          return { src, data };
+        })
+      ),
+    ]);
 
-    try {
-      const nba = await fetchNbaCalendarAndStandings(nbaProvider, effNbaKey);
-      matches.push(...nba.matches);
-      standings.push(...nba.standings);
-      sources.push({
-        sport: 'nba',
-        provider: nbaProvider,
-        status: 'ok',
-        updatedAt: new Date().toISOString(),
-        matchCount: nba.matches.length,
-      });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Error obteniendo calendario de NBA';
-      errors.push(msg);
-      sources.push({
-        sport: 'nba',
-        provider: nbaProvider,
-        status: 'error',
-        updatedAt: new Date().toISOString(),
-        matchCount: 0,
-        error: msg,
-      });
-    }
+    const fbBatches: MultiSourceMatchBatch[] = [];
+    const nbaBatches: MultiSourceMatchBatch[] = [];
+    const standingBatches: StandingEntry[][] = [];
+    const nowIso = new Date().toISOString();
+
+    fbSettled.forEach((outcome, idx) => {
+      const src = fbList[idx];
+      if (outcome.status === 'fulfilled') {
+        fbBatches.push({
+          provider: src.provider,
+          label: src.label,
+          matches: outcome.value.data.matches,
+        });
+        standingBatches.push(outcome.value.data.standings);
+        sources.push({
+          sport: 'football',
+          provider: src.provider,
+          status: 'ok',
+          updatedAt: nowIso,
+          matchCount: outcome.value.data.matches.length,
+        });
+      } else {
+        const msg =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : `Error consultando ${src.label}`;
+        errors.push(`${src.label}: ${msg}`);
+        sources.push({
+          sport: 'football',
+          provider: src.provider,
+          status: 'error',
+          updatedAt: nowIso,
+          matchCount: 0,
+          error: msg,
+        });
+      }
+    });
+
+    nbaSettled.forEach((outcome, idx) => {
+      const src = nbaList[idx];
+      if (outcome.status === 'fulfilled') {
+        nbaBatches.push({
+          provider: src.provider,
+          label: src.label,
+          matches: outcome.value.data.matches,
+        });
+        standingBatches.push(outcome.value.data.standings);
+        sources.push({
+          sport: 'nba',
+          provider: src.provider,
+          status: 'ok',
+          updatedAt: nowIso,
+          matchCount: outcome.value.data.matches.length,
+        });
+      } else {
+        const msg =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : `Error consultando ${src.label}`;
+        errors.push(`${src.label}: ${msg}`);
+        sources.push({
+          sport: 'nba',
+          provider: src.provider,
+          status: 'error',
+          updatedAt: nowIso,
+          matchCount: 0,
+          error: msg,
+        });
+      }
+    });
+
+    const matches = [
+      ...mergeMatchesAcrossSources(fbBatches),
+      ...mergeMatchesAcrossSources(nbaBatches),
+    ];
+    const standings = mergeStandingsAcrossSources(standingBatches);
 
     const fetchedAt = new Date().toISOString();
     const payload = {
@@ -662,41 +1162,136 @@ async function startServer() {
       if (!match || match.isOfflineReference) {
         return res.json({ match });
       }
-      if (match.id.startsWith('espn-nba-')) {
-        const hydrated = await hydrateLiveMatchDetails(match, 'espn-nba', '');
-        return res.json({ match: hydrated });
-      }
-      if (match.id.startsWith('espnsoc-')) {
-        const hydrated = await hydrateLiveMatchDetails(match, 'espn-football', '');
-        return res.json({ match: hydrated });
-      }
 
       const vault = await readVault();
-      if (match.sport === 'football' && vault.football.connected && vault.football.apiKey) {
-        const hydrated = await hydrateLiveMatchDetails(
-          match,
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        return res.json({ match: hydrated });
+      const tasks: Array<{ provider: string; label: string; promise: Promise<MatchRecord> }> = [];
+
+      if (match.sport === 'football') {
+        const activeFb = getActiveFootballProviders(vault);
+        const addedProviders = new Set<string>();
+
+        for (const src of activeFb) {
+          const sourceMatchId = match.sourceIds?.[src.provider] ?? (
+            (src.provider === 'football-data' && match.id.startsWith('fd-')) ||
+            (src.provider === 'api-football' && match.id.startsWith('apifb-')) ||
+            (src.provider === 'espn-football' && match.id.startsWith('espnsoc-'))
+              ? match.id
+              : undefined
+          );
+
+          if (sourceMatchId) {
+            addedProviders.add(src.provider);
+            tasks.push({
+              provider: src.provider,
+              label: src.label,
+              promise: hydrateLiveMatchDetails({ ...match, id: sourceMatchId }, src.provider, src.apiKey),
+            });
+          } else if (src.provider === 'espn-football') {
+            // Dynamically cross-link ESPN Soccer even if match originated only in Football-Data or API-Football
+            addedProviders.add('espn-football');
+            tasks.push({
+              provider: 'espn-football',
+              label: src.label,
+              promise: (async () => {
+                const espnData = await fetchEspnSoccerEnrichment();
+                const baseTs = new Date(match.kickoffIso).getTime();
+                const matchedEspn = espnData.matches.find(
+                  (em) =>
+                    Math.abs(new Date(em.kickoffIso).getTime() - baseTs) <= 36 * 3600_000 &&
+                    teamsMatch(em.homeTeam.name, match.homeTeam.name) &&
+                    teamsMatch(em.awayTeam.name, match.awayTeam.name)
+                );
+                if (!matchedEspn) return match;
+                return hydrateLiveMatchDetails(matchedEspn, 'espn-football', '');
+              })(),
+            });
+          }
+        }
+
+        // Preserve direct espnsoc- hydration if user disabled/didn't configure other keys
+        if (!addedProviders.has('espn-football') && match.id.startsWith('espnsoc-')) {
+          tasks.push({
+            provider: 'espn-football',
+            label: PROVIDER_DISPLAY_NAMES['espn-football'],
+            promise: hydrateLiveMatchDetails(match, 'espn-football', ''),
+          });
+        }
+      } else if (match.sport === 'nba') {
+        const activeNba = getActiveNbaProviders(vault);
+        const addedProviders = new Set<string>();
+
+        for (const src of activeNba) {
+          const sourceMatchId = match.sourceIds?.[src.provider] ?? (
+            (src.provider === 'basketballapi-net' && match.id.startsWith('bapi-')) ||
+            (src.provider === 'balldontlie' && match.id.startsWith('bdl-')) ||
+            ((src.provider === 'api-basketball' || src.provider === 'api-nba') &&
+              (match.id.startsWith('apibsk-') || match.id.startsWith('apinba2-'))) ||
+            (src.provider === 'espn-nba' && match.id.startsWith('espn-nba-'))
+              ? match.id
+              : undefined
+          );
+
+          if (sourceMatchId) {
+            addedProviders.add(src.provider);
+            tasks.push({
+              provider: src.provider,
+              label: src.label,
+              promise: hydrateLiveMatchDetails({ ...match, id: sourceMatchId }, src.provider, src.apiKey),
+            });
+          } else if (src.provider === 'espn-nba') {
+            addedProviders.add('espn-nba');
+            tasks.push({
+              provider: 'espn-nba',
+              label: src.label,
+              promise: hydrateLiveMatchDetails(match, 'espn-nba', ''),
+            });
+          }
+        }
+
+        if (!addedProviders.has('espn-nba')) {
+          tasks.push({
+            provider: 'espn-nba',
+            label: PROVIDER_DISPLAY_NAMES['espn-nba'],
+            promise: hydrateLiveMatchDetails(match, 'espn-nba', ''),
+          });
+        }
       }
-      const nbaKey = vault.nba.reuseFootballKey ? vault.football.apiKey : vault.nba.apiKey;
-      if (match.sport === 'nba') {
-        const hydrated = await hydrateLiveMatchDetails(
-          match,
-          vault.nba.connected && nbaKey ? vault.nba.provider : 'espn-nba',
-          nbaKey
-        );
-        return res.json({ match: hydrated });
+
+      if (tasks.length === 0) {
+        return res.json({
+          match: {
+            ...match,
+            hydrationStatus: 'provider_unavailable',
+            hydrationNote:
+              'Ninguno de los proveedores configurados para este deporte está conectado en Configuración de APIs.',
+          },
+        });
       }
-      return res.json({
-        match: {
-          ...match,
-          hydrationStatus: 'provider_unavailable',
-          hydrationNote:
-            'El proveedor configurado para este deporte no está conectado en Configuración de APIs.',
-        },
+
+      const settled = await Promise.allSettled(tasks.map((t) => t.promise));
+      const variants: Array<{ provider: string; label: string; match: MatchRecord }> = [];
+      settled.forEach((resItem, idx) => {
+        if (resItem.status === 'fulfilled' && resItem.value) {
+          variants.push({
+            provider: tasks[idx].provider,
+            label: tasks[idx].label,
+            match: resItem.value,
+          });
+        }
       });
+
+      if (variants.length === 0) {
+        return res.json({
+          match: {
+            ...match,
+            hydrationStatus: 'network_error',
+            hydrationNote: 'No se pudo hidratar el detalle del partido desde las fuentes activas.',
+          },
+        });
+      }
+
+      const mergedMatch = mergeHydratedMatchDetails(match, variants);
+      return res.json({ match: mergedMatch });
     } catch (err) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error hidratando detalle del partido',
@@ -907,15 +1502,40 @@ async function startServer() {
       const vault = await readVault();
       let workingMatch = match;
 
-      // Re-hydrate from primary live provider first to catch newly confirmed official starting XIs
-      if (match.id.startsWith('espnsoc-')) {
-        workingMatch = await hydrateLiveMatchDetails(workingMatch, 'espn-football', '');
-      } else if (vault.football.connected && vault.football.apiKey) {
-        workingMatch = await hydrateLiveMatchDetails(
-          workingMatch,
-          vault.football.provider,
-          vault.football.apiKey
-        );
+      // Re-hydrate from ALL active Football providers simultaneously to catch newly confirmed starting XIs
+      const activeFb = getActiveFootballProviders(vault);
+      const refreshTasks: Array<{ provider: string; label: string; promise: Promise<MatchRecord> }> = [];
+      for (const src of activeFb) {
+        const srcId =
+          match.sourceIds?.[src.provider] ??
+          ((src.provider === 'football-data' && match.id.startsWith('fd-')) ||
+          (src.provider === 'api-football' && match.id.startsWith('apifb-')) ||
+          (src.provider === 'espn-football' && match.id.startsWith('espnsoc-'))
+            ? match.id
+            : undefined);
+        if (srcId) {
+          refreshTasks.push({
+            provider: src.provider,
+            label: src.label,
+            promise: hydrateLiveMatchDetails({ ...workingMatch, id: srcId }, src.provider, src.apiKey),
+          });
+        }
+      }
+      if (refreshTasks.length > 0) {
+        const settledRefresh = await Promise.allSettled(refreshTasks.map((t) => t.promise));
+        const variants: Array<{ provider: string; label: string; match: MatchRecord }> = [];
+        settledRefresh.forEach((item, idx) => {
+          if (item.status === 'fulfilled' && item.value) {
+            variants.push({
+              provider: refreshTasks[idx].provider,
+              label: refreshTasks[idx].label,
+              match: item.value,
+            });
+          }
+        });
+        if (variants.length > 0) {
+          workingMatch = mergeHydratedMatchDetails(workingMatch, variants);
+        }
       }
 
       // If official lineup was just published, ensure probableLineup is preserved cleanly alongside confirmedLineup

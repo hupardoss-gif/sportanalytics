@@ -10,7 +10,10 @@ import type {
 } from '../types/sports.ts';
 import {
   computeFootballPlayerProp,
+  FOOTBALL_FIELD_STATS,
+  FOOTBALL_GK_STATS,
   FOOTBALL_STAT_CONFIG,
+  isGoalkeeperPosition,
 } from '../engine/footballModel.ts';
 import { computeNbaPlayerProp, NBA_STAT_CONFIG } from '../engine/nbaModel.ts';
 
@@ -22,18 +25,6 @@ interface OverUnderLabProps {
   initialStat?: PropStatKey;
   initialLine?: number;
 }
-
-const FOOTBALL_STATS: FootballPropStat[] = [
-  'shots',
-  'shotsOnTarget',
-  'goals',
-  'assists',
-  'foulsCommitted',
-  'foulsDrawn',
-  'yellowCards',
-  'redCards',
-  'passes',
-];
 
 const NBA_STATS: NbaPropStat[] = [
   'points',
@@ -54,16 +45,25 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
   initialStat,
   initialLine,
 }) => {
+  const isGk = player.sport === 'football' && isGoalkeeperPosition(player.position);
   const availableStats: PropStatKey[] =
-    player.sport === 'football' ? FOOTBALL_STATS : NBA_STATS;
+    player.sport === 'football'
+      ? isGk
+        ? FOOTBALL_GK_STATS
+        : FOOTBALL_FIELD_STATS
+      : NBA_STATS;
 
   const [statKey, setStatKey] = useState<PropStatKey>(
     initialStat && availableStats.includes(initialStat)
       ? initialStat
-      : player.sport === 'football'
-      ? 'shots'
-      : 'points'
+      : availableStats[0]
   );
+
+  useEffect(() => {
+    if (!availableStats.includes(statKey)) {
+      setStatKey(availableStats[0]);
+    }
+  }, [player.id, isGk, availableStats, statKey]);
 
   // Baseline projection to get default recommended line when stat or player changes
   const defaultProjection = useMemo(() => {
@@ -177,57 +177,71 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
         })}
       </div>
 
-      {/* Horizontal Slider + Stepper Controls */}
-      <div className="space-y-3 pt-1">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <span className="text-xs text-slate-400 block">Línea seleccionada</span>
-            <span className="text-2xl font-bold font-mono tabular-nums text-white">
-              {projection.line.toFixed(1)}{' '}
-              <span className="text-sm font-normal text-slate-400">
-                {projection.statLabel.toLowerCase()}
-              </span>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={stepDown}
-              aria-label="Reducir línea"
-              className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-            >
-              <Minus className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
-              onClick={stepUp}
-              aria-label="Aumentar línea"
-              className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
-          </div>
+      {/* Conditional Interactive Simulator vs Honest Unavailable Notice */}
+      {projection.unavailable ? (
+        <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-4 space-y-1.5 text-xs">
+          <span className="font-semibold text-slate-200 block">
+            No disponible — {projection.statLabel}
+          </span>
+          <p className="text-slate-400 leading-relaxed">
+            {projection.unavailableReason ??
+              projection.statsOriginNote ??
+              'La fuente de datos actual no publica estadísticas individuales reales suficientes para calcular líneas Over/Under sobre este jugador.'}
+          </p>
         </div>
+      ) : (
+        <>
+          {/* Horizontal Slider + Stepper Controls */}
+          <div className="space-y-3 pt-1">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <span className="text-xs text-slate-400 block">Línea seleccionada</span>
+                <span className="text-2xl font-bold font-mono tabular-nums text-white">
+                  {projection.line.toFixed(1)}{' '}
+                  <span className="text-sm font-normal text-slate-400">
+                    {projection.statLabel.toLowerCase()}
+                  </span>
+                </span>
+              </div>
 
-        <div>
-          <input
-            type="range"
-            min={projection.minLine}
-            max={projection.maxLine}
-            step={projection.step}
-            value={projection.line}
-            onChange={(e) => setCustomLine(parseFloat(e.target.value))}
-            aria-label={`Deslizador Over/Under para ${projection.statLabel}`}
-            className="analytics-slider"
-          />
-          <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-500 -mt-1">
-            <span>{projection.minLine.toFixed(1)}</span>
-            <span>Media modelo: {projection.expectedValue.toFixed(2)}</span>
-            <span>{projection.maxLine.toFixed(1)}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={stepDown}
+                  aria-label="Reducir línea"
+                  className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Minus className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={stepUp}
+                  aria-label="Aumentar línea"
+                  className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <input
+                type="range"
+                min={projection.minLine}
+                max={projection.maxLine}
+                step={projection.step}
+                value={projection.line}
+                onChange={(e) => setCustomLine(parseFloat(e.target.value))}
+                aria-label={`Deslizador Over/Under para ${projection.statLabel}`}
+                className="analytics-slider"
+              />
+              <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-500 -mt-1">
+                <span>{projection.minLine.toFixed(1)}</span>
+                <span>Media modelo: {projection.expectedValue.toFixed(2)}</span>
+                <span>{projection.maxLine.toFixed(1)}</span>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
 
       {/* Complementary Over / Under Probability Bar (Always Sums to 100.0%) */}
       <div className="space-y-2">
@@ -378,6 +392,8 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
           })}
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 };
