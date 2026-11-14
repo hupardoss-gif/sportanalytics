@@ -1,44 +1,61 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   BookmarkPlus,
   Check,
   AlertCircle,
-  Scale,
   BarChart3,
   Users,
   History,
   LayoutDashboard,
   Loader2,
   Info,
+  ShieldCheck,
+  AlertTriangle,
+  Target,
+  Minus,
+  Plus,
+  Percent,
+  SlidersHorizontal,
 } from 'lucide-react';
 import type {
   AvailabilityStatus,
+  DataReliability,
   LoggedPrediction,
   MatchRecord,
   PlayerProfile,
   TeamRecentGame,
 } from '../types/sports.ts';
-import { computeFootballMatchPrediction } from '../engine/footballModel.ts';
-import { computeNbaMatchPrediction } from '../engine/nbaModel.ts';
-import { evaluateMatchOddsDiscrepancies } from '../engine/oddsEngine.ts';
+import {
+  buildFootballMatchExplanation,
+  computeFootballMatchPrediction,
+} from '../engine/footballModel.ts';
+import {
+  buildNbaMatchExplanation,
+  computeNbaMatchPrediction,
+} from '../engine/nbaModel.ts';
+import { evaluateMatchStatOverUnder } from '../engine/distributionMath.ts';
 import { TacticalPitch } from './TacticalPitch.tsx';
 import { BasketballCourt } from './BasketballCourt.tsx';
 import { AiExplanationBox, type AiExplanationPayload } from './AiExplanationBox.tsx';
+import { OddsProbabilityPanel } from './OddsProbabilityPanel.tsx';
 
 interface MatchDetailViewProps {
   match: MatchRecord;
+  historyItems?: LoggedPrediction[];
   hydrating?: boolean;
   refreshingNbaNews?: boolean;
+  refreshingFootballLineups?: boolean;
   playerOverrides: Record<string, AvailabilityStatus>;
   onToggleAvailability: (playerId: string, nextStatus: AvailabilityStatus) => void;
   onRefreshNbaNews?: (match: MatchRecord) => Promise<void>;
+  onRefreshFootballLineups?: (match: MatchRecord) => Promise<void>;
   onSelectPlayer: (player: PlayerProfile, match: MatchRecord) => void;
   onLogPrediction: (pred: Omit<LoggedPrediction, 'id' | 'createdAt' | 'status'>) => Promise<void>;
   onBack: () => void;
 }
 
-type DetailTab = 'summary' | 'teams' | 'tactical' | 'odds' | 'h2h';
+type DetailTab = 'summary' | 'expected' | 'teams' | 'tactical' | 'h2h' | 'odds';
 
 function summarizeGames(games: TeamRecentGame[]) {
   const n = games.length;
@@ -86,13 +103,38 @@ function summarizeGames(games: TeamRecentGame[]) {
   };
 }
 
+function renderDataQualityBadge(quality: DataReliability, dataConfidence: number) {
+  const cls =
+    quality === 'verified'
+      ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+      : quality === 'estimated'
+        ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+        : 'border-rose-500/35 bg-rose-950/25 text-rose-300';
+  const label =
+    quality === 'verified'
+      ? 'Datos verificados'
+      : quality === 'estimated'
+        ? 'Estimación parcial'
+        : 'Sin datos suficientes';
+
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded border text-[11px] font-semibold ${cls}`}>
+      <ShieldCheck className="w-3.5 h-3.5" />
+      {label} · Cobertura {dataConfidence}%
+    </span>
+  );
+}
+
 export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   match,
+  historyItems = [],
   hydrating = false,
   refreshingNbaNews = false,
+  refreshingFootballLineups = false,
   playerOverrides,
   onToggleAvailability,
   onRefreshNbaNews,
+  onRefreshFootballLineups,
   onSelectPlayer,
   onLogPrediction,
   onBack,
@@ -103,6 +145,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   const [aiError, setAiError] = useState<string | null>(null);
   const [aiData, setAiData] = useState<AiExplanationPayload | null>(null);
   const [savedToast, setSavedToast] = useState(false);
+  const [matchStatLines, setMatchStatLines] = useState<Record<string, number>>({});
+
+  useEffect(() => {
+    setMatchStatLines({});
+    setAiData(null);
+  }, [match.id]);
 
   const effectiveHomePlayers = useMemo(
     () =>
@@ -125,23 +173,38 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
   const footballPred = useMemo(
     () =>
       match.sport === 'football'
-        ? computeFootballMatchPrediction(match, effectiveHomePlayers, effectiveAwayPlayers)
+        ? computeFootballMatchPrediction(
+            match,
+            effectiveHomePlayers,
+            effectiveAwayPlayers,
+            historyItems
+          )
         : null,
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
+    [match, effectiveHomePlayers, effectiveAwayPlayers, historyItems]
   );
 
   const nbaPred = useMemo(
     () =>
       match.sport === 'nba'
-        ? computeNbaMatchPrediction(match, effectiveHomePlayers, effectiveAwayPlayers)
+        ? computeNbaMatchPrediction(
+            match,
+            effectiveHomePlayers,
+            effectiveAwayPlayers,
+            historyItems
+          )
         : null,
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
+    [match, effectiveHomePlayers, effectiveAwayPlayers, historyItems]
   );
 
-  const oddsItems = useMemo(
-    () => evaluateMatchOddsDiscrepancies(match, effectiveHomePlayers, effectiveAwayPlayers),
-    [match, effectiveHomePlayers, effectiveAwayPlayers]
-  );
+  const narrative = useMemo(() => {
+    if (match.sport === 'football' && footballPred) {
+      return buildFootballMatchExplanation(match, footballPred);
+    }
+    if (match.sport === 'nba' && nbaPred) {
+      return buildNbaMatchExplanation(match, nbaPred, effectiveHomePlayers, effectiveAwayPlayers);
+    }
+    return null;
+  }, [match, footballPred, nbaPred, effectiveHomePlayers, effectiveAwayPlayers]);
 
   const handleExplainAi = async () => {
     setAiLoading(true);
@@ -154,14 +217,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               competition: match.competition,
               lineupStatus: match.lineupStatus,
               modelOutputs: footballPred,
-              oddsDiscrepancies: oddsItems.slice(0, 4),
             }
           : {
               match: `${match.homeTeam.name} vs ${match.awayTeam.name}`,
               competition: match.competition,
               lineupStatus: match.lineupStatus,
               modelOutputs: nbaPred,
-              oddsDiscrepancies: oddsItems.slice(0, 4),
             };
 
       const res = await fetch('/api/ai/explain', {
@@ -185,6 +246,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
       const favoriteIsHome = footballPred.probHome >= footballPred.probAway;
       await onLogPrediction({
         sport: 'football',
+        competition: match.competition,
         matchId: match.id,
         matchLabel,
         market: 'Resultado Final (1X2)',
@@ -192,17 +254,20 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           ? `Victoria ${match.homeTeam.shortName}`
           : `Victoria ${match.awayTeam.shortName}`,
         predictedProb: Math.max(footballPred.probHome, footballPred.probAway),
+        rawPredictedProb: Math.max(footballPred.rawProbHome, footballPred.rawProbAway),
         predictedValue: +(footballPred.lambdaHome + footballPred.lambdaAway).toFixed(2),
       });
     } else if (match.sport === 'nba' && nbaPred) {
       const favoriteIsHome = nbaPred.probHomeWin >= nbaPred.probAwayWin;
       await onLogPrediction({
         sport: 'nba',
+        competition: match.competition,
         matchId: match.id,
         matchLabel,
         market: 'Ganador (Moneyline)',
         selection: favoriteIsHome ? match.homeTeam.name : match.awayTeam.name,
         predictedProb: Math.max(nbaPred.probHomeWin, nbaPred.probAwayWin),
+        rawPredictedProb: Math.max(nbaPred.rawProbHomeWin, nbaPred.rawProbAwayWin),
         predictedValue: +nbaPred.expectedSpreadHome.toFixed(1),
       });
     }
@@ -214,6 +279,11 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
     match.sport === 'football'
       ? footballPred?.absenceImpactSummary ?? []
       : nbaPred?.absenceImpactSummary ?? [];
+
+  const modelWarnings =
+    match.sport === 'football'
+      ? footballPred?.modelWarnings ?? []
+      : nbaPred?.modelWarnings ?? [];
 
   const statusText =
     match.status === 'live'
@@ -299,6 +369,16 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </span>
         </div>
 
+        {match.sourceDiscrepancies && match.sourceDiscrepancies.length > 0 && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3 py-2 text-xs text-amber-200 flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div>
+              <span className="font-semibold">Diferencias detectadas al contrastar fuentes:</span>{' '}
+              {match.sourceDiscrepancies.join(' · ')}
+            </div>
+          </div>
+        )}
+
         <div className="grid grid-cols-1 md:grid-cols-3 items-center gap-6">
           <div>
             <p className="text-xs text-slate-400">Local · {match.homeTeam.record}</p>
@@ -376,6 +456,29 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           </div>
         )}
 
+        {/* Model Warnings Strip */}
+        {modelWarnings.length > 0 && (
+          <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-300 flex items-start gap-2.5">
+            <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="space-y-0.5">
+              {modelWarnings.map((w, idx) => (
+                <span key={idx} className="block">
+                  · {w}
+                </span>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {match.provenance && (match.provenance.isStale || match.provenance.status === 'error') && (
+          <div className="rounded-lg border border-amber-500/35 bg-amber-950/25 px-3.5 py-2 text-xs text-amber-200 flex items-center gap-2">
+            <AlertTriangle className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+            <span>
+              Estado de fuente ({match.provenance.source}): {match.provenance.errorMessage ?? `datos con ${match.provenance.staleAgeMinutes} min de antigüedad`} · Tipo: {match.provenance.dataType}.
+            </span>
+          </div>
+        )}
+
         {match.hydrationNote && (
           <div className="rounded-lg border border-slate-800 bg-slate-950/50 px-3.5 py-2 text-xs text-slate-300 flex items-center gap-2">
             <Info className="w-3.5 h-3.5 text-blue-400 shrink-0" />
@@ -384,19 +487,20 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
         )}
       </section>
 
-      {/* Sub-Navigation Tabs: Resumen, Análisis equipos, Jugadores y alineaciones, Cuotas, H2H */}
+      {/* Sub-Navigation Tabs */}
       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
         {(
           [
             { id: 'summary', label: 'A. Resumen y Predicción', icon: LayoutDashboard },
-            { id: 'teams', label: 'B. Análisis de Equipos', icon: BarChart3 },
+            { id: 'expected', label: 'B. Qué se espera del partido', icon: Target },
+            { id: 'teams', label: 'C. Análisis de Equipos', icon: BarChart3 },
             {
               id: 'tactical',
-              label: match.sport === 'football' ? 'C. Jugadores y Alineaciones' : 'C. Jugadores y Rotación',
+              label: match.sport === 'football' ? 'D. Jugadores y Alineaciones' : 'D. Jugadores y Rotación',
               icon: Users,
             },
-            { id: 'h2h', label: 'D. Historial H2H', icon: History },
-            { id: 'odds', label: 'E. Cuotas y Valor', icon: Scale },
+            { id: 'h2h', label: 'E. Historial H2H', icon: History },
+            { id: 'odds', label: 'F. Cuotas y Probabilidades', icon: Percent },
           ] as const
         ).map((item) => {
           const Icon = item.icon;
@@ -425,9 +529,13 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           {match.sport === 'football' && footballPred && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Probabilidades de victoria y modelo Dixon-Coles
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Probabilidades y modelo Dixon-Coles
+                  </h3>
+                  {renderDataQualityBadge(footballPred.dataQuality, footballPred.dataConfidence)}
+                </div>
+
                 <div className="space-y-3">
                   {[
                     { label: `Victoria ${match.homeTeam.shortName}`, val: footballPred.probHome, color: 'bg-blue-500' },
@@ -438,7 +546,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                       <div className="flex justify-between text-xs">
                         <span className="text-slate-300">{r.label}</span>
                         <span className="font-mono tabular-nums font-semibold text-white">
-                          {(r.val * 100).toFixed(1)}% · Cuota justa {(1 / r.val).toFixed(2)}
+                          {(r.val * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
@@ -476,22 +584,44 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                   <div>
                     <span className="text-slate-400 block">Córners esperados</span>
                     <span className="text-base font-bold font-mono tabular-nums text-white">
-                      {footballPred.expectedCorners.toFixed(1)}
+                      {(() => {
+                        const c = footballPred.expectedStats.find((s) => s.key === 'corners');
+                        return c && c.reliability !== 'unavailable' && c.pointEstimate !== null
+                          ? c.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                   <div>
                     <span className="text-slate-400 block">Tarjetas esperadas</span>
                     <span className="text-base font-bold font-mono tabular-nums text-white">
-                      {(footballPred.expectedCardsHome + footballPred.expectedCardsAway).toFixed(1)}
+                      {(() => {
+                        const yc = footballPred.expectedStats.find((s) => s.key === 'yellow_cards');
+                        return yc && yc.reliability !== 'unavailable' && yc.pointEstimate !== null
+                          ? yc.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                 </div>
               </div>
 
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Resultados exactos más probables y confianza
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Resultados exactos más probables
+                  </h3>
+                  <span
+                    className={`px-2 py-0.5 rounded border text-[11px] font-medium ${
+                      footballPred.calibrationApplied
+                        ? 'border-blue-500/35 bg-blue-950/30 text-blue-300'
+                        : 'border-slate-700 bg-slate-900 text-slate-400'
+                    }`}
+                  >
+                    {footballPred.calibrationApplied ? 'Calibrado empíricamente' : 'Modelo base (sin ajuste)'}
+                  </span>
+                </div>
+
                 <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                   {footballPred.exactScores.map((sc) => (
                     <div
@@ -507,9 +637,14 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                     </div>
                   ))}
                 </div>
-                <p className="text-xs text-slate-400">
-                  Confianza del modelo: {footballPred.dataConfidence}% · Basado en xG local/visitante, clasificación actual, forma reciente y bajas activas.
-                </p>
+                <div className="text-xs text-slate-400 space-y-1">
+                  <p>
+                    Cobertura de datos: <strong className="text-slate-200">{footballPred.dataConfidence}%</strong> (mide la disponibilidad de métricas reales, independiente de la probabilidad del favorito).
+                  </p>
+                  {footballPred.calibrationNote && (
+                    <p className="text-blue-300">{footballPred.calibrationNote}</p>
+                  )}
+                </div>
               </div>
             </div>
           )}
@@ -517,9 +652,13 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           {match.sport === 'nba' && nbaPred && (
             <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
-                <h3 className="text-base font-semibold text-white">
-                  Modelo de Eficiencia Ajustada por Ritmo (NBA)
-                </h3>
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <h3 className="text-base font-semibold text-white">
+                    Modelo de Eficiencia Ajustada por Ritmo (NBA)
+                  </h3>
+                  {renderDataQualityBadge(nbaPred.dataQuality, nbaPred.dataConfidence)}
+                </div>
+
                 <div className="space-y-3">
                   {[
                     { label: `Victoria ${match.homeTeam.name}`, val: nbaPred.probHomeWin, color: 'bg-blue-500' },
@@ -529,7 +668,7 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                       <div className="flex justify-between text-xs">
                         <span className="text-slate-300">{r.label}</span>
                         <span className="font-mono tabular-nums font-semibold text-white">
-                          {(r.val * 100).toFixed(1)}% · Cuota justa {(1 / r.val).toFixed(2)}
+                          {(r.val * 100).toFixed(1)}%
                         </span>
                       </div>
                       <div className="h-2.5 rounded-full bg-slate-800 overflow-hidden">
@@ -556,7 +695,12 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                   <div>
                     <span className="text-slate-400 block">Ritmo (posesiones)</span>
                     <span className="text-base font-bold font-mono tabular-nums text-blue-300">
-                      {nbaPred.expectedPace.toFixed(1)}
+                      {(() => {
+                        const p = nbaPred.expectedStats.find((s) => s.key === 'pace');
+                        return p && p.reliability !== 'unavailable' && p.pointEstimate !== null
+                          ? p.pointEstimate.toFixed(1)
+                          : 'N/D';
+                      })()}
                     </span>
                   </div>
                   <div>
@@ -566,12 +710,21 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                     </span>
                   </div>
                   <div>
-                    <span className="text-slate-400 block">Confianza de datos</span>
+                    <span className="text-slate-400 block">Cobertura de datos</span>
                     <span className="text-base font-bold font-mono tabular-nums text-slate-200">
                       {nbaPred.dataConfidence}%
                     </span>
                   </div>
+                  <div>
+                    <span className="text-slate-400 block">Calibración</span>
+                    <span className="text-xs font-semibold text-slate-200">
+                      {nbaPred.calibrationApplied ? 'Empírica activa' : 'Modelo base'}
+                    </span>
+                  </div>
                 </div>
+                {nbaPred.calibrationNote && (
+                  <p className="text-xs text-blue-300">{nbaPred.calibrationNote}</p>
+                )}
               </div>
 
               <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-3">
@@ -615,9 +768,9 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
                             </span>
                           </div>
                           <span className="font-mono tabular-nums text-blue-400">
-                            {(p.splits.season.points ?? 0).toFixed(1)} PTS ·{' '}
-                            {(p.splits.season.rebounds ?? 0).toFixed(1)} REB ·{' '}
-                            {(p.splits.season.assists ?? 0).toFixed(1)} AST
+                            {p.statsQuality === 'unavailable' || p.splits.season.points === undefined
+                              ? 'Stats ind. N/D'
+                              : `${p.splits.season.points.toFixed(1)} PTS · ${(p.splits.season.rebounds ?? 0).toFixed(1)} REB · ${(p.splits.season.assists ?? 0).toFixed(1)} AST`}
                           </span>
                         </button>
                       ))}
@@ -654,6 +807,74 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
             </div>
           )}
 
+          {narrative && (
+            <section className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-3">
+                <div>
+                  <h3 className="text-base font-semibold text-white">
+                    Por qué el modelo estima este escenario
+                  </h3>
+                  <p className="text-xs text-blue-300 mt-0.5">{narrative.headline}</p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTab('expected')}
+                  className="text-xs font-semibold text-blue-400 hover:text-blue-300 cursor-pointer"
+                >
+                  Ver «Qué se espera del partido» →
+                </button>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+                <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 p-3.5 space-y-2">
+                  <span className="font-semibold text-blue-300 block">
+                    Factores a favor de {match.homeTeam.shortName}
+                  </span>
+                  <p className="text-slate-400 font-mono text-[11px]">{narrative.homeStrengthsWeaknesses}</p>
+                  <ul className="space-y-1 text-slate-300">
+                    {narrative.homeFavoringFactors.map((f, i) => (
+                      <li key={i}>· {f}</li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 p-3.5 space-y-2">
+                  <span className="font-semibold text-sky-300 block">
+                    Factores a favor de {match.awayTeam.shortName}
+                  </span>
+                  <p className="text-slate-400 font-mono text-[11px]">{narrative.awayStrengthsWeaknesses}</p>
+                  <ul className="space-y-1 text-slate-300">
+                    {narrative.awayFavoringFactors.map((f, i) => (
+                      <li key={i}>· {f}</li>
+                    ))}
+                  </ul>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-xs">
+                <div className="space-y-1">
+                  <span className="font-semibold text-slate-200 block">Emparejamientos tácticos</span>
+                  {narrative.tacticalMatchups.map((t, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {t}</p>
+                  ))}
+                </div>
+                <div className="space-y-1">
+                  <span className="font-semibold text-slate-200 block">Impacto de bajas y dudas</span>
+                  {narrative.keyAbsencesImpact.map((b, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {b}</p>
+                  ))}
+                  <p className="text-slate-400 leading-relaxed pt-1">{narrative.h2hAssessment}</p>
+                </div>
+                <div className="space-y-1">
+                  <span className="font-semibold text-amber-300 block">Incertidumbres y límites</span>
+                  {narrative.uncertaintiesAndLimits.map((u, i) => (
+                    <p key={i} className="text-slate-400 leading-relaxed">· {u}</p>
+                  ))}
+                </div>
+              </div>
+            </section>
+          )}
+
           <AiExplanationBox
             title="Explicación Cuantitativa con IA"
             loading={aiLoading}
@@ -662,6 +883,199 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
             onTrigger={handleExplainAi}
             buttonLabel="Explicar predicción con IA"
           />
+        </div>
+      )}
+
+      {/* SECTION B: QUÉ SE ESPERA DEL PARTIDO */}
+      {tab === 'expected' && (
+        <div className="space-y-6">
+          <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h3 className="text-base font-semibold text-white">
+                Qué se espera del partido (Estimación puntual e intervalo 80%)
+              </h3>
+              {(footballPred || nbaPred) &&
+                renderDataQualityBadge(
+                  (footballPred?.dataQuality ?? nbaPred?.dataQuality)!,
+                  (footballPred?.dataConfidence ?? nbaPred?.dataConfidence)!
+                )}
+            </div>
+            <p className="text-xs text-slate-400">
+              Cada métrica diferencia si procede de estadísticas reales verificadas o de una estimación matemática derivada cuando el proveedor no publica ese dato específico.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {(footballPred?.expectedStats ?? nbaPred?.expectedStats ?? []).map((item) => {
+              const evalOu = evaluateMatchStatOverUnder(item, matchStatLines[item.key]);
+              const isUnavailable =
+                item.reliability === 'unavailable' || item.pointEstimate === null || !evalOu.available;
+
+              const setLineForMarket = (nextVal: number) => {
+                if (!evalOu.available) return;
+                const clamped = Math.max(
+                  evalOu.minLine,
+                  Math.min(evalOu.maxLine, +(Math.round(nextVal / evalOu.step) * evalOu.step).toFixed(2))
+                );
+                setMatchStatLines((prev) => ({ ...prev, [item.key]: clamped }));
+              };
+
+              return (
+                <div
+                  key={item.key}
+                  className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-3 flex flex-col justify-between"
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-start justify-between gap-2">
+                      <span className="text-xs font-medium text-slate-200">{item.label}</span>
+                      <span
+                        className={`px-2 py-0.5 rounded border text-[10px] font-semibold shrink-0 ${
+                          item.reliability === 'verified'
+                            ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+                            : item.reliability === 'estimated'
+                              ? 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+                              : 'border-rose-500/35 bg-rose-950/25 text-rose-300'
+                        }`}
+                      >
+                        {item.reliability === 'verified'
+                          ? 'Verificado'
+                          : item.reliability === 'estimated'
+                            ? 'Estimación'
+                            : 'No disponible'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-2xl font-bold font-mono tabular-nums text-white">
+                        {item.pointEstimate !== null ? item.pointEstimate : 'N/D'}
+                        {item.pointEstimate !== null && item.unit ? (
+                          <span className="text-xs font-normal text-slate-400 ml-1">{item.unit}</span>
+                        ) : null}
+                      </span>
+                      {item.intervalLow !== null && item.intervalHigh !== null && (
+                        <span className="text-xs font-mono tabular-nums text-blue-300">
+                          80%: [{item.intervalLow} – {item.intervalHigh}]
+                        </span>
+                      )}
+                    </div>
+
+                    {item.note && <p className="text-[11px] text-slate-400">{item.note}</p>}
+                  </div>
+
+                  {isUnavailable ? (
+                    <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
+                      Sin datos base suficientes para simular líneas Over / Under en este mercado.
+                    </div>
+                  ) : (
+                    <div className="pt-3 border-t border-slate-800/80 space-y-2.5">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 text-[11px] text-slate-300">
+                          <SlidersHorizontal className="w-3.5 h-3.5 text-blue-400" />
+                          <span>Línea:</span>
+                          <span className="font-mono tabular-nums font-bold text-white text-sm">
+                            {evalOu.line.toFixed(evalOu.step >= 1 ? 1 : 1)}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => setLineForMarket(evalOu.line - evalOu.step)}
+                            aria-label={`Reducir línea de ${item.label}`}
+                            className="w-8 h-8 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                          >
+                            <Minus className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setLineForMarket(evalOu.line + evalOu.step)}
+                            aria-label={`Aumentar línea de ${item.label}`}
+                            className="w-8 h-8 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                          >
+                            <Plus className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+
+                      <input
+                        type="range"
+                        min={evalOu.minLine}
+                        max={evalOu.maxLine}
+                        step={evalOu.step}
+                        value={evalOu.line}
+                        onChange={(e) => setLineForMarket(parseFloat(e.target.value))}
+                        aria-label={`Deslizador Over/Under para ${item.label}`}
+                        className="analytics-slider"
+                      />
+
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="font-semibold text-emerald-400 font-mono tabular-nums">
+                            Supera (&gt; {evalOu.line}): {evalOu.probOver.toFixed(1)}%
+                          </span>
+                          <span className="font-semibold text-slate-300 font-mono tabular-nums">
+                            Debajo: {evalOu.probUnder.toFixed(1)}%
+                          </span>
+                        </div>
+                        <div className="h-2.5 w-full rounded-full overflow-hidden bg-slate-800 flex">
+                          <div
+                            style={{ width: `${evalOu.probOver}%` }}
+                            className="bg-emerald-500 transition-all duration-150"
+                          />
+                          <div
+                            style={{ width: `${evalOu.probUnder}%` }}
+                            className="bg-slate-600 transition-all duration-150"
+                          />
+                        </div>
+                        <p className="text-[10px] text-slate-500">
+                          Estimación de probabilidad del modelo (
+                          {item.distributionSpec?.kind === 'poisson'
+                            ? 'Poisson'
+                            : item.distributionSpec?.kind === 'negbin'
+                              ? 'Binomial Negativa'
+                              : 'Normal'}
+                          )
+                        </p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
+          {match.sport === 'football' && footballPred && (
+            <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
+              <div>
+                <span className="text-slate-400 block">Ambos marcan (BTTS Sí)</span>
+                <span className="text-lg font-bold font-mono tabular-nums text-emerald-400">
+                  {(footballPred.bttsYes * 100).toFixed(1)}%
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Over 1.5 / 2.5 / 3.5 goles</span>
+                <span className="text-sm font-bold font-mono tabular-nums text-white">
+                  {(footballPred.over15 * 100).toFixed(0)}% / {(footballPred.over25 * 100).toFixed(0)}% /{' '}
+                  {(footballPred.over35 * 100).toFixed(0)}%
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Marcador más probable</span>
+                <span className="text-lg font-bold font-mono tabular-nums text-blue-300">
+                  {footballPred.exactScores[0]
+                    ? `${footballPred.exactScores[0].home}-${footballPred.exactScores[0].away} (${(footballPred.exactScores[0].probability * 100).toFixed(1)}%)`
+                    : '-'}
+                </span>
+              </div>
+              <div>
+                <span className="text-slate-400 block">Tarjetas ({match.homeTeam.shortName} / {match.awayTeam.shortName})</span>
+                <span className="text-sm font-bold font-mono tabular-nums text-white">
+                  {footballPred.expectedStats.find((s) => s.key === 'yellow_cards')?.reliability === 'unavailable'
+                    ? 'N/D'
+                    : `${footballPred.expectedCardsHome.toFixed(1)} / ${footballPred.expectedCardsAway.toFixed(1)}`}
+                </span>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -811,16 +1225,55 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
               </div>
             ))}
           </div>
+          {match.sport === 'nba' && (
+            <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-3 text-xs">
+              <h4 className="text-sm font-semibold text-white">
+                Eficiencia avanzada NBA (ORtg, DRtg, Pace) y duelos tácticos
+              </h4>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {[match.homeTeam, match.awayTeam].map((tm) => (
+                  <div key={tm.id} className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 space-y-1.5">
+                    <span className="font-semibold text-slate-100 block">{tm.name}</span>
+                    <div className="grid grid-cols-3 gap-2 font-mono tabular-nums">
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">ORtg</span>
+                        <span className="text-blue-300 font-bold">{tm.offRating ? tm.offRating.toFixed(1) : 'N/D'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">DRtg</span>
+                        <span className="text-sky-300 font-bold">{tm.defRating ? tm.defRating.toFixed(1) : 'N/D'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[10px]">Pace</span>
+                        <span className="text-white font-bold">{tm.pace ? tm.pace.toFixed(1) : 'N/D'}</span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {narrative && narrative.tacticalMatchups.length > 0 && (
+                <div className="space-y-1 pt-1 text-slate-300">
+                  {narrative.tacticalMatchups.map((line, i) => (
+                    <p key={i}>· {line}</p>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
         </div>
       )}
 
-      {/* SECTION C: JUGADORES Y ALINEACIONES */}
+      {/* SECTION D: JUGADORES Y ALINEACIONES */}
       {tab === 'tactical' &&
         (match.sport === 'football' ? (
           <TacticalPitch
             match={match}
             homePlayers={effectiveHomePlayers}
             awayPlayers={effectiveAwayPlayers}
+            refreshingLineups={refreshingFootballLineups}
+            onRefreshFootballLineups={
+              onRefreshFootballLineups ? () => void onRefreshFootballLineups(match) : undefined
+            }
             onSelectPlayer={(p) => onSelectPlayer(p, match)}
             onToggleAvailability={onToggleAvailability}
           />
@@ -836,12 +1289,20 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
           />
         ))}
 
-      {/* SECTION D: HISTORIAL H2H */}
+      {/* SECTION E: HISTORIAL H2H */}
       {tab === 'h2h' && (
         <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-5 space-y-4">
           <h3 className="text-base font-semibold text-white">
             Enfrentamientos directos (H2H) y balance histórico
           </h3>
+          {match.h2hSummary.played < 4 && (
+            <div className="rounded-lg border border-amber-500/30 bg-amber-950/20 px-3.5 py-2.5 text-xs text-amber-200 flex items-start gap-2">
+              <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+              <span>
+                Muestra H2H reducida ({match.h2hSummary.played} duelo{match.h2hSummary.played === 1 ? '' : 's'}). Con menos de 4 enfrentamientos directos recientes el modelo restringe su peso para no sobreinterpretar rachas puntuales.
+              </span>
+            </div>
+          )}
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-xs">
             <div>
               <span className="text-slate-400 block">Partidos H2H</span>
@@ -891,74 +1352,10 @@ export const MatchDetailView: React.FC<MatchDetailViewProps> = ({
         </div>
       )}
 
-      {/* SECTION E: CUOTAS Y VALOR */}
+      {/* SECTION F: CUOTAS DE REFERENCIA Y PROBABILIDADES */}
       {tab === 'odds' && (
-        <div className="rounded-xl border border-slate-800 bg-[#0D1526] overflow-hidden">
-          <div className="px-5 py-4 border-b border-slate-800">
-            <h3 className="text-base font-semibold text-white">
-              Comparativa de cuotas disponibles vs modelo
-            </h3>
-            <p className="text-xs text-slate-400 mt-0.5">
-              Probabilidad implícita ajustada sin margen de la casa (de-vigging proporcional). Comparación matemática sujeta a incertidumbre.
-            </p>
-          </div>
-          {oddsItems.length === 0 ? (
-            <div className="p-6 text-center text-xs text-slate-400">
-              No se han podido obtener cuotas publicadas actualmente para este partido.
-            </div>
-          ) : (
-            <div className="divide-y divide-slate-800/80">
-              {oddsItems.map((item) => (
-                <div
-                  key={item.id}
-                  className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                >
-                  <div className="space-y-1">
-                    <div className="font-semibold text-slate-100">
-                      {item.selectionLabel}{' '}
-                      <span className="text-slate-400 font-normal">· {item.marketLabel}</span>
-                    </div>
-                    <div className="text-slate-400">
-                      {item.bookmaker} · Margen {item.bookmakerMarginPct.toFixed(1)}% ·{' '}
-                      {item.mainReason}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-5 font-mono tabular-nums shrink-0">
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Cuota</span>
-                      <span className="text-sm font-bold text-white">
-                        {item.availableOdds.toFixed(2)}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Modelo / Impl.</span>
-                      <span className="text-sm font-semibold text-blue-300">
-                        {(item.modelProbability * 100).toFixed(1)}% vs{' '}
-                        {(item.fairImpliedProbability * 100).toFixed(1)}%
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-slate-400 block text-[11px]">Diferencia</span>
-                      <span
-                        className={`text-sm font-bold ${
-                          item.edgePct > 2
-                            ? 'text-emerald-400'
-                            : item.edgePct < -2
-                              ? 'text-rose-400'
-                              : 'text-slate-300'
-                        }`}
-                      >
-                        {item.edgePct > 0 ? `+${item.edgePct.toFixed(1)}%` : `${item.edgePct.toFixed(1)}%`}
-                      </span>
-                    </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
-        </div>
+        <OddsProbabilityPanel match={match} footballPred={footballPred} nbaPred={nbaPred} />
       )}
     </div>
   );
 };
-

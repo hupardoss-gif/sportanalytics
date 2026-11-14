@@ -6,6 +6,7 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, Type } from '@google/genai';
 import type {
   ApiConfigState,
+  LiveFeedSourceStatus,
   LoggedPrediction,
   MatchRecord,
   StandingEntry,
@@ -15,11 +16,14 @@ import {
   fetchFootballCalendarAndStandings,
   fetchNbaCalendarAndStandings,
   hydrateLiveMatchDetails,
+  mergeHydratedMatchDetails,
+  mergeMatchesAcrossSources,
+  mergeStandingsAcrossSources,
+  type MultiSourceMatchBatch,
 } from './server/liveAdapters.ts';
 import {
   fetchEspnNbaCalendarAndStandings,
-  fetchTheOddsApiForSport,
-  mergeRealOddsIntoMatches,
+  fetchEspnSoccerEnrichment,
   teamsMatch,
 } from './server/espnAdapters.ts';
 import {
@@ -27,8 +31,23 @@ import {
   fetchNbaExternalNews,
   fetchOfficialNbaInjuriesFeed,
   normalizeNbaName,
+  parseValidPublishedAt,
   queryGeminiNbaSearchGrounding,
 } from './server/nbaIntelligence.ts';
+import {
+  buildProbableFootballLineups,
+  resolveEspnSoccerIdsForMatch,
+} from './server/footballIntelligence.ts';
+import { evaluateFeedStaleness } from './server/dataHealth.ts';
+import {
+  createRequireConfigAdmin,
+  decryptVaultSecret,
+  encryptVaultSecret,
+  isConfigRequestAuthorized,
+  registerConfigAuthRoutes,
+} from './server/configSecurity.ts';
+import { fetchWithTimeout, writeFileAtomic } from './server/httpUtils.ts';
+import { fetchMatchOdds } from './server/oddsAdapters.ts';
 
 dotenv.config();
 
@@ -38,6 +57,7 @@ let liveCache: {
     matches: MatchRecord[];
     standings: StandingEntry[];
     errors: string[];
+    sources: LiveFeedSourceStatus[];
     fetchedAt: string;
   };
 } | null = null;
@@ -46,47 +66,147 @@ const PORT = 3000;
 const VAULT_PATH = path.resolve(process.cwd(), '.sportanalytics-vault.json');
 const HISTORY_PATH = path.resolve(process.cwd(), '.sportanalytics-history.json');
 
+const FOOTBALL_PROVIDER_IDS = ['football-data', 'api-football', 'espn-football'] as const;
+const NBA_PROVIDER_IDS = ['basketballapi-net', 'espn-nba', 'api-basketball', 'api-nba', 'balldontlie'] as const;
+
+const PROVIDER_DISPLAY_NAMES: Record<string, string> = {
+  'football-data': 'Football-Data.org v4',
+  'api-football': 'API-Football',
+  'espn-football': 'ESPN Fútbol Oficial',
+  'basketballapi-net': 'BasketballAPI.net v1',
+  'espn-nba': 'ESPN NBA Oficial',
+  'api-basketball': 'API-Basketball v1',
+  'api-nba': 'API-NBA v2',
+  'balldontlie': 'BallDontLie NBA',
+};
+
 interface StoredSportConfig {
   provider: string;
   apiKey: string;
   connected: boolean;
+  enabled?: boolean;
   lastChecked: string | null;
   accountInfo: string | null;
   error: string | null;
 }
 
+interface StoredNbaConfig extends StoredSportConfig {
+  reuseFootballKey?: boolean;
+}
+
 interface StoredVault {
+  adminPinHash?: string;
   football: StoredSportConfig;
   nba: StoredSportConfig & { reuseFootballKey: boolean };
-  odds: StoredSportConfig;
+  footballProviders?: Record<string, StoredSportConfig>;
+  nbaProviders?: Record<string, StoredNbaConfig>;
 }
+
+const DEFAULT_FOOTBALL_PROVIDERS: Record<string, StoredSportConfig> = {
+  'football-data': {
+    provider: 'football-data',
+    apiKey: '',
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'api-football': {
+    provider: 'api-football',
+    apiKey: '',
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'espn-football': {
+    provider: 'espn-football',
+    apiKey: '',
+    connected: true,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: 'ESPN Soccer Oficial · Ligas europeas y UEFA (verificación simultánea sin clave)',
+    error: null,
+  },
+};
+
+const DEFAULT_NBA_PROVIDERS: Record<string, StoredNbaConfig> = {
+  'basketballapi-net': {
+    provider: 'basketballapi-net',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'espn-nba': {
+    provider: 'espn-nba',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: true,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: 'ESPN NBA Oficial · Calendario, lesiones, game logs y clasificaciones (verificación simultánea sin clave)',
+    error: null,
+  },
+  'api-basketball': {
+    provider: 'api-basketball',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'api-nba': {
+    provider: 'api-nba',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+  'balldontlie': {
+    provider: 'balldontlie',
+    apiKey: '',
+    reuseFootballKey: false,
+    connected: false,
+    enabled: true,
+    lastChecked: null,
+    accountInfo: null,
+    error: null,
+  },
+};
 
 const DEFAULT_VAULT: StoredVault = {
   football: {
     provider: 'football-data',
     apiKey: '',
     connected: false,
+    enabled: true,
     lastChecked: null,
     accountInfo: null,
     error: null,
   },
   nba: {
-    provider: 'espn-nba',
+    provider: 'basketballapi-net',
     apiKey: '',
     reuseFootballKey: false,
     connected: false,
+    enabled: true,
     lastChecked: null,
     accountInfo: null,
     error: null,
   },
-  odds: {
-    provider: 'the-odds-api',
-    apiKey: '',
-    connected: false,
-    lastChecked: null,
-    accountInfo: null,
-    error: null,
-  },
+  footballProviders: structuredClone(DEFAULT_FOOTBALL_PROVIDERS),
+  nbaProviders: structuredClone(DEFAULT_NBA_PROVIDERS),
 };
 
 function maskKey(key: string): string | null {
@@ -94,14 +214,151 @@ function maskKey(key: string): string | null {
   return `••••••••${key.slice(-4)}`;
 }
 
+function getEffectiveNbaKey(vault: StoredVault, providerId: string): string {
+  const entry = vault.nbaProviders?.[providerId];
+  const reuse = entry?.reuseFootballKey ?? (vault.nba.provider === providerId ? vault.nba.reuseFootballKey : false);
+  if (reuse) {
+    return (
+      vault.footballProviders?.['api-football']?.apiKey ||
+      vault.football.apiKey ||
+      ''
+    );
+  }
+  return entry?.apiKey || (vault.nba.provider === providerId ? vault.nba.apiKey : '') || '';
+}
+
+function getActiveFootballProviders(vault: StoredVault): Array<{ provider: string; apiKey: string; label: string }> {
+  const providers = vault.footballProviders ?? {};
+  const orderedIds = ['football-data', 'api-football', 'espn-football'];
+  const active: Array<{ provider: string; apiKey: string; label: string }> = [];
+  for (const pid of orderedIds) {
+    const cfg = providers[pid];
+    if (!cfg || cfg.enabled === false) continue;
+    const isZeroKey = pid === 'espn-football';
+    if (isZeroKey || Boolean(cfg.apiKey.trim())) {
+      active.push({
+        provider: pid,
+        apiKey: isZeroKey ? '' : cfg.apiKey.trim(),
+        label: PROVIDER_DISPLAY_NAMES[pid] ?? pid,
+      });
+    }
+  }
+  return active;
+}
+
+function getActiveNbaProviders(vault: StoredVault): Array<{ provider: string; apiKey: string; label: string }> {
+  const providers = vault.nbaProviders ?? {};
+  const orderedIds = ['basketballapi-net', 'api-basketball', 'api-nba', 'balldontlie', 'espn-nba'];
+  const active: Array<{ provider: string; apiKey: string; label: string }> = [];
+  for (const pid of orderedIds) {
+    const cfg = providers[pid];
+    if (!cfg || cfg.enabled === false) continue;
+    const isZeroKey = pid === 'espn-nba';
+    const effKey = isZeroKey ? '' : getEffectiveNbaKey(vault, pid).trim();
+    if (isZeroKey || Boolean(effKey)) {
+      active.push({
+        provider: pid,
+        apiKey: effKey,
+        label: PROVIDER_DISPLAY_NAMES[pid] ?? pid,
+      });
+    }
+  }
+  return active;
+}
+
 async function readVault(): Promise<StoredVault> {
   try {
     const raw = await fs.readFile(VAULT_PATH, 'utf8');
     const parsed = JSON.parse(raw) as Partial<StoredVault>;
+    const legacyFbKey = await decryptVaultSecret(parsed.football?.apiKey ?? '');
+    const legacyNbaKey = await decryptVaultSecret(parsed.nba?.apiKey ?? '');
+
+    const footballProviders: Record<string, StoredSportConfig> = structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+    for (const pid of FOOTBALL_PROVIDER_IDS) {
+      const existing = parsed.footballProviders?.[pid];
+      if (existing) {
+        footballProviders[pid] = {
+          ...footballProviders[pid],
+          ...existing,
+          provider: pid,
+          apiKey: await decryptVaultSecret(existing.apiKey ?? ''),
+          enabled: existing.enabled !== false,
+        };
+      }
+    }
+    // Preserve legacy single-provider football entry transparently
+    if (parsed.football?.provider && FOOTBALL_PROVIDER_IDS.includes(parsed.football.provider as (typeof FOOTBALL_PROVIDER_IDS)[number])) {
+      const lPid = parsed.football.provider;
+      const prev = footballProviders[lPid];
+      if (!prev?.apiKey && legacyFbKey) {
+        footballProviders[lPid] = {
+          ...prev,
+          ...parsed.football,
+          provider: lPid,
+          apiKey: legacyFbKey,
+          enabled: true,
+        };
+      } else if (!parsed.footballProviders?.[lPid] && parsed.football.connected) {
+        footballProviders[lPid] = {
+          ...prev,
+          ...parsed.football,
+          provider: lPid,
+          apiKey: legacyFbKey || prev.apiKey,
+          enabled: true,
+        };
+      }
+    }
+
+    const nbaProviders: Record<string, StoredNbaConfig> = structuredClone(DEFAULT_NBA_PROVIDERS);
+    for (const pid of NBA_PROVIDER_IDS) {
+      const existing = parsed.nbaProviders?.[pid];
+      if (existing) {
+        nbaProviders[pid] = {
+          ...nbaProviders[pid],
+          ...existing,
+          provider: pid,
+          apiKey: await decryptVaultSecret(existing.apiKey ?? ''),
+          enabled: existing.enabled !== false,
+        };
+      }
+    }
+    // Preserve legacy single-provider NBA entry transparently (e.g. basketballapi-net key)
+    if (parsed.nba?.provider && NBA_PROVIDER_IDS.includes(parsed.nba.provider as (typeof NBA_PROVIDER_IDS)[number])) {
+      const lPid = parsed.nba.provider;
+      const prev = nbaProviders[lPid];
+      if (!prev?.apiKey && (legacyNbaKey || parsed.nba.reuseFootballKey)) {
+        nbaProviders[lPid] = {
+          ...prev,
+          ...parsed.nba,
+          provider: lPid,
+          apiKey: legacyNbaKey,
+          enabled: true,
+        };
+      } else if (!parsed.nbaProviders?.[lPid] && (parsed.nba.connected || parsed.nba.error)) {
+        nbaProviders[lPid] = {
+          ...prev,
+          ...parsed.nba,
+          provider: lPid,
+          apiKey: legacyNbaKey || prev.apiKey,
+          enabled: true,
+        };
+      }
+    }
+
     return {
-      football: { ...DEFAULT_VAULT.football, ...(parsed.football ?? {}) },
-      nba: { ...DEFAULT_VAULT.nba, ...(parsed.nba ?? {}) },
-      odds: { ...DEFAULT_VAULT.odds, ...(parsed.odds ?? {}) },
+      adminPinHash: typeof parsed.adminPinHash === 'string' ? parsed.adminPinHash : undefined,
+      football: {
+        ...DEFAULT_VAULT.football,
+        ...(parsed.football ?? {}),
+        apiKey: legacyFbKey || footballProviders[parsed.football?.provider ?? 'football-data']?.apiKey || '',
+      },
+      nba: {
+        ...DEFAULT_VAULT.nba,
+        ...(parsed.nba ?? {}),
+        apiKey: legacyNbaKey || nbaProviders[parsed.nba?.provider ?? 'basketballapi-net']?.apiKey || '',
+      },
+      footballProviders,
+      nbaProviders,
     };
   } catch {
     return structuredClone(DEFAULT_VAULT);
@@ -109,78 +366,158 @@ async function readVault(): Promise<StoredVault> {
 }
 
 async function writeVault(vault: StoredVault): Promise<void> {
-  await fs.writeFile(VAULT_PATH, JSON.stringify(vault, null, 2), 'utf8');
+  const encFootballProviders: Record<string, StoredSportConfig> = {};
+  for (const [pid, cfg] of Object.entries(vault.footballProviders ?? {})) {
+    encFootballProviders[pid] = {
+      ...cfg,
+      apiKey: await encryptVaultSecret(cfg.apiKey ?? ''),
+    };
+  }
+  const encNbaProviders: Record<string, StoredNbaConfig> = {};
+  for (const [pid, cfg] of Object.entries(vault.nbaProviders ?? {})) {
+    encNbaProviders[pid] = {
+      ...cfg,
+      apiKey: await encryptVaultSecret(cfg.apiKey ?? ''),
+    };
+  }
+
+  const encryptedPayload: StoredVault = {
+    adminPinHash: vault.adminPinHash,
+    football: {
+      ...vault.football,
+      apiKey: await encryptVaultSecret(vault.football.apiKey),
+    },
+    nba: {
+      ...vault.nba,
+      apiKey: await encryptVaultSecret(vault.nba.apiKey),
+    },
+    footballProviders: encFootballProviders,
+    nbaProviders: encNbaProviders,
+  };
+  await writeFileAtomic(VAULT_PATH, JSON.stringify(encryptedPayload, null, 2), 0o600);
 }
 
-function toPublicConfig(vault: StoredVault): ApiConfigState {
-  const effectiveNbaKey = vault.nba.reuseFootballKey
-    ? vault.football.apiKey
-    : vault.nba.apiKey;
-  const fbZeroKey = vault.football.provider === 'espn-football';
-  const nbaZeroKey = vault.nba.provider === 'espn-nba';
+async function toPublicConfig(vault: StoredVault, req?: express.Request): Promise<ApiConfigState> {
+  const unlocked = req ? await isConfigRequestAuthorized(req, vault) : false;
+
+  const fbMap: ApiConfigState['footballProviders'] = {};
+  for (const pid of FOOTBALL_PROVIDER_IDS) {
+    const cfg = vault.footballProviders?.[pid] ?? DEFAULT_FOOTBALL_PROVIDERS[pid];
+    const isZeroKey = pid === 'espn-football';
+    const hasCreds = isZeroKey || Boolean(cfg.apiKey.trim());
+    fbMap[pid] = {
+      connected: cfg.enabled !== false && cfg.connected && hasCreds,
+      enabled: cfg.enabled !== false,
+      provider: pid,
+      role: isZeroKey ? 'verification' : 'primary',
+      maskedKey: isZeroKey ? null : maskKey(cfg.apiKey),
+      lastChecked: cfg.lastChecked,
+      accountInfo: cfg.accountInfo,
+      error: cfg.error,
+    };
+  }
+
+  const nbaMap: ApiConfigState['nbaProviders'] = {};
+  for (const pid of NBA_PROVIDER_IDS) {
+    const cfg = vault.nbaProviders?.[pid] ?? DEFAULT_NBA_PROVIDERS[pid];
+    const isZeroKey = pid === 'espn-nba';
+    const effKey = isZeroKey ? '' : getEffectiveNbaKey(vault, pid);
+    const hasCreds = isZeroKey || Boolean(effKey.trim());
+    nbaMap[pid] = {
+      connected: cfg.enabled !== false && cfg.connected && hasCreds,
+      enabled: cfg.enabled !== false,
+      provider: pid,
+      role: isZeroKey ? 'verification' : 'primary',
+      maskedKey: isZeroKey ? null : maskKey(effKey),
+      reuseFootballKey: Boolean(cfg.reuseFootballKey),
+      lastChecked: cfg.lastChecked,
+      accountInfo: cfg.accountInfo,
+      error: cfg.error,
+    };
+  }
+
+  const fbSummaryTarget =
+    fbMap[vault.football.provider]?.connected
+      ? fbMap[vault.football.provider]
+      : Object.values(fbMap).find((p) => p.connected && p.role === 'primary') ??
+        Object.values(fbMap).find((p) => p.connected) ??
+        fbMap[vault.football.provider] ??
+        fbMap['football-data'];
+
+  const nbaSummaryTarget =
+    nbaMap[vault.nba.provider]?.connected
+      ? nbaMap[vault.nba.provider]
+      : Object.values(nbaMap).find((p) => p.connected && p.role === 'primary') ??
+        Object.values(nbaMap).find((p) => p.connected) ??
+        nbaMap[vault.nba.provider] ??
+        nbaMap['basketballapi-net'];
+
+  const activeFbNames = Object.values(fbMap)
+    .filter((p) => p.connected)
+    .map((p) => PROVIDER_DISPLAY_NAMES[p.provider] ?? p.provider);
+  const activeNbaNames = Object.values(nbaMap)
+    .filter((p) => p.connected)
+    .map((p) => PROVIDER_DISPLAY_NAMES[p.provider] ?? p.provider);
 
   return {
     football: {
-      connected: vault.football.connected && (fbZeroKey || Boolean(vault.football.apiKey)),
-      provider: vault.football.provider,
-      maskedKey: fbZeroKey ? null : maskKey(vault.football.apiKey),
-      lastChecked: vault.football.lastChecked,
-      accountInfo: vault.football.accountInfo,
-      error: vault.football.error,
+      ...fbSummaryTarget,
+      accountInfo:
+        activeFbNames.length > 1
+          ? `Conectadas simultáneamente (${activeFbNames.length}): ${activeFbNames.join(' + ')}`
+          : fbSummaryTarget.accountInfo,
     },
     nba: {
-      connected: vault.nba.connected && (nbaZeroKey || Boolean(effectiveNbaKey)),
-      provider: vault.nba.provider,
-      maskedKey: nbaZeroKey ? null : maskKey(effectiveNbaKey),
-      reuseFootballKey: vault.nba.reuseFootballKey,
-      lastChecked: vault.nba.lastChecked,
-      accountInfo: vault.nba.accountInfo,
-      error: vault.nba.error,
+      ...nbaSummaryTarget,
+      accountInfo:
+        activeNbaNames.length > 1
+          ? `Conectadas simultáneamente (${activeNbaNames.length}): ${activeNbaNames.join(' + ')}`
+          : nbaSummaryTarget.accountInfo,
     },
-    odds: {
-      connected: vault.odds.connected && Boolean(vault.odds.apiKey),
-      provider: vault.odds.provider,
-      maskedKey: maskKey(vault.odds.apiKey),
-      lastChecked: vault.odds.lastChecked,
-      accountInfo: vault.odds.accountInfo,
-      error: vault.odds.error,
+    footballProviders: fbMap,
+    nbaProviders: nbaMap,
+    security: {
+      pinConfigured: Boolean(vault.adminPinHash),
+      unlocked,
+      envProtected: Boolean(process.env.CONFIG_ADMIN_KEY?.trim()),
     },
   };
 }
 
 async function testProviderConnection(
-  sport: 'football' | 'nba' | 'odds',
+  sport: 'football' | 'nba',
   provider: string,
   apiKey: string
 ): Promise<{ ok: boolean; accountInfo: string | null; error: string | null }> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 9000);
-
   try {
     if (provider === 'espn-football') {
-      const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard', {
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://site.api.espn.com/apis/site/v2/sports/soccer/esp.1/scoreboard',
+        undefined,
+        9000
+      );
       if (!res.ok) {
         return { ok: false, accountInfo: null, error: `ESPN Soccer devolvió HTTP ${res.status}` };
       }
       return {
         ok: true,
-        accountInfo: 'ESPN Soccer Oficial + DraftKings · 8 competiciones (incl. Europa y Conference League)',
+        accountInfo: 'ESPN Soccer Oficial · Ligas europeas y competiciones UEFA (calendario y clasificaciones)',
         error: null,
       };
     }
 
     if (provider === 'espn-nba') {
-      const res = await fetch('https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard', {
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard',
+        undefined,
+        9000
+      );
       if (!res.ok) {
         return { ok: false, accountInfo: null, error: `ESPN NBA devolvió HTTP ${res.status}` };
       }
       return {
         ok: true,
-        accountInfo: 'ESPN NBA Oficial + Cuotas DraftKings · Calendario, lesiones, clasificaciones y game logs',
+        accountInfo: 'ESPN NBA Oficial · Calendario, lesiones oficiales, clasificaciones y game logs',
         error: null,
       };
     }
@@ -188,11 +525,13 @@ async function testProviderConnection(
     if (!apiKey.trim()) {
       return { ok: false, accountInfo: null, error: 'Introduce una clave API válida antes de comprobar.' };
     }
+
     if (provider === 'api-football' || (sport === 'football' && provider === 'api-sports')) {
-      const res = await fetch('https://v3.football.api-sports.io/status', {
-        headers: { 'x-apisports-key': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://v3.football.api-sports.io/status',
+        { headers: { 'x-apisports-key': apiKey.trim() } },
+        9000
+      );
       const json = (await res.json().catch(() => ({}))) as {
         errors?: Record<string, string> | string[];
         response?: { account?: { email?: string }; subscription?: { plan?: string; active?: boolean }; requests?: { current?: number; limit_day?: number } };
@@ -214,10 +553,11 @@ async function testProviderConnection(
     }
 
     if (provider === 'football-data') {
-      const res = await fetch('https://api.football-data.org/v4/competitions', {
-        headers: { 'X-Auth-Token': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://api.football-data.org/v4/competitions',
+        { headers: { 'X-Auth-Token': apiKey.trim() } },
+        9000
+      );
       if (!res.ok) {
         return {
           ok: false,
@@ -238,10 +578,11 @@ async function testProviderConnection(
         provider === 'api-nba'
           ? 'https://v2.nba.api-sports.io/status'
           : 'https://v1.basketball.api-sports.io/status';
-      const res = await fetch(url, {
-        headers: { 'x-apisports-key': apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        url,
+        { headers: { 'x-apisports-key': apiKey.trim() } },
+        9000
+      );
       const json = (await res.json().catch(() => ({}))) as {
         errors?: Record<string, string> | string[];
         response?: { subscription?: { plan?: string }; requests?: { current?: number; limit_day?: number } };
@@ -270,10 +611,11 @@ async function testProviderConnection(
       const token = apiKey.trim().replace(/^Bearer\s+/i, '');
       const headers = { Authorization: `Bearer ${token}` };
 
-      const compRes = await fetch('https://api.basketballapi.net/v1/competitions', {
-        headers,
-        signal: controller.signal,
-      });
+      const compRes = await fetchWithTimeout(
+        'https://api.basketballapi.net/v1/competitions',
+        { headers },
+        9000
+      );
 
       if (compRes.status === 401) {
         return {
@@ -297,32 +639,49 @@ async function testProviderConnection(
         };
       }
 
-      // Fallback check on /v1/results/yesterday (included in Free tier)
-      const yestRes = await fetch('https://api.basketballapi.net/v1/results/yesterday', {
-        headers,
-        signal: controller.signal,
-      });
+      const yestRes = await fetchWithTimeout(
+        'https://api.basketballapi.net/v1/results/yesterday',
+        { headers },
+        9000
+      );
       if (yestRes.ok) {
         return {
           ok: true,
-          accountInfo: 'BasketballAPI.net v1 · Plan Free conectado (resultados de hoy y ayer)',
+          accountInfo:
+            'BasketballAPI.net v1 · Plan Free conectado (partidos/resultados de hoy y ayer; combinado simultáneamente con ESPN NBA)',
           error: null,
         };
       }
 
-      const errBody = await yestRes.text().catch(() => '');
+      const todayStr = new Date().toISOString().slice(0, 10);
+      const todayRes = await fetchWithTimeout(
+        `https://api.basketballapi.net/v1/games?date=${todayStr}`,
+        { headers },
+        9000
+      );
+      if (todayRes.ok) {
+        return {
+          ok: true,
+          accountInfo:
+            'BasketballAPI.net v1 · Conectado al calendario diario (combinado simultáneamente con ESPN NBA)',
+          error: null,
+        };
+      }
+
+      const errBody = await todayRes.text().catch(() => '') || await yestRes.text().catch(() => '');
       return {
         ok: false,
         accountInfo: null,
-        error: `BasketballAPI.net devolvió HTTP ${yestRes.status}. ${errBody ? errBody.slice(0, 140) : 'Verifica tu clave API.'}`,
+        error: `BasketballAPI.net devolvió HTTP ${todayRes.status || yestRes.status}. ${errBody ? errBody.slice(0, 140) : 'Verifica tu plan o clave API.'}`,
       };
     }
 
     if (provider === 'balldontlie') {
-      const res = await fetch('https://api.balldontlie.io/v1/teams', {
-        headers: { Authorization: apiKey.trim() },
-        signal: controller.signal,
-      });
+      const res = await fetchWithTimeout(
+        'https://api.balldontlie.io/v1/teams',
+        { headers: { Authorization: apiKey.trim() } },
+        9000
+      );
       if (!res.ok) {
         return {
           ok: false,
@@ -333,303 +692,468 @@ async function testProviderConnection(
       return { ok: true, accountInfo: 'BallDontLie NBA v1 · Conexión verificada', error: null };
     }
 
-    if (provider === 'the-odds-api') {
-      const res = await fetch(
-        `https://api.the-odds-api.com/v4/sports/?apiKey=${encodeURIComponent(apiKey.trim())}`,
-        { signal: controller.signal }
-      );
-      if (!res.ok) {
-        return {
-          ok: false,
-          accountInfo: null,
-          error: `The Odds API devolvió HTTP ${res.status}. Verifica tu API key.`,
-        };
-      }
-      const remaining = res.headers.get('x-requests-remaining');
-      return {
-        ok: true,
-        accountInfo: `The Odds API v4 · Cuotas en vivo${remaining ? ` · ${remaining} créditos restantes` : ''}`,
-        error: null,
-      };
-    }
-
     return { ok: false, accountInfo: null, error: `Proveedor no reconocido: ${provider}` };
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Error de red desconocido';
     return { ok: false, accountInfo: null, error: `No se pudo contactar con el proveedor: ${message}` };
-  } finally {
-    clearTimeout(timeout);
   }
 }
 
+function sanitizeHistoryList(rawList: unknown[]): LoggedPrediction[] {
+  return rawList
+    .filter((x): x is Record<string, unknown> => Boolean(x && typeof x === 'object'))
+    .map((x) => {
+      const copy = { ...x };
+      delete copy.bookmakerOdds;
+      return copy as unknown as LoggedPrediction;
+    });
+}
 
 async function readHistory(): Promise<LoggedPrediction[]> {
   try {
     const raw = await fs.readFile(HISTORY_PATH, 'utf8');
-    return JSON.parse(raw) as LoggedPrediction[];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return sanitizeHistoryList(parsed);
   } catch {
-    await fs.writeFile(HISTORY_PATH, JSON.stringify(INITIAL_PREDICTION_HISTORY, null, 2), 'utf8');
+    await writeFileAtomic(HISTORY_PATH, JSON.stringify(INITIAL_PREDICTION_HISTORY, null, 2), 0o600);
     return INITIAL_PREDICTION_HISTORY;
   }
 }
 
 async function writeHistory(items: LoggedPrediction[]): Promise<void> {
-  await fs.writeFile(HISTORY_PATH, JSON.stringify(items, null, 2), 'utf8');
+  await writeFileAtomic(HISTORY_PATH, JSON.stringify(items, null, 2), 0o600);
 }
 
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  // 1. API Vault Configuration Routes (Server-side secret protection)
-  app.get('/api/config/apis', async (_req, res) => {
+  const requireConfigAdmin = createRequireConfigAdmin(readVault);
+
+  // 1. Config Auth & API Vault Configuration Routes (Server-side secret protection)
+  registerConfigAuthRoutes(app, readVault, writeVault);
+
+  app.get('/api/config/apis', async (req, res) => {
     const vault = await readVault();
-    res.json(toPublicConfig(vault));
+    res.json(await toPublicConfig(vault, req));
   });
 
-  app.post('/api/config/apis', async (req, res) => {
+  app.post('/api/config/apis', requireConfigAdmin, async (req, res) => {
     try {
-      const { sport, provider, apiKey, reuseFootballKey } = req.body as {
-        sport: 'football' | 'nba' | 'odds';
+      const { sport, provider, apiKey, reuseFootballKey, enabled } = req.body as {
+        sport: 'football' | 'nba';
         provider?: string;
         apiKey?: string;
         reuseFootballKey?: boolean;
+        enabled?: boolean;
       };
+
+      if (sport !== 'football' && sport !== 'nba') {
+        return res.status(400).json({ error: 'Deporte no válido; solo se admite football o nba.' });
+      }
 
       const vault = await readVault();
       const now = new Date().toISOString();
 
       if (sport === 'football') {
-        if (provider) vault.football.provider = provider;
-        if (typeof apiKey === 'string' && apiKey.trim()) {
-          vault.football.apiKey = apiKey.trim();
-        }
-        const test = await testProviderConnection(
-          'football',
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        vault.football.connected = test.ok;
-        vault.football.accountInfo = test.accountInfo;
-        vault.football.error = test.error;
-        vault.football.lastChecked = now;
+        vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+        const targetProv = provider && FOOTBALL_PROVIDER_IDS.includes(provider as (typeof FOOTBALL_PROVIDER_IDS)[number])
+          ? provider
+          : vault.football.provider;
+        const entry = {
+          ...(vault.footballProviders[targetProv] ?? DEFAULT_FOOTBALL_PROVIDERS[targetProv]),
+          provider: targetProv,
+        };
 
-        // If NBA is configured to reuse Football key, re-check NBA too
-        if (vault.nba.reuseFootballKey && vault.football.apiKey) {
-          const nbaTest = await testProviderConnection(
-            'nba',
-            vault.nba.provider,
-            vault.football.apiKey
-          );
-          vault.nba.connected = nbaTest.ok;
-          vault.nba.accountInfo = nbaTest.accountInfo;
-          vault.nba.error = nbaTest.error;
-          vault.nba.lastChecked = now;
+        if (typeof apiKey === 'string' && apiKey.trim() && targetProv !== 'espn-football') {
+          entry.apiKey = apiKey.trim();
         }
-      } else if (sport === 'nba') {
-        if (provider) vault.nba.provider = provider;
+        if (enabled === false) {
+          entry.enabled = false;
+          entry.connected = false;
+          entry.lastChecked = now;
+        } else {
+          entry.enabled = true;
+          const test = await testProviderConnection('football', targetProv, entry.apiKey);
+          entry.connected = test.ok;
+          entry.accountInfo = test.accountInfo;
+          entry.error = test.error;
+          entry.lastChecked = now;
+        }
+
+        vault.footballProviders[targetProv] = entry;
+        // Keep vault.football synced with primary keyed provider without dropping other providers
+        if (targetProv !== 'espn-football' || !vault.football.apiKey) {
+          vault.football = { ...entry };
+        }
+
+        // Re-check any NBA API-Sports provider reusing football key
+        const apiFbKey = vault.footballProviders['api-football']?.apiKey || vault.football.apiKey;
+        if (apiFbKey && vault.nbaProviders) {
+          for (const nbaPid of ['api-basketball', 'api-nba'] as const) {
+            const nbaEntry = vault.nbaProviders[nbaPid];
+            if (nbaEntry?.reuseFootballKey && nbaEntry.enabled !== false) {
+              const nbaTest = await testProviderConnection('nba', nbaPid, apiFbKey);
+              nbaEntry.connected = nbaTest.ok;
+              nbaEntry.accountInfo = nbaTest.accountInfo;
+              nbaEntry.error = nbaTest.error;
+              nbaEntry.lastChecked = now;
+            }
+          }
+        }
+      } else {
+        vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+        const targetProv = provider && NBA_PROVIDER_IDS.includes(provider as (typeof NBA_PROVIDER_IDS)[number])
+          ? provider
+          : vault.nba.provider;
+        const entry: StoredNbaConfig = {
+          ...(vault.nbaProviders[targetProv] ?? DEFAULT_NBA_PROVIDERS[targetProv]),
+          provider: targetProv,
+        };
+
         if (typeof reuseFootballKey === 'boolean') {
-          vault.nba.reuseFootballKey = reuseFootballKey;
+          entry.reuseFootballKey = targetProv === 'espn-nba' ? false : reuseFootballKey;
         }
-        if (typeof apiKey === 'string' && apiKey.trim() && !vault.nba.reuseFootballKey) {
-          vault.nba.apiKey = apiKey.trim();
+        if (typeof apiKey === 'string' && apiKey.trim() && !entry.reuseFootballKey && targetProv !== 'espn-nba') {
+          entry.apiKey = apiKey.trim();
         }
-        const keyToUse = vault.nba.reuseFootballKey
-          ? vault.football.apiKey
-          : vault.nba.apiKey;
-        const test = await testProviderConnection('nba', vault.nba.provider, keyToUse);
-        vault.nba.connected = test.ok;
-        vault.nba.accountInfo = test.accountInfo;
-        vault.nba.error = test.error;
-        vault.nba.lastChecked = now;
-      } else if (sport === 'odds') {
-        if (provider) vault.odds.provider = provider;
-        if (typeof apiKey === 'string' && apiKey.trim()) {
-          vault.odds.apiKey = apiKey.trim();
+
+        if (enabled === false) {
+          entry.enabled = false;
+          entry.connected = false;
+          entry.lastChecked = now;
+        } else {
+          entry.enabled = true;
+          vault.nbaProviders[targetProv] = entry;
+          const keyToUse = targetProv === 'espn-nba' ? '' : getEffectiveNbaKey(vault, targetProv);
+          const test = await testProviderConnection('nba', targetProv, keyToUse);
+          entry.connected = test.ok;
+          entry.accountInfo = test.accountInfo;
+          entry.error = test.error;
+          entry.lastChecked = now;
         }
-        const test = await testProviderConnection('odds', vault.odds.provider, vault.odds.apiKey);
-        vault.odds.connected = test.ok;
-        vault.odds.accountInfo = test.accountInfo;
-        vault.odds.error = test.error;
-        vault.odds.lastChecked = now;
+
+        vault.nbaProviders[targetProv] = entry;
+        if (targetProv !== 'espn-nba' || !vault.nba.apiKey) {
+          vault.nba = {
+            ...entry,
+            reuseFootballKey: Boolean(entry.reuseFootballKey),
+          };
+        }
       }
 
       liveCache = null;
       await writeVault(vault);
-      res.json(toPublicConfig(vault));
+      return res.json(await toPublicConfig(vault, req));
     } catch (err) {
-      res.status(500).json({
+      return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error guardando configuración API',
       });
     }
   });
 
-  app.post('/api/config/apis/test', async (req, res) => {
+  app.post('/api/config/apis/test', requireConfigAdmin, async (req, res) => {
     try {
       const { sport, provider, apiKey, reuseFootballKey } = req.body as {
-        sport: 'football' | 'nba' | 'odds';
+        sport: 'football' | 'nba';
         provider?: string;
         apiKey?: string;
         reuseFootballKey?: boolean;
       };
+
+      if (sport !== 'football' && sport !== 'nba') {
+        return res.status(400).json({ error: 'Deporte no válido; solo se admite football o nba.' });
+      }
+
       const vault = await readVault();
       const now = new Date().toISOString();
 
       const targetProvider =
-        provider ??
-        (sport === 'football'
-          ? vault.football.provider
-          : sport === 'nba'
-            ? vault.nba.provider
-            : vault.odds.provider);
+        provider ?? (sport === 'football' ? vault.football.provider : vault.nba.provider);
 
       let targetKey = apiKey?.trim() ?? '';
       if (!targetKey) {
         if (sport === 'football') {
-          targetKey = vault.football.apiKey;
-        } else if (sport === 'nba') {
-          const useFb =
-            typeof reuseFootballKey === 'boolean' ? reuseFootballKey : vault.nba.reuseFootballKey;
-          targetKey = useFb ? vault.football.apiKey : vault.nba.apiKey;
+          targetKey = vault.footballProviders?.[targetProvider]?.apiKey || vault.football.apiKey;
         } else {
-          targetKey = vault.odds.apiKey;
+          const useFb =
+            typeof reuseFootballKey === 'boolean'
+              ? reuseFootballKey
+              : vault.nbaProviders?.[targetProvider]?.reuseFootballKey;
+          targetKey = useFb
+            ? vault.footballProviders?.['api-football']?.apiKey || vault.football.apiKey
+            : vault.nbaProviders?.[targetProvider]?.apiKey || vault.nba.apiKey;
         }
       }
 
       const result = await testProviderConnection(sport, targetProvider, targetKey);
       if (sport === 'football') {
-        vault.football.connected = result.ok;
-        vault.football.accountInfo = result.accountInfo;
-        vault.football.error = result.error;
-        vault.football.lastChecked = now;
-      } else if (sport === 'nba') {
-        vault.nba.connected = result.ok;
-        vault.nba.accountInfo = result.accountInfo;
-        vault.nba.error = result.error;
-        vault.nba.lastChecked = now;
+        vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+        const cur = vault.footballProviders[targetProvider] ?? DEFAULT_FOOTBALL_PROVIDERS[targetProvider];
+        vault.footballProviders[targetProvider] = {
+          ...cur,
+          provider: targetProvider,
+          apiKey: targetKey || cur.apiKey,
+          enabled: result.ok ? true : cur.enabled,
+          connected: result.ok,
+          accountInfo: result.accountInfo,
+          error: result.error,
+          lastChecked: now,
+        };
+        if (vault.football.provider === targetProvider) {
+          vault.football = { ...vault.footballProviders[targetProvider] };
+        }
       } else {
-        vault.odds.connected = result.ok;
-        vault.odds.accountInfo = result.accountInfo;
-        vault.odds.error = result.error;
-        vault.odds.lastChecked = now;
+        vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+        const cur = vault.nbaProviders[targetProvider] ?? DEFAULT_NBA_PROVIDERS[targetProvider];
+        vault.nbaProviders[targetProvider] = {
+          ...cur,
+          provider: targetProvider,
+          apiKey: reuseFootballKey ? cur.apiKey : (targetKey || cur.apiKey),
+          reuseFootballKey: typeof reuseFootballKey === 'boolean' ? reuseFootballKey : cur.reuseFootballKey,
+          enabled: result.ok ? true : cur.enabled,
+          connected: result.ok,
+          accountInfo: result.accountInfo,
+          error: result.error,
+          lastChecked: now,
+        };
+        if (vault.nba.provider === targetProvider) {
+          vault.nba = {
+            ...vault.nbaProviders[targetProvider],
+            reuseFootballKey: Boolean(vault.nbaProviders[targetProvider].reuseFootballKey),
+          };
+        }
       }
       liveCache = null;
       await writeVault(vault);
-      res.json({ result, config: toPublicConfig(vault) });
+      return res.json({ result, config: await toPublicConfig(vault, req) });
     } catch (err) {
-      res.status(500).json({
+      return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error comprobando conexión API',
       });
     }
   });
 
-  app.delete('/api/config/apis', async (req, res) => {
+  app.delete('/api/config/apis', requireConfigAdmin, async (req, res) => {
     const sport = (req.query.sport as string) || 'all';
+    const provider = typeof req.query.provider === 'string' ? req.query.provider : undefined;
     const vault = await readVault();
+
     if (sport === 'football' || sport === 'all') {
-      vault.football = structuredClone(DEFAULT_VAULT.football);
+      vault.footballProviders = vault.footballProviders ?? structuredClone(DEFAULT_FOOTBALL_PROVIDERS);
+      if (provider && vault.footballProviders[provider]) {
+        if (provider === 'espn-football') {
+          vault.footballProviders[provider] = {
+            ...DEFAULT_FOOTBALL_PROVIDERS[provider],
+            connected: false,
+            enabled: false,
+          };
+        } else {
+          vault.footballProviders[provider] = structuredClone(DEFAULT_FOOTBALL_PROVIDERS[provider]);
+        }
+        if (vault.football.provider === provider) {
+          const fallback = Object.values(vault.footballProviders).find((p) => p.connected && p.enabled !== false);
+          vault.football = fallback ? { ...fallback } : structuredClone(DEFAULT_VAULT.football);
+        }
+      } else {
+        for (const pid of FOOTBALL_PROVIDER_IDS) {
+          if (pid !== 'espn-football') {
+            vault.footballProviders[pid] = structuredClone(DEFAULT_FOOTBALL_PROVIDERS[pid]);
+          }
+        }
+        vault.football = structuredClone(DEFAULT_VAULT.football);
+      }
     }
+
     if (sport === 'nba' || sport === 'all') {
-      vault.nba = structuredClone(DEFAULT_VAULT.nba);
+      vault.nbaProviders = vault.nbaProviders ?? structuredClone(DEFAULT_NBA_PROVIDERS);
+      if (provider && vault.nbaProviders[provider]) {
+        if (provider === 'espn-nba') {
+          vault.nbaProviders[provider] = {
+            ...DEFAULT_NBA_PROVIDERS[provider],
+            connected: false,
+            enabled: false,
+          };
+        } else {
+          vault.nbaProviders[provider] = structuredClone(DEFAULT_NBA_PROVIDERS[provider]);
+        }
+        if (vault.nba.provider === provider) {
+          const fallback = Object.values(vault.nbaProviders).find((p) => p.connected && p.enabled !== false);
+          vault.nba = fallback
+            ? { ...fallback, reuseFootballKey: Boolean(fallback.reuseFootballKey) }
+            : structuredClone(DEFAULT_VAULT.nba);
+        }
+      } else {
+        for (const pid of NBA_PROVIDER_IDS) {
+          if (pid !== 'espn-nba') {
+            vault.nbaProviders[pid] = structuredClone(DEFAULT_NBA_PROVIDERS[pid]);
+          }
+        }
+        vault.nba = structuredClone(DEFAULT_VAULT.nba);
+      }
     }
-    if (sport === 'odds' || sport === 'all') {
-      vault.odds = structuredClone(DEFAULT_VAULT.odds);
-    }
+
     liveCache = null;
     await writeVault(vault);
-    res.json(toPublicConfig(vault));
+    res.json(await toPublicConfig(vault, req));
   });
 
-  // 2. Live Sports Data Proxy Routes (Multi-day Calendar, Standings & On-Demand Match Hydration)
+  // 2. Live Sports Data Proxy Routes (Simultaneous Multi-Source Calendar, Cross-Check, Standings & Hydration)
   app.get('/api/sports/live', async (req, res) => {
     const forceRefresh = req.query.refresh === '1';
     const vault = await readVault();
 
     if (!forceRefresh && liveCache && Date.now() < liveCache.expiresAt) {
       return res.json({
-        config: toPublicConfig(vault),
+        config: await toPublicConfig(vault, req),
         ...liveCache.payload,
+        feedMeta: evaluateFeedStaleness({
+          fetchedAt: liveCache.payload.fetchedAt,
+          fromCache: true,
+          sources: liveCache.payload.sources,
+          errors: liveCache.payload.errors,
+        }),
       });
     }
 
-    let matches: MatchRecord[] = [];
-    const standings: StandingEntry[] = [];
     const errors: string[] = [];
+    const sources: LiveFeedSourceStatus[] = [];
 
-    if (
-      vault.football.connected &&
-      (vault.football.provider === 'espn-football' || vault.football.apiKey)
-    ) {
-      try {
-        const fb = await fetchFootballCalendarAndStandings(
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        matches.push(...fb.matches);
-        standings.push(...fb.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de fútbol');
-      }
-    } else if (!vault.football.connected) {
-      // Provide public ESPN Soccer calendar + DraftKings odds if no Football API key is configured yet
-      try {
-        const fbPublic = await fetchFootballCalendarAndStandings('espn-football', '');
-        matches.push(...fbPublic.matches);
-      } catch {
-        // Ignore silent fallback error
-      }
-    }
+    const activeFbProviders = getActiveFootballProviders(vault);
+    const fbList = activeFbProviders.length > 0
+      ? activeFbProviders
+      : [{ provider: 'espn-football', apiKey: '', label: PROVIDER_DISPLAY_NAMES['espn-football'] }];
 
-    const nbaKey = vault.nba.reuseFootballKey ? vault.football.apiKey : vault.nba.apiKey;
-    if (
-      vault.nba.connected &&
-      (vault.nba.provider === 'espn-nba' || nbaKey)
-    ) {
-      try {
-        const nba = await fetchNbaCalendarAndStandings(vault.nba.provider, nbaKey);
-        matches.push(...nba.matches);
-        standings.push(...nba.standings);
-      } catch (err) {
-        errors.push(err instanceof Error ? err.message : 'Error obteniendo calendario de NBA');
-      }
-    } else {
-      // Automatic public ESPN NBA feed so NBA calendar, standings, injuries & DraftKings odds always work
-      try {
-        const nbaPublic = await fetchNbaCalendarAndStandings('espn-nba', '');
-        matches.push(...nbaPublic.matches);
-        standings.push(...nbaPublic.standings);
-      } catch {
-        // Ignore silent fallback error
-      }
-    }
+    const activeNbaProviders = getActiveNbaProviders(vault);
+    const nbaList = activeNbaProviders.length > 0
+      ? activeNbaProviders
+      : [{ provider: 'espn-nba', apiKey: '', label: PROVIDER_DISPLAY_NAMES['espn-nba'] }];
 
-    // Optional The Odds API multi-bookmaker enrichment
-    if (vault.odds.connected && vault.odds.apiKey) {
-      try {
-        const [fbOdds, nbaOdds] = await Promise.all([
-          fetchTheOddsApiForSport('football', vault.odds.apiKey),
-          fetchTheOddsApiForSport('nba', vault.odds.apiKey),
-        ]);
-        matches = mergeRealOddsIntoMatches(matches, [...fbOdds, ...nbaOdds]);
-      } catch {
-        // Keep primary odds cleanly if optional Odds API fails
-      }
-    }
+    const [fbSettled, nbaSettled] = await Promise.all([
+      Promise.allSettled(
+        fbList.map(async (src) => {
+          const data = await fetchFootballCalendarAndStandings(src.provider, src.apiKey, {
+            includeEspnFallback: false,
+          });
+          return { src, data };
+        })
+      ),
+      Promise.allSettled(
+        nbaList.map(async (src) => {
+          const data = await fetchNbaCalendarAndStandings(src.provider, src.apiKey, {
+            includeEspnFallback: false,
+          });
+          return { src, data };
+        })
+      ),
+    ]);
 
+    const fbBatches: MultiSourceMatchBatch[] = [];
+    const nbaBatches: MultiSourceMatchBatch[] = [];
+    const standingBatches: StandingEntry[][] = [];
+    const nowIso = new Date().toISOString();
+
+    fbSettled.forEach((outcome, idx) => {
+      const src = fbList[idx];
+      if (outcome.status === 'fulfilled') {
+        fbBatches.push({
+          provider: src.provider,
+          label: src.label,
+          matches: outcome.value.data.matches,
+        });
+        standingBatches.push(outcome.value.data.standings);
+        sources.push({
+          sport: 'football',
+          provider: src.provider,
+          status: 'ok',
+          updatedAt: nowIso,
+          matchCount: outcome.value.data.matches.length,
+        });
+      } else {
+        const msg =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : `Error consultando ${src.label}`;
+        errors.push(`${src.label}: ${msg}`);
+        sources.push({
+          sport: 'football',
+          provider: src.provider,
+          status: 'error',
+          updatedAt: nowIso,
+          matchCount: 0,
+          error: msg,
+        });
+      }
+    });
+
+    nbaSettled.forEach((outcome, idx) => {
+      const src = nbaList[idx];
+      if (outcome.status === 'fulfilled') {
+        nbaBatches.push({
+          provider: src.provider,
+          label: src.label,
+          matches: outcome.value.data.matches,
+        });
+        standingBatches.push(outcome.value.data.standings);
+        sources.push({
+          sport: 'nba',
+          provider: src.provider,
+          status: 'ok',
+          updatedAt: nowIso,
+          matchCount: outcome.value.data.matches.length,
+        });
+      } else {
+        const msg =
+          outcome.reason instanceof Error
+            ? outcome.reason.message
+            : `Error consultando ${src.label}`;
+        errors.push(`${src.label}: ${msg}`);
+        sources.push({
+          sport: 'nba',
+          provider: src.provider,
+          status: 'error',
+          updatedAt: nowIso,
+          matchCount: 0,
+          error: msg,
+        });
+      }
+    });
+
+    const matches = [
+      ...mergeMatchesAcrossSources(fbBatches),
+      ...mergeMatchesAcrossSources(nbaBatches),
+    ];
+    const standings = mergeStandingsAcrossSources(standingBatches);
+
+    const fetchedAt = new Date().toISOString();
     const payload = {
       matches,
       standings,
       errors,
-      fetchedAt: new Date().toISOString(),
-    };
-    liveCache = {
-      expiresAt: Date.now() + 180_000,
-      payload,
+      sources,
+      fetchedAt,
     };
 
+    // Never cache failed responses as fresh valid cache
+    if (errors.length === 0) {
+      liveCache = {
+        expiresAt: Date.now() + 180_000,
+        payload,
+      };
+    } else {
+      liveCache = null;
+    }
+
     res.json({
-      config: toPublicConfig(vault),
+      config: await toPublicConfig(vault, req),
       ...payload,
+      feedMeta: evaluateFeedStaleness({
+        fetchedAt,
+        fromCache: false,
+        sources,
+        errors,
+      }),
     });
   });
 
@@ -639,44 +1163,174 @@ async function startServer() {
       if (!match || match.isOfflineReference) {
         return res.json({ match });
       }
-      if (match.id.startsWith('espn-nba-')) {
-        const hydrated = await hydrateLiveMatchDetails(match, 'espn-nba', '');
-        return res.json({ match: hydrated });
-      }
-      if (match.id.startsWith('espnsoc-')) {
-        const hydrated = await hydrateLiveMatchDetails(match, 'espn-football', '');
-        return res.json({ match: hydrated });
-      }
 
       const vault = await readVault();
-      if (match.sport === 'football' && vault.football.connected && vault.football.apiKey) {
-        const hydrated = await hydrateLiveMatchDetails(
-          match,
-          vault.football.provider,
-          vault.football.apiKey
-        );
-        return res.json({ match: hydrated });
+      const tasks: Array<{ provider: string; label: string; promise: Promise<MatchRecord> }> = [];
+
+      if (match.sport === 'football') {
+        const activeFb = getActiveFootballProviders(vault);
+        const addedProviders = new Set<string>();
+
+        for (const src of activeFb) {
+          const sourceMatchId = match.sourceIds?.[src.provider] ?? (
+            (src.provider === 'football-data' && match.id.startsWith('fd-')) ||
+            (src.provider === 'api-football' && match.id.startsWith('apifb-')) ||
+            (src.provider === 'espn-football' && match.id.startsWith('espnsoc-'))
+              ? match.id
+              : undefined
+          );
+
+          if (sourceMatchId) {
+            addedProviders.add(src.provider);
+            tasks.push({
+              provider: src.provider,
+              label: src.label,
+              promise: hydrateLiveMatchDetails({ ...match, id: sourceMatchId }, src.provider, src.apiKey),
+            });
+          } else if (src.provider === 'espn-football') {
+            // Dynamically cross-link ESPN Soccer even if match originated only in Football-Data or API-Football
+            addedProviders.add('espn-football');
+            tasks.push({
+              provider: 'espn-football',
+              label: src.label,
+              promise: (async () => {
+                const espnData = await fetchEspnSoccerEnrichment();
+                const baseTs = new Date(match.kickoffIso).getTime();
+                const matchedEspn = espnData.matches.find(
+                  (em) =>
+                    Math.abs(new Date(em.kickoffIso).getTime() - baseTs) <= 36 * 3600_000 &&
+                    teamsMatch(em.homeTeam.name, match.homeTeam.name) &&
+                    teamsMatch(em.awayTeam.name, match.awayTeam.name)
+                );
+                if (!matchedEspn) return match;
+                return hydrateLiveMatchDetails(matchedEspn, 'espn-football', '');
+              })(),
+            });
+          }
+        }
+
+        // Preserve direct espnsoc- hydration if user disabled/didn't configure other keys
+        if (!addedProviders.has('espn-football') && match.id.startsWith('espnsoc-')) {
+          tasks.push({
+            provider: 'espn-football',
+            label: PROVIDER_DISPLAY_NAMES['espn-football'],
+            promise: hydrateLiveMatchDetails(match, 'espn-football', ''),
+          });
+        }
+      } else if (match.sport === 'nba') {
+        const activeNba = getActiveNbaProviders(vault);
+        const addedProviders = new Set<string>();
+
+        for (const src of activeNba) {
+          const sourceMatchId = match.sourceIds?.[src.provider] ?? (
+            (src.provider === 'basketballapi-net' && match.id.startsWith('bapi-')) ||
+            (src.provider === 'balldontlie' && match.id.startsWith('bdl-')) ||
+            ((src.provider === 'api-basketball' || src.provider === 'api-nba') &&
+              (match.id.startsWith('apibsk-') || match.id.startsWith('apinba2-'))) ||
+            (src.provider === 'espn-nba' && match.id.startsWith('espn-nba-'))
+              ? match.id
+              : undefined
+          );
+
+          if (sourceMatchId) {
+            addedProviders.add(src.provider);
+            tasks.push({
+              provider: src.provider,
+              label: src.label,
+              promise: hydrateLiveMatchDetails({ ...match, id: sourceMatchId }, src.provider, src.apiKey),
+            });
+          } else if (src.provider === 'espn-nba') {
+            addedProviders.add('espn-nba');
+            tasks.push({
+              provider: 'espn-nba',
+              label: src.label,
+              promise: hydrateLiveMatchDetails(match, 'espn-nba', ''),
+            });
+          }
+        }
+
+        if (!addedProviders.has('espn-nba')) {
+          tasks.push({
+            provider: 'espn-nba',
+            label: PROVIDER_DISPLAY_NAMES['espn-nba'],
+            promise: hydrateLiveMatchDetails(match, 'espn-nba', ''),
+          });
+        }
       }
-      const nbaKey = vault.nba.reuseFootballKey ? vault.football.apiKey : vault.nba.apiKey;
-      if (match.sport === 'nba') {
-        const hydrated = await hydrateLiveMatchDetails(
-          match,
-          vault.nba.connected && nbaKey ? vault.nba.provider : 'espn-nba',
-          nbaKey
-        );
-        return res.json({ match: hydrated });
+
+      if (tasks.length === 0) {
+        return res.json({
+          match: {
+            ...match,
+            hydrationStatus: 'provider_unavailable',
+            hydrationNote:
+              'Ninguno de los proveedores configurados para este deporte está conectado en Configuración de APIs.',
+          },
+        });
       }
-      return res.json({
-        match: {
-          ...match,
-          hydrationStatus: 'provider_unavailable',
-          hydrationNote:
-            'El proveedor configurado para este deporte no está conectado en Configuración de APIs.',
-        },
+
+      const settled = await Promise.allSettled(tasks.map((t) => t.promise));
+      const variants: Array<{ provider: string; label: string; match: MatchRecord }> = [];
+      settled.forEach((resItem, idx) => {
+        if (resItem.status === 'fulfilled' && resItem.value) {
+          variants.push({
+            provider: tasks[idx].provider,
+            label: tasks[idx].label,
+            match: resItem.value,
+          });
+        }
       });
+
+      if (variants.length === 0) {
+        return res.json({
+          match: {
+            ...match,
+            hydrationStatus: 'network_error',
+            hydrationNote: 'No se pudo hidratar el detalle del partido desde las fuentes activas.',
+          },
+        });
+      }
+
+      const mergedMatch = mergeHydratedMatchDetails(match, variants);
+      return res.json({ match: mergedMatch });
     } catch (err) {
       return res.status(500).json({
         error: err instanceof Error ? err.message : 'Error hidratando detalle del partido',
+      });
+    }
+  });
+
+  // 2A-bis. Reference odds per match (informational / statistical use only)
+  app.post('/api/odds/match', async (req, res) => {
+    try {
+      const { match, refresh } = req.body as { match?: MatchRecord; refresh?: boolean };
+      if (
+        !match ||
+        typeof match.id !== 'string' ||
+        (match.sport !== 'football' && match.sport !== 'nba') ||
+        !match.homeTeam ||
+        !match.awayTeam
+      ) {
+        return res.status(400).json({ error: 'Partido no válido para consultar cuotas.' });
+      }
+      if (match.isOfflineReference) {
+        return res.json({
+          matchId: match.id,
+          sport: match.sport,
+          fetchedAt: new Date().toISOString(),
+          sources: [],
+        });
+      }
+      const vault = await readVault();
+      const footballDataKey =
+        match.sport === 'football'
+          ? getActiveFootballProviders(vault).find((p) => p.provider === 'football-data')?.apiKey
+          : undefined;
+      const payload = await fetchMatchOdds(match, { footballDataKey, forceRefresh: refresh === true });
+      return res.json(payload);
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Error consultando cuotas de referencia',
       });
     }
   });
@@ -781,7 +1435,8 @@ async function startServer() {
         sourcesChecked.push('Google Search Grounding (Gemini Web Search)');
         for (const f of grounding.findings ?? []) {
           const normPlayer = normalizeNbaName(f.playerName);
-          const publishedAt = f.publishedAt || nowIso;
+          // Strictly preserve upstream publishedAt without fabricating fallback dates
+          const publishedAt = parseValidPublishedAt(f.publishedAt);
           mergedNewsItems.unshift({
             id: `ground-${normPlayer}-${Date.now()}`,
             source: f.source || 'Google Search Grounding',
@@ -797,6 +1452,19 @@ async function startServer() {
           const applyFinding = (list: typeof updatedHomePlayers) =>
             list.map((p) => {
               if (normalizeNbaName(p.name) !== normPlayer) return p;
+              // Never overwrite a confirmed official status with an unconfirmed rumor
+              if (p.availabilityConfidence === 'confirmed' && !f.confirmed) {
+                return {
+                  ...p,
+                  latestNews: {
+                    source: f.source || 'Google Search Grounding',
+                    publishedAt,
+                    summary: f.summary,
+                    url: grounding.citations?.[0]?.url,
+                    confirmed: false,
+                  },
+                };
+              }
               return {
                 ...p,
                 availability: f.status,
@@ -856,6 +1524,122 @@ async function startServer() {
     }
   });
 
+  // 2C. Real-Time Football Probable vs Confirmed Lineups, Club Releases & Press Refresh Route
+  app.post('/api/football/match/refresh-lineups', async (req, res) => {
+    try {
+      const { match, includeSearchGrounding = true } = req.body as {
+        match: MatchRecord;
+        includeSearchGrounding?: boolean;
+      };
+      if (!match || match.sport !== 'football' || match.isOfflineReference) {
+        return res.json({ match });
+      }
+
+      const vault = await readVault();
+      let workingMatch = match;
+
+      // Re-hydrate from ALL active Football providers simultaneously to catch newly confirmed starting XIs
+      const activeFb = getActiveFootballProviders(vault);
+      const refreshTasks: Array<{ provider: string; label: string; promise: Promise<MatchRecord> }> = [];
+      for (const src of activeFb) {
+        const srcId =
+          match.sourceIds?.[src.provider] ??
+          ((src.provider === 'football-data' && match.id.startsWith('fd-')) ||
+          (src.provider === 'api-football' && match.id.startsWith('apifb-')) ||
+          (src.provider === 'espn-football' && match.id.startsWith('espnsoc-'))
+            ? match.id
+            : undefined);
+        if (srcId) {
+          refreshTasks.push({
+            provider: src.provider,
+            label: src.label,
+            promise: hydrateLiveMatchDetails({ ...workingMatch, id: srcId }, src.provider, src.apiKey),
+          });
+        }
+      }
+      if (refreshTasks.length > 0) {
+        const settledRefresh = await Promise.allSettled(refreshTasks.map((t) => t.promise));
+        const variants: Array<{ provider: string; label: string; match: MatchRecord }> = [];
+        settledRefresh.forEach((item, idx) => {
+          if (item.status === 'fulfilled' && item.value) {
+            variants.push({
+              provider: refreshTasks[idx].provider,
+              label: refreshTasks[idx].label,
+              match: item.value,
+            });
+          }
+        });
+        if (variants.length > 0) {
+          workingMatch = mergeHydratedMatchDetails(workingMatch, variants);
+        }
+      }
+
+      // If official lineup was just published, ensure probableLineup is preserved cleanly alongside confirmedLineup
+      if (workingMatch.lineupStatus === 'confirmed' && workingMatch.confirmedLineup) {
+        if (!workingMatch.probableLineup && match.probableLineup) {
+          workingMatch.probableLineup = match.probableLineup;
+        }
+        return res.json({ match: workingMatch });
+      }
+
+      // Otherwise refresh probable lineups + RSS + Google Search Grounding (club websites & Marca/AS/MD/SPORT/Relevo/ESPN/BBC/Sky)
+      const espnIds = await resolveEspnSoccerIdsForMatch(
+        workingMatch.competition,
+        workingMatch.homeTeam.name,
+        workingMatch.awayTeam.name
+      );
+      const bundle = await buildProbableFootballLineups({
+        match: workingMatch,
+        slug: espnIds.slug,
+        homeEspnTeamId: espnIds.homeEspnTeamId,
+        awayEspnTeamId: espnIds.awayEspnTeamId,
+        includeSearchGrounding,
+        forceRefresh: true,
+      });
+
+      const nowIso = new Date().toISOString();
+      const updatedHome = bundle.homePlayers.length >= 11 ? bundle.homePlayers : workingMatch.homePlayers;
+      const updatedAway = bundle.awayPlayers.length >= 11 ? bundle.awayPlayers : workingMatch.awayPlayers;
+      const hasLineups = updatedHome.length > 0 || updatedAway.length > 0;
+
+      const updatedMatch: MatchRecord = {
+        ...workingMatch,
+        homeTeam: {
+          ...workingMatch.homeTeam,
+          formation: bundle.homeFormation ?? workingMatch.homeTeam.formation,
+        },
+        awayTeam: {
+          ...workingMatch.awayTeam,
+          formation: bundle.awayFormation ?? workingMatch.awayTeam.formation,
+        },
+        lineupStatus: hasLineups ? 'provisional' : 'unknown',
+        homePlayers: updatedHome,
+        awayPlayers: updatedAway,
+        probableLineup: bundle.probableLineup ?? workingMatch.probableLineup,
+        footballNews: bundle.footballNews,
+        hydrationStatus: hasLineups ? 'ok' : 'not_published',
+        hydrationNote: hasLineups
+          ? 'Alineación probable actualizada con fuentes deportivas y estado reciente.'
+          : 'Sin novedades suficientes para proyectar el once todavía.',
+        provenance: {
+          source: bundle.footballNews.sourcesChecked.slice(0, 4).join(' · ') || workingMatch.dataOrigin,
+          fetchedAt: nowIso,
+          status: hasLineups ? 'ok' : 'partial',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: hasLineups ? 'estimated' : 'unavailable',
+        },
+        updatedAt: nowIso,
+      };
+
+      return res.json({ match: updatedMatch });
+    } catch (err) {
+      return res.status(500).json({
+        error: err instanceof Error ? err.message : 'Error actualizando alineaciones de fútbol',
+      });
+    }
+  });
+
   // 3. Server-Side Gemini AI Analyst Route
   app.post('/api/ai/explain', async (req, res) => {
     const apiKey = process.env.GEMINI_API_KEY;
@@ -868,7 +1652,7 @@ async function startServer() {
 
     try {
       const { contextType, payload } = req.body as {
-        contextType: 'match' | 'player_prop' | 'odds_discrepancy';
+        contextType: 'match' | 'player_prop';
         payload: Record<string, unknown>;
       };
 
@@ -884,16 +1668,16 @@ async function startServer() {
       const systemInstruction = `Eres el analista cuantitativo de SportAnalytics AI.
 Reglas estrictas e inquebrantables:
 1. Responde siempre en español claro, técnico y preciso.
-2. Explica ÚNICAMENTE utilizando los números, probabilidades, alineaciones, bajas y discrepancias exactas recibidas en el JSON de entrada.
-3. NUNCA inventes estadísticas, lesiones, cuotas, historiales ni probabilidades independientes.
-4. Señala siempre factores favorables, factores desfavorables, impacto de ausencias/rotaciones y la incertidumbre real del modelo (varianza, muestra, alineaciones provisionales).
-5. Nunca garantices resultados ni presentes una ventaja estadística como apuesta segura.`;
+2. Explica ÚNICAMENTE utilizando los números, probabilidades, alineaciones, bajas y métricas estadísticas exactas recibidas en el JSON de entrada.
+3. NUNCA inventes estadísticas, lesiones, fechas ni probabilidades independientes, y NO hagas referencias a casas de apuestas o cuotas.
+4. Diferencia claramente entre datos verificados, estimaciones posicionales, rumores de prensa e información no disponible.
+5. Señala siempre factores favorables, factores desfavorables, impacto de ausencias/rotaciones y la incertidumbre estadística real del modelo.`;
 
       const prompt = `Tipo de análisis: ${contextType}
 Datos exactos calculados por los modelos matemáticos de SportAnalytics AI:
 ${JSON.stringify(payload, null, 2)}
 
-Genera una explicación estructurada con resumen ejecutivo, factores favorables, factores desfavorables, impacto de disponibilidad/bajas y nota de incertidumbre.`;
+Genera una explicación estructurada con resumen estadístico, factores favorables, factores desfavorables, impacto de disponibilidad/bajas y nota de incertidumbre.`;
 
       const response = await ai.models.generateContent({
         model: 'gemini-4-hydrogen',
@@ -924,7 +1708,7 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
               },
               uncertaintyNote: {
                 type: Type.STRING,
-                description: 'Nota sobre varianza, tamaño muestral, margen de casa y fiabilidad.',
+                description: 'Nota sobre varianza, tamaño muestral, calidad de los datos y fiabilidad.',
               },
             },
             required: [
@@ -955,12 +1739,20 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
 
   app.post('/api/history', async (req, res) => {
     const items = await readHistory();
-    const entry = req.body as LoggedPrediction;
+    const entry = req.body as Record<string, unknown>;
+    const cleanEntry = { ...entry };
+    delete cleanEntry.bookmakerOdds;
     const next: LoggedPrediction = {
-      ...entry,
-      id: entry.id || `pred-${Date.now()}`,
-      createdAt: entry.createdAt || new Date().toISOString(),
-      status: entry.status || 'pending',
+      ...(cleanEntry as unknown as LoggedPrediction),
+      id: typeof cleanEntry.id === 'string' && cleanEntry.id ? cleanEntry.id : `pred-${Date.now()}`,
+      createdAt:
+        typeof cleanEntry.createdAt === 'string' && cleanEntry.createdAt
+          ? cleanEntry.createdAt
+          : new Date().toISOString(),
+      status:
+        cleanEntry.status === 'won' || cleanEntry.status === 'lost' || cleanEntry.status === 'pending'
+          ? cleanEntry.status
+          : 'pending',
     };
     const updated = [next, ...items];
     await writeHistory(updated);
@@ -979,7 +1771,10 @@ Genera una explicación estructurada con resumen ejecutivo, factores favorables,
         ? {
             ...item,
             status,
-            actualValue: actualValue ?? item.actualValue,
+            actualValue:
+              typeof actualValue === 'number' && Number.isFinite(actualValue)
+                ? actualValue
+                : item.actualValue,
             resolvedAt: status === 'pending' ? undefined : new Date().toISOString(),
           }
         : item

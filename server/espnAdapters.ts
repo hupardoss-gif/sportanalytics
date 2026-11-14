@@ -1,6 +1,6 @@
 import type {
   AvailabilityStatus,
-  BookmakerOdd,
+  DataReliability,
   MatchRecord,
   MatchStatus,
   PlayerGameLogEntry,
@@ -10,6 +10,7 @@ import type {
   TeamRecentGame,
   TimeframeSplit,
 } from '../src/types/sports.ts';
+import { fetchWithTimeout } from './httpUtils.ts';
 import {
   applyNewsAndInjuriesToNbaPlayers,
   detectMinutesRestriction,
@@ -18,6 +19,10 @@ import {
   normalizeNbaName,
   type ParsedInjuryRecord,
 } from './nbaIntelligence.ts';
+import {
+  buildProbableFootballLineups,
+  promoteOfficialToConfirmedLineup,
+} from './footballIntelligence.ts';
 
 type AnyObj = Record<string, unknown>;
 
@@ -30,24 +35,66 @@ function yyyymmddOffset(days: number): string {
   return isoDateOffset(days).replace(/-/g, '');
 }
 
-export function americanToDecimal(raw: unknown): number | null {
-  if (raw === null || raw === undefined) return null;
-  const s = String(raw).trim().toUpperCase();
-  if (!s) return null;
-  if (s === 'EVEN' || s === 'EV') return 2.0;
-  const n = Number(s.replace('+', ''));
-  if (!Number.isFinite(n) || n === 0) return null;
-  if (n > 0) return +(1 + n / 100).toFixed(3);
-  return +(1 + 100 / Math.abs(n)).toFixed(3);
-}
+const GENERIC_TEAM_TOKENS = new Set([
+  'madrid',
+  'manchester',
+  'milan',
+  'milano',
+  'roma',
+  'london',
+  'lisbon',
+  'sevilla',
+  'valencia',
+  'paris',
+  'berlin',
+  'munich',
+  'los',
+  'angeles',
+  'new',
+  'york',
+  'golden',
+  'state',
+  'san',
+  'antonio',
+  'oklahoma',
+  'city',
+  'united',
+  'real',
+  'atletico',
+  'athletic',
+  'sporting',
+  'saint',
+  'olympic',
+  'olympique',
+  'royal',
+  'dinamo',
+  'dynamo',
+  'racing',
+  'deportivo',
+  'union',
+  'rovers',
+  'wanderers',
+  'albion',
+  'town',
+  'county',
+  'villa',
+  'inter',
+  'borussia',
+  'eintracht',
+]);
 
 export function normalizeTeamKey(name: string): string {
   return name
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
     .toLowerCase()
-    .replace(/\b(fc|cf|cd|ud|sd|rc|rcd|ac|as|sc|club|deportivo|baloncesto|basketball)\b/g, ' ')
+    .replace(/\butd\b/g, 'united')
+    .replace(/\batl\b/g, 'atletico')
+    .replace(/\bmunchen\b/g, 'munich')
+    .replace(/^la\s+/g, 'los angeles ')
+    .replace(/\b(fc|cf|cd|ud|sd|rc|rcd|ac|as|sc|ss|ssc|sv|vfl|rb|tsg|afc|cp|club|baloncesto|basketball|de|del|la|las|los|the)\b/g, ' ')
     .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
 }
 
@@ -55,12 +102,78 @@ export function teamsMatch(a: string, b: string): boolean {
   const na = normalizeTeamKey(a);
   const nb = normalizeTeamKey(b);
   if (!na || !nb) return false;
-  if (na === nb || na.includes(nb) || nb.includes(na)) return true;
-  const tokA = na.split(' ').filter((t) => t.length >= 3);
-  const tokB = nb.split(' ').filter((t) => t.length >= 3);
+  if (na === nb) return true;
+
+  const tokA = na.split(' ').filter((t) => t.length >= 2);
+  const tokB = nb.split(' ').filter((t) => t.length >= 2);
   if (tokA.length === 0 || tokB.length === 0) return false;
-  const shared = tokA.filter((t) => tokB.includes(t));
-  return shared.length >= 1 && (shared[0].length >= 5 || shared.length >= 2);
+
+  const setA = new Set(tokA);
+  const setB = new Set(tokB);
+
+  // Explicit derby & city-sibling disambiguation guards
+  const exclusivePairs: Array<[string, string]> = [
+    ['real', 'atletico'],
+    ['real', 'athletic'],
+    ['city', 'united'],
+    ['lakers', 'clippers'],
+    ['knicks', 'nets'],
+    ['giants', 'jets'],
+    ['sevilla', 'betis'],
+    ['espanyol', 'barcelona'],
+    ['celtic', 'rangers'],
+    ['lazio', 'roma'],
+    ['torino', 'juventus'],
+    ['marseille', 'lyonnais'],
+    ['marseille', 'lyon'],
+    ['arsenal', 'chelsea'],
+    ['arsenal', 'tottenham'],
+    ['liverpool', 'everton'],
+    ['inter', 'milan'],
+  ];
+
+  for (const [x, y] of exclusivePairs) {
+    if ((setA.has(x) && setB.has(y)) || (setA.has(y) && setB.has(x))) {
+      // Allow "Inter Milan" vs "Internazionale" only if one actually represents Inter; block "Inter Milan" vs "AC Milan"
+      if (x === 'inter' && y === 'milan') {
+        const aIsInter = setA.has('inter') || setA.has('internazionale');
+        const bIsInter = setB.has('inter') || setB.has('internazionale');
+        if (aIsInter !== bIsInter) return false;
+      } else {
+        return false;
+      }
+    }
+  }
+
+  // Also block "Inter Milan" vs "Milan" when "inter" is missing from one side
+  if ((setA.has('inter') && !setB.has('inter') && setB.has('milan')) || (setB.has('inter') && !setA.has('inter') && setA.has('milan'))) {
+    return false;
+  }
+
+  // Distinguish Manchester United vs Manchester City even if one uses abbreviation/partial tokens
+  const distA = tokA.filter((t) => !GENERIC_TEAM_TOKENS.has(t));
+  const distB = tokB.filter((t) => !GENERIC_TEAM_TOKENS.has(t));
+
+  if (distA.length > 0 && distB.length > 0) {
+    const sharedDistinctive = distA.filter((t) => t.length >= 3 && setB.has(t));
+    if (sharedDistinctive.length > 0) {
+      return true;
+    }
+    // Partial prefix match for truncated club names (min 5 chars, e.g. "internazionale" vs "inter")
+    for (const ta of distA) {
+      for (const tb of distB) {
+        if (ta.length >= 5 && tb.length >= 5 && (ta.startsWith(tb) || tb.startsWith(ta))) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  // Both teams consist solely of generic tokens (e.g. "Real Madrid" vs "Real Sociedad" or "Madrid"):
+  // Require ALL tokens of the shorter name (with >=2 tokens) to appear in the longer name AND equal shared length >= 2
+  const sharedAll = tokA.filter((t) => setB.has(t));
+  return sharedAll.length >= 2 && sharedAll.length === Math.min(tokA.length, tokB.length);
 }
 
 function mapEspnFootballStatus(ev: AnyObj): { status: MatchStatus; clock?: string } {
@@ -79,138 +192,6 @@ function mapEspnFootballStatus(ev: AnyObj): { status: MatchStatus; clock?: strin
   if (day < today) return { status: 'finished' };
   if (day === today) return { status: 'today' };
   return { status: 'upcoming' };
-}
-
-function parseEspnOddsArray(
-  oddsArr: unknown,
-  matchId: string,
-  sport: 'football' | 'nba',
-  homeName: string,
-  awayName: string,
-  updatedAt: string
-): BookmakerOdd[] {
-  if (!Array.isArray(oddsArr) || oddsArr.length === 0) return [];
-  const primary = (oddsArr[0] ?? {}) as AnyObj;
-  const provider = (primary.provider as AnyObj | undefined) ?? {};
-  const bookmaker = String(provider.displayName ?? provider.name ?? 'DraftKings (ESPN)');
-  const parsed: BookmakerOdd[] = [];
-
-  const ml = (primary.moneyline as AnyObj | undefined) ?? {};
-  const homeMl = americanToDecimal(
-    (ml.home as AnyObj | undefined)?.close && ((ml.home as AnyObj).close as AnyObj).odds
-      ? ((ml.home as AnyObj).close as AnyObj).odds
-      : (primary.homeTeamOdds as AnyObj | undefined)?.moneyLine
-  );
-  const awayMl = americanToDecimal(
-    (ml.away as AnyObj | undefined)?.close && ((ml.away as AnyObj).close as AnyObj).odds
-      ? ((ml.away as AnyObj).close as AnyObj).odds
-      : (primary.awayTeamOdds as AnyObj | undefined)?.moneyLine
-  );
-  const drawMl = americanToDecimal(
-    (ml.draw as AnyObj | undefined)?.close && ((ml.draw as AnyObj).close as AnyObj).odds
-      ? ((ml.draw as AnyObj).close as AnyObj).odds
-      : (primary.drawOdds as AnyObj | undefined)?.moneyLine
-  );
-
-  if (sport === 'football' && homeMl && drawMl && awayMl) {
-    const threeWay: [number, number, number] = [homeMl, drawMl, awayMl];
-    parsed.push({
-      id: `${matchId}-espn-1x2-home`,
-      marketCategory: 'match',
-      marketLabel: 'Resultado Final (1X2)',
-      selectionLabel: `Victoria ${homeName}`,
-      side: 'home',
-      decimalOdds: homeMl,
-      threeWayOdds: threeWay,
-      bookmaker,
-      updatedAt,
-    });
-    parsed.push({
-      id: `${matchId}-espn-1x2-draw`,
-      marketCategory: 'match',
-      marketLabel: 'Resultado Final (1X2)',
-      selectionLabel: 'Empate',
-      side: 'draw',
-      decimalOdds: drawMl,
-      threeWayOdds: threeWay,
-      bookmaker,
-      updatedAt,
-    });
-    parsed.push({
-      id: `${matchId}-espn-1x2-away`,
-      marketCategory: 'match',
-      marketLabel: 'Resultado Final (1X2)',
-      selectionLabel: `Victoria ${awayName}`,
-      side: 'away',
-      decimalOdds: awayMl,
-      threeWayOdds: threeWay,
-      bookmaker,
-      updatedAt,
-    });
-  } else if (sport === 'nba' && homeMl && awayMl) {
-    parsed.push({
-      id: `${matchId}-espn-ml-home`,
-      marketCategory: 'match',
-      marketLabel: 'Ganador del Partido (Moneyline)',
-      selectionLabel: homeName,
-      side: 'home',
-      decimalOdds: homeMl,
-      complementOdds: awayMl,
-      bookmaker,
-      updatedAt,
-    });
-    parsed.push({
-      id: `${matchId}-espn-ml-away`,
-      marketCategory: 'match',
-      marketLabel: 'Ganador del Partido (Moneyline)',
-      selectionLabel: awayName,
-      side: 'away',
-      decimalOdds: awayMl,
-      complementOdds: homeMl,
-      bookmaker,
-      updatedAt,
-    });
-  }
-
-  // Over / Under Total (football goals OR NBA total points)
-  const totalObj = (primary.total as AnyObj | undefined) ?? {};
-  const overClose = ((totalObj.over as AnyObj | undefined)?.close as AnyObj | undefined) ?? {};
-  const underClose = ((totalObj.under as AnyObj | undefined)?.close as AnyObj | undefined) ?? {};
-  const overOdds = americanToDecimal(overClose.odds ?? primary.overOdds);
-  const underOdds = americanToDecimal(underClose.odds ?? primary.underOdds);
-  const rawLineStr = String(overClose.line ?? primary.overUnder ?? '');
-  const lineNum = Number(rawLineStr.replace(/[^0-9.]/g, ''));
-
-  if (overOdds && underOdds && Number.isFinite(lineNum) && lineNum > 0) {
-    parsed.push({
-      id: `${matchId}-espn-ou-over`,
-      marketCategory: 'totals',
-      marketLabel: sport === 'football' ? 'Más / Menos Goles' : 'Total Puntos (O/U)',
-      selectionLabel:
-        sport === 'football' ? `Más de ${lineNum} goles` : `Más de ${lineNum} puntos`,
-      line: lineNum,
-      side: 'over',
-      decimalOdds: overOdds,
-      complementOdds: underOdds,
-      bookmaker,
-      updatedAt,
-    });
-    parsed.push({
-      id: `${matchId}-espn-ou-under`,
-      marketCategory: 'totals',
-      marketLabel: sport === 'football' ? 'Más / Menos Goles' : 'Total Puntos (O/U)',
-      selectionLabel:
-        sport === 'football' ? `Menos de ${lineNum} goles` : `Menos de ${lineNum} puntos`,
-      line: lineNum,
-      side: 'under',
-      decimalOdds: underOdds,
-      complementOdds: overOdds,
-      bookmaker,
-      updatedAt,
-    });
-  }
-
-  return parsed;
 }
 
 export const ESPN_SOCCER_LEAGUES: Array<{ slug: string; name: string }> = [
@@ -235,149 +216,26 @@ export async function fetchEspnSoccerEnrichment(): Promise<{
   const todayStr = isoDateOffset(0);
   const maxStr = isoDateOffset(12);
 
-  const ingestScoreboardJson = (lg: { slug: string; name: string }, json: { events?: AnyObj[] }) => {
-    for (const ev of json.events ?? []) {
-      const evId = String(ev.id ?? '');
-      if (!evId || seen.has(evId)) continue;
-      seen.add(evId);
-
-      const comp = ((ev.competitions as AnyObj[] | undefined)?.[0] ?? {}) as AnyObj;
-      const competitors = (comp.competitors as AnyObj[] | undefined) ?? [];
-      const homeC = competitors.find((c) => c.homeAway === 'home') ?? competitors[0];
-      const awayC = competitors.find((c) => c.homeAway === 'away') ?? competitors[1];
-      if (!homeC || !awayC) continue;
-
-      const homeTeam = (homeC.team as AnyObj | undefined) ?? {};
-      const awayTeam = (awayC.team as AnyObj | undefined) ?? {};
-      const homeName = String(homeTeam.displayName ?? homeTeam.name ?? 'Local');
-      const awayName = String(awayTeam.displayName ?? awayTeam.name ?? 'Visitante');
-      const { status, clock } = mapEspnFootballStatus(ev);
-
-      const hScore = homeC.score !== undefined ? Number(homeC.score) : NaN;
-      const aScore = awayC.score !== undefined ? Number(awayC.score) : NaN;
-      const hasScore =
-        (status === 'live' || status === 'finished') &&
-        Number.isFinite(hScore) &&
-        Number.isFinite(aScore);
-
-      const odds = parseEspnOddsArray(
-        comp.odds,
-        `espnsoc-${lg.slug}-${evId}`,
-        'football',
-        homeName,
-        awayName,
-        fetchedAt
-      );
-
-      const homeForm = String(homeC.form ?? '')
-        .slice(-5)
-        .split('')
-        .filter((c) => c === 'W' || c === 'D' || c === 'L') as ('W' | 'D' | 'L')[];
-      const awayForm = String(awayC.form ?? '')
-        .slice(-5)
-        .split('')
-        .filter((c) => c === 'W' || c === 'D' || c === 'L') as ('W' | 'D' | 'L')[];
-
-      matches.push({
-        id: `espnsoc-${lg.slug}-${evId}`,
-        sport: 'football',
-        competition: lg.name,
-        season: 'Actual',
-        status,
-        kickoffIso: String(ev.date ?? fetchedAt),
-        minuteOrClock: clock,
-        venue: String((comp.venue as AnyObj | undefined)?.fullName ?? 'Estadio oficial'),
-        homeTeam: {
-          id: `espnsoc-team-${String(homeTeam.id ?? homeName)}`,
-          name: homeName,
-          shortName: String(homeTeam.abbreviation ?? homeName.slice(0, 3)).toUpperCase(),
-          league: lg.name,
-          record: String((homeC.records as AnyObj[] | undefined)?.[0]?.summary ?? 'Oficial'),
-          formRecent: homeForm,
-          restDays: 4,
-        },
-        awayTeam: {
-          id: `espnsoc-team-${String(awayTeam.id ?? awayName)}`,
-          name: awayName,
-          shortName: String(awayTeam.abbreviation ?? awayName.slice(0, 3)).toUpperCase(),
-          league: lg.name,
-          record: String((awayC.records as AnyObj[] | undefined)?.[0]?.summary ?? 'Oficial'),
-          formRecent: awayForm,
-          restDays: 4,
-        },
-        score: hasScore ? { home: hScore, away: aScore } : undefined,
-        lineupStatus: 'unknown',
-        homePlayers: [],
-        awayPlayers: [],
-        h2hSummary: {
-          played: 0,
-          homeWins: 0,
-          draws: 0,
-          awayWins: 0,
-          avgTotalPointsOrGoals: 2.5,
-          lastMeetings: [],
-        },
-        odds,
-        dataOrigin: 'ESPN Soccer + DraftKings',
-        updatedAt: fetchedAt,
-        isOfflineReference: false,
-      });
-    }
-  };
-
-  await Promise.all(
-    ESPN_SOCCER_LEAGUES.map(async (lg) => {
-      try {
-        const res = await fetch(
-          `https://site.api.espn.com/apis/site/v2/sports/soccer/${lg.slug}/scoreboard`
-        );
-        if (!res.ok) return;
-        const json = (await res.json()) as {
-          events?: AnyObj[];
-          leagues?: Array<{ calendar?: string[] }>;
-        };
-        ingestScoreboardJson(lg, json);
-
-        // Fetch up to 4 upcoming matchday dates from this league's calendar within the next 12 days
-        const upcomingDates = Array.from(
-          new Set(
-            (json.leagues?.[0]?.calendar ?? [])
-              .map((d) => String(d).slice(0, 10))
-              .filter((d) => d >= todayStr && d <= maxStr)
-          )
-        ).slice(0, 4);
-
-        if (upcomingDates.length > 0) {
-          await Promise.all(
-            upcomingDates.map(async (isoDay) => {
-              try {
-                const dParam = isoDay.replace(/-/g, '');
-                const dRes = await fetch(
-                  `https://site.api.espn.com/apis/site/v2/sports/soccer/${lg.slug}/scoreboard?dates=${dParam}`
-                );
-                if (!dRes.ok) return;
-                const dJson = (await dRes.json()) as { events?: AnyObj[] };
-                ingestScoreboardJson(lg, dJson);
-              } catch {
-                // Skip single calendar date hiccup
-              }
-            })
-          );
-        }
-      } catch {
-        // Ignore single-league network hiccup
-      }
-    })
-  );
-
-  // Fetch ESPN Standings for top 5 European leagues (0 Football-Data rate-limit cost)
+  // Fetch standings first for top 5 leagues so scoreboard matches can inherit real team metrics
   const standings: StandingEntry[] = [];
+  const teamStatsLookup = new Map<
+    string,
+    {
+      played: number;
+      record: string;
+      ppg: number;
+      oppg: number;
+    }
+  >();
+
   const standingLeagues = ESPN_SOCCER_LEAGUES.slice(0, 5);
   await Promise.all(
     standingLeagues.map(async (lg) => {
       try {
-        const res = await fetch(
-          `https://site.api.espn.com/apis/v2/sports/soccer/${lg.slug}/standings`
+        const res = await fetchWithTimeout(
+          `https://site.api.espn.com/apis/v2/sports/soccer/${lg.slug}/standings`,
+          undefined,
+          9000
         );
         if (!res.ok) return;
         const json = (await res.json()) as {
@@ -409,10 +267,20 @@ export async function fetchEspnSoccerEnrichment(): Promise<{
           const gf = Math.round(statVal(stats, 'pointsFor'));
           const ga = Math.round(statVal(stats, 'pointsAgainst'));
           const pts = Math.round(statVal(stats, 'points'));
+          const teamKey = `espnsoc-team-${String(team.id ?? teamShort)}`;
+
+          if (played > 0) {
+            teamStatsLookup.set(teamKey, {
+              played,
+              record: `${won}-${drawn}-${lost} · ${pts} pts`,
+              ppg: +(gf / played).toFixed(2),
+              oppg: +(ga / played).toFixed(2),
+            });
+          }
 
           standings.push({
             rank,
-            teamId: `espnsoc-team-${String(team.id ?? teamShort)}`,
+            teamId: teamKey,
             teamName,
             teamShort,
             league: lg.name,
@@ -435,6 +303,151 @@ export async function fetchEspnSoccerEnrichment(): Promise<{
     })
   );
 
+  const ingestScoreboardJson = (lg: { slug: string; name: string }, json: { events?: AnyObj[] }) => {
+    for (const ev of json.events ?? []) {
+      const evId = String(ev.id ?? '');
+      if (!evId || seen.has(evId)) continue;
+      seen.add(evId);
+
+      const comp = ((ev.competitions as AnyObj[] | undefined)?.[0] ?? {}) as AnyObj;
+      const competitors = (comp.competitors as AnyObj[] | undefined) ?? [];
+      const homeC = competitors.find((c) => c.homeAway === 'home') ?? competitors[0];
+      const awayC = competitors.find((c) => c.homeAway === 'away') ?? competitors[1];
+      if (!homeC || !awayC) continue;
+
+      const homeTeam = (homeC.team as AnyObj | undefined) ?? {};
+      const awayTeam = (awayC.team as AnyObj | undefined) ?? {};
+      const homeName = String(homeTeam.displayName ?? homeTeam.name ?? 'Local');
+      const awayName = String(awayTeam.displayName ?? awayTeam.name ?? 'Visitante');
+      const { status, clock } = mapEspnFootballStatus(ev);
+
+      const hScore = homeC.score !== undefined ? Number(homeC.score) : NaN;
+      const aScore = awayC.score !== undefined ? Number(awayC.score) : NaN;
+      const hasScore =
+        (status === 'live' || status === 'finished') &&
+        Number.isFinite(hScore) &&
+        Number.isFinite(aScore);
+
+      const homeForm = String(homeC.form ?? '')
+        .slice(-5)
+        .split('')
+        .filter((c) => c === 'W' || c === 'D' || c === 'L') as ('W' | 'D' | 'L')[];
+      const awayForm = String(awayC.form ?? '')
+        .slice(-5)
+        .split('')
+        .filter((c) => c === 'W' || c === 'D' || c === 'L') as ('W' | 'D' | 'L')[];
+
+      const hKey = `espnsoc-team-${String(homeTeam.id ?? homeName)}`;
+      const aKey = `espnsoc-team-${String(awayTeam.id ?? awayName)}`;
+      const hMeta = teamStatsLookup.get(hKey);
+      const aMeta = teamStatsLookup.get(aKey);
+
+      matches.push({
+        id: `espnsoc-${lg.slug}-${evId}`,
+        sport: 'football',
+        competition: lg.name,
+        season: 'Actual',
+        status,
+        kickoffIso: String(ev.date ?? fetchedAt),
+        minuteOrClock: clock,
+        venue: String((comp.venue as AnyObj | undefined)?.fullName ?? 'Estadio oficial'),
+        homeTeam: {
+          id: hKey,
+          name: homeName,
+          shortName: String(homeTeam.abbreviation ?? homeName.slice(0, 3)).toUpperCase(),
+          league: lg.name,
+          record: hMeta?.record ?? String((homeC.records as AnyObj[] | undefined)?.[0]?.summary ?? 'Oficial'),
+          playedGames: hMeta?.played,
+          ppgOrGpg: hMeta?.ppg,
+          oppgOrGapg: hMeta?.oppg,
+          attackHome: hMeta ? hMeta.ppg * 1.08 : undefined,
+          defenseHome: hMeta ? hMeta.oppg * 0.92 : undefined,
+          formRecent: homeForm,
+          restDays: 4,
+        },
+        awayTeam: {
+          id: aKey,
+          name: awayName,
+          shortName: String(awayTeam.abbreviation ?? awayName.slice(0, 3)).toUpperCase(),
+          league: lg.name,
+          record: aMeta?.record ?? String((awayC.records as AnyObj[] | undefined)?.[0]?.summary ?? 'Oficial'),
+          playedGames: aMeta?.played,
+          ppgOrGpg: aMeta?.ppg,
+          oppgOrGapg: aMeta?.oppg,
+          attackAway: aMeta ? aMeta.ppg * 0.94 : undefined,
+          defenseAway: aMeta ? aMeta.oppg * 1.06 : undefined,
+          formRecent: awayForm,
+          restDays: 4,
+        },
+        score: hasScore ? { home: hScore, away: aScore } : undefined,
+        lineupStatus: 'unknown',
+        homePlayers: [],
+        awayPlayers: [],
+        h2hSummary: {
+          played: 0,
+          homeWins: 0,
+          draws: 0,
+          awayWins: 0,
+          avgTotalPointsOrGoals: 2.5,
+          lastMeetings: [],
+        },
+        odds: [],
+        teamStatsQuality: hMeta && aMeta ? 'verified' : hMeta || aMeta ? 'estimated' : 'unavailable',
+        dataOrigin: 'ESPN Soccer Oficial',
+        updatedAt: fetchedAt,
+        isOfflineReference: false,
+      });
+    }
+  };
+
+  await Promise.all(
+    ESPN_SOCCER_LEAGUES.map(async (lg) => {
+      try {
+        const res = await fetchWithTimeout(
+          `https://site.api.espn.com/apis/site/v2/sports/soccer/${lg.slug}/scoreboard`,
+          undefined,
+          9000
+        );
+        if (!res.ok) return;
+        const json = (await res.json()) as {
+          events?: AnyObj[];
+          leagues?: Array<{ calendar?: string[] }>;
+        };
+        ingestScoreboardJson(lg, json);
+
+        const upcomingDates = Array.from(
+          new Set(
+            (json.leagues?.[0]?.calendar ?? [])
+              .map((d) => String(d).slice(0, 10))
+              .filter((d) => d >= todayStr && d <= maxStr)
+          )
+        ).slice(0, 4);
+
+        if (upcomingDates.length > 0) {
+          await Promise.all(
+            upcomingDates.map(async (isoDay) => {
+              try {
+                const dParam = isoDay.replace(/-/g, '');
+                const dRes = await fetchWithTimeout(
+                  `https://site.api.espn.com/apis/site/v2/sports/soccer/${lg.slug}/scoreboard?dates=${dParam}`,
+                  undefined,
+                  9000
+                );
+                if (!dRes.ok) return;
+                const dJson = (await dRes.json()) as { events?: AnyObj[] };
+                ingestScoreboardJson(lg, dJson);
+              } catch {
+                // Skip single calendar date hiccup
+              }
+            })
+          );
+        }
+      } catch {
+        // Ignore single-league network hiccup
+      }
+    })
+  );
+
   return { matches, standings };
 }
 
@@ -444,11 +457,11 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
 }> {
   const fetchedAt = new Date().toISOString();
 
-  // Fetch NBA Standings first so every team gets real W-L, PPG, OPPG & Off/Def strengths
   const standings: StandingEntry[] = [];
   const teamMetaMap = new Map<
     string,
     {
+      played: number;
       record: string;
       homeRecord: string;
       awayRecord: string;
@@ -460,8 +473,10 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
   >();
 
   try {
-    const stRes = await fetch(
-      'https://site.api.espn.com/apis/v2/sports/basketball/nba/standings'
+    const stRes = await fetchWithTimeout(
+      'https://site.api.espn.com/apis/v2/sports/basketball/nba/standings',
+      undefined,
+      9000
     );
     if (stRes.ok) {
       const stJson = (await stRes.json()) as { children?: AnyObj[] };
@@ -487,21 +502,29 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
 
           const wins = getStatVal(['wins']);
           const losses = getStatVal(['losses']);
-          const played = Math.max(1, wins + losses);
-          const ppg = getStatVal(['avgPointsFor', 'pointsFor']) / (getStatVal(['avgPointsFor']) > 0 ? 1 : played);
-          const oppg = getStatVal(['avgPointsAgainst', 'pointsAgainst']) / (getStatVal(['avgPointsAgainst']) > 0 ? 1 : played);
-          const avgPpg = getStatVal(['avgPointsFor']) || (ppg > 50 ? ppg : 114.5);
-          const avgOppg = getStatVal(['avgPointsAgainst']) || (oppg > 50 ? oppg : 114.5);
-          const pct = getStatDisp(['winPercent']) || (wins / played).toFixed(3);
+          const played = wins + losses;
+          const safePlayed = Math.max(1, played);
+          const rawAvgPpg = getStatVal(['avgPointsFor']);
+          const rawTotPpg = getStatVal(['pointsFor']) / safePlayed;
+          const rawAvgOppg = getStatVal(['avgPointsAgainst']);
+          const rawTotOppg = getStatVal(['pointsAgainst']) / safePlayed;
+
+          const avgPpg = rawAvgPpg > 50 ? rawAvgPpg : rawTotPpg > 50 ? rawTotPpg : undefined;
+          const avgOppg = rawAvgOppg > 50 ? rawAvgOppg : rawTotOppg > 50 ? rawTotOppg : undefined;
+          const pct = getStatDisp(['winPercent']) || (played > 0 ? (wins / safePlayed).toFixed(3) : '0.000');
           const homeRec = getStatDisp(['Home', 'home']);
           const awayRec = getStatDisp(['Road', 'away']);
 
-          // Convert PPG/OPPG against league average (~114.5) into pace-adjusted ratings
-          const offRating = Math.max(103, Math.min(125, avgPpg * (114.5 / 114.0)));
-          const defRating = Math.max(103, Math.min(125, avgOppg * (114.5 / 114.0)));
+          if (teamId && played > 0 && avgPpg !== undefined && avgOppg !== undefined) {
+            // Bayesian shrinkage toward league mean (114.5) when early in the season (k=16)
+            const shrink = played / (played + 16);
+            const shrunkPpg = 114.5 + shrink * (avgPpg - 114.5);
+            const shrunkOppg = 114.5 + shrink * (avgOppg - 114.5);
+            const offRating = Math.max(104, Math.min(124, shrunkPpg * (114.5 / 114.0)));
+            const defRating = Math.max(104, Math.min(124, shrunkOppg * (114.5 / 114.0)));
 
-          if (teamId) {
             teamMetaMap.set(teamId, {
+              played,
               record: `${wins}-${losses}`,
               homeRecord: homeRec,
               awayRecord: awayRec,
@@ -519,12 +542,15 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
             teamShort: String(team.abbreviation ?? 'NBA'),
             league: 'NBA',
             conference: conf,
-            played: wins + losses,
+            played,
             won: wins,
             lost: losses,
-            goalsForOrPtsFor: Math.round(avgPpg * 10) / 10,
-            goalsAgainstOrPtsAgainst: Math.round(avgOppg * 10) / 10,
-            diff: Math.round((avgPpg - avgOppg) * 10) / 10,
+            goalsForOrPtsFor: avgPpg !== undefined ? Math.round(avgPpg * 10) / 10 : 0,
+            goalsAgainstOrPtsAgainst: avgOppg !== undefined ? Math.round(avgOppg * 10) / 10 : 0,
+            diff:
+              avgPpg !== undefined && avgOppg !== undefined
+                ? Math.round((avgPpg - avgOppg) * 10) / 10
+                : 0,
             pointsOrWinPct: pct,
             form: [],
             homeRecord: homeRec,
@@ -537,13 +563,14 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
     // Continue even if standings call hiccups
   }
 
-  // Fetch 16 days around today (-2 .. +13) so recent, today, live, and upcoming 2 weeks load
   const dateOffsets = [-2, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
   const dayBuckets = await Promise.all(
     dateOffsets.map(async (off) => {
       try {
-        const res = await fetch(
-          `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=${yyyymmddOffset(off)}`
+        const res = await fetchWithTimeout(
+          `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=${yyyymmddOffset(off)}`,
+          undefined,
+          9000
         );
         if (!res.ok) return [] as AnyObj[];
         const json = (await res.json()) as { events?: AnyObj[] };
@@ -601,20 +628,11 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
     const hRec = String(((homeC.records as AnyObj[] | undefined)?.[0]?.summary ?? hMeta?.record ?? 'NBA'));
     const aRec = String(((awayC.records as AnyObj[] | undefined)?.[0]?.summary ?? aMeta?.record ?? 'NBA'));
 
-    const odds = parseEspnOddsArray(
-      comp.odds,
-      `espn-nba-${evId}`,
-      'nba',
-      homeName,
-      awayName,
-      fetchedAt
-    );
-
     matches.push({
       id: `espn-nba-${evId}`,
       sport: 'nba',
       competition: 'NBA',
-      season: '2025-26 / Actual',
+      season: 'Actual',
       status,
       kickoffIso,
       minuteOrClock:
@@ -628,13 +646,13 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
         shortName: String(hTeam.abbreviation ?? homeName.slice(0, 3)).toUpperCase(),
         league: 'NBA',
         record: hRec,
+        playedGames: hMeta?.played,
         homeRecord: hMeta?.homeRecord,
         awayRecord: hMeta?.awayRecord,
         ppgOrGpg: hMeta?.ppg,
         oppgOrGapg: hMeta?.oppg,
         offRating: hMeta?.offRating,
         defRating: hMeta?.defRating,
-        pace: 99.5,
         formRecent: [],
         restDays: 2,
       },
@@ -644,13 +662,13 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
         shortName: String(aTeam.abbreviation ?? awayName.slice(0, 3)).toUpperCase(),
         league: 'NBA',
         record: aRec,
+        playedGames: aMeta?.played,
         homeRecord: aMeta?.homeRecord,
         awayRecord: aMeta?.awayRecord,
         ppgOrGpg: aMeta?.ppg,
         oppgOrGapg: aMeta?.oppg,
         offRating: aMeta?.offRating,
         defRating: aMeta?.defRating,
-        pace: 99.5,
         formRecent: [],
         restDays: 2,
       },
@@ -666,8 +684,9 @@ export async function fetchEspnNbaCalendarAndStandings(): Promise<{
         avgTotalPointsOrGoals: 224,
         lastMeetings: [],
       },
-      odds,
-      dataOrigin: 'ESPN NBA Oficial + DraftKings',
+      odds: [],
+      teamStatsQuality: hMeta && aMeta ? 'verified' : hMeta || aMeta ? 'estimated' : 'unavailable',
+      dataOrigin: 'ESPN NBA Oficial',
       updatedAt: fetchedAt,
       isOfflineReference: false,
     });
@@ -767,8 +786,10 @@ async function fetchEspnNbaAthleteGamelog(
   sampleSizeGames: number;
 } | null> {
   try {
-    const res = await fetch(
-      `https://site.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/${athleteId}/gamelog`
+    const res = await fetchWithTimeout(
+      `https://site.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/${athleteId}/gamelog`,
+      undefined,
+      8000
     );
     if (!res.ok) return null;
     const json = (await res.json()) as {
@@ -878,25 +899,25 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
   try {
     const [sumRes, homeRosterRes, awayRosterRes, homeSchedRes, awaySchedRes, homeStatRes, awayStatRes] =
       await Promise.all([
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${eventId}`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${eventId}`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : null))
           .catch(() => null) as Promise<AnyObj | null>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/roster`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/roster`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/roster`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/roster`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/schedule`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/schedule`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/schedule`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/schedule`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/statistics`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${homeTeamId}/statistics`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
-        fetch(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/statistics`)
+        fetchWithTimeout(`https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/${awayTeamId}/statistics`, undefined, 9000)
           .then((r) => (r.ok ? r.json() : {}))
           .catch(() => ({})) as Promise<AnyObj>,
       ]);
@@ -963,7 +984,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
     const homeSched = parseTeamSchedule(homeSchedRes, homeTeamId);
     const awaySched = parseTeamSchedule(awaySchedRes, awayTeamId);
 
-    // Fetch last completed game summaries if current game has no boxscore yet, to extract real starting 5
     const hasCurrentBoxscore =
       Array.isArray((sumRes?.boxscore as AnyObj | undefined)?.players) &&
       ((sumRes?.boxscore as AnyObj).players as unknown[]).length >= 2;
@@ -971,15 +991,19 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
     const [homeLastBox, awayLastBox] = !hasCurrentBoxscore
       ? await Promise.all([
           homeSched.lastCompletedEventId
-            ? fetch(
-                `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${homeSched.lastCompletedEventId}`
+            ? fetchWithTimeout(
+                `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${homeSched.lastCompletedEventId}`,
+                undefined,
+                8000
               )
                 .then((r) => (r.ok ? r.json() : null))
                 .catch(() => null) as Promise<AnyObj | null>
             : Promise.resolve(null),
           awaySched.lastCompletedEventId
-            ? fetch(
-                `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${awaySched.lastCompletedEventId}`
+            ? fetchWithTimeout(
+                `https://site.api.espn.com/apis/site/v2/sports/basketball/nba/summary?event=${awaySched.lastCompletedEventId}`,
+                undefined,
+                8000
               )
                 .then((r) => (r.ok ? r.json() : null))
                 .catch(() => null) as Promise<AnyObj | null>
@@ -1016,14 +1040,12 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       awayTeamId
     );
 
-    // Query official league-wide NBA injury feed in parallel/cached
     const officialInjFeed = await fetchOfficialNbaInjuriesFeed();
     const matchOfficialInjuries: ParsedInjuryRecord[] = [
       ...(officialInjFeed.byTeamId.get(homeTeamId) ?? []),
       ...(officialInjFeed.byTeamId.get(awayTeamId) ?? []),
     ];
 
-    // Map injuries from tonight's summary + roster medical notes + official injury report
     const injuryMap = new Map<
       string,
       {
@@ -1121,7 +1143,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
 
     const buildNbaSidePlayers = async (
       rosterJson: AnyObj,
-      espnTeamId: string,
       oppEspnId: string,
       teamId: string,
       teamName: string,
@@ -1131,7 +1152,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       const rawAthletes = (rosterJson.athletes as AnyObj[] | undefined) ?? [];
       if (rawAthletes.length === 0) return [];
 
-      // Order: recent starters first, then recent active rotation, then rest of roster
       const rankScore = (a: AnyObj): number => {
         const id = String(a.id ?? '');
         const name = String(a.fullName ?? a.displayName ?? '');
@@ -1145,7 +1165,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       const sorted = [...rawAthletes].sort((a, b) => rankScore(a) - rankScore(b));
       const selected = sorted.slice(0, 11);
 
-      // Count healthy starters so we assign 5 starters (confirmed_starter if official boxscore locked, else possible_starter)
       let starterAssigned = 0;
       const starterStatus: AvailabilityStatus = hasCurrentBoxscore
         ? 'confirmed_starter'
@@ -1172,7 +1191,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
         return { a, id, idx, inj, availability };
       });
 
-      // Promote top healthy available players to projected starter if a starter is OUT
       for (const item of candidateMeta) {
         if (starterAssigned >= 5) break;
         if (item.availability === 'available') {
@@ -1206,15 +1224,8 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
 
         const fallbackSplit: StatSplitValues = {
           games: 0,
-          minutes: isStarterAvail ? 28 : 16,
+          minutes: 0,
           starterRate: isStarterAvail ? 0.85 : 0.15,
-          points: 0,
-          rebounds: 0,
-          assists: 0,
-          threes: 0,
-          steals: 0,
-          blocks: 0,
-          turnovers: 0,
         };
 
         const splits = gl?.splits ?? {
@@ -1230,6 +1241,9 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
         const pts = splits.season.points ?? 0;
         const ast = splits.season.assists ?? 0;
         const isStarterSlot = isStarterAvail || item.availability === 'doubtful' || item.availability === 'probable';
+        const sampleGames = gl?.sampleSizeGames ?? 0;
+        const statsQuality: DataReliability =
+          sampleGames >= 8 ? 'verified' : sampleGames > 0 ? 'estimated' : 'unavailable';
 
         return {
           id: `espn-nba-p-${item.id}`,
@@ -1260,7 +1274,14 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
           },
           splits,
           recentLogs: gl?.recentLogs ?? [],
-          sampleSizeGames: gl?.sampleSizeGames ?? 0,
+          sampleSizeGames: sampleGames,
+          statsQuality,
+          statsOriginNote:
+            sampleGames >= 8
+              ? `Game log oficial ESPN (${sampleGames} partidos reales)`
+              : sampleGames > 0
+                ? `Muestra reducida ESPN (${sampleGames} partidos)`
+                : 'Sin historial individual de game log publicado',
         };
       });
     };
@@ -1268,7 +1289,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
     const [rawHomePlayers, rawAwayPlayers] = await Promise.all([
       buildNbaSidePlayers(
         homeRosterRes,
-        homeTeamId,
         awayTeamId,
         baseMatch.homeTeam.id,
         baseMatch.homeTeam.name,
@@ -1277,7 +1297,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       ),
       buildNbaSidePlayers(
         awayRosterRes,
-        awayTeamId,
         homeTeamId,
         baseMatch.awayTeam.id,
         baseMatch.awayTeam.name,
@@ -1310,7 +1329,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       hasCurrentBoxscore
     );
 
-    // Parse real H2H from seasonseries or recent mutual games
     const seriesEvents: Array<{ date: string; home: string; away: string; score: string }> = [];
     let hWins = 0;
     let aWins = 0;
@@ -1341,7 +1359,6 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       }
     }
 
-    // Extract team statistics comparison
     const extractTeamStat = (statJson: AnyObj, statName: string): string => {
       const cats = ((statJson.results as AnyObj | undefined)?.stats as AnyObj | undefined)?.categories as AnyObj[] | undefined;
       for (const c of cats ?? []) {
@@ -1350,6 +1367,34 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       }
       return '-';
     };
+
+    const extractTeamNum = (statJson: AnyObj, statName: string): number | null => {
+      const cats = ((statJson.results as AnyObj | undefined)?.stats as AnyObj | undefined)?.categories as AnyObj[] | undefined;
+      for (const c of cats ?? []) {
+        const found = ((c.stats as AnyObj[] | undefined) ?? []).find((s) => s.name === statName);
+        if (found?.value !== undefined && Number.isFinite(Number(found.value))) return Number(found.value);
+      }
+      return null;
+    };
+
+    const calcPaceFromTeamStats = (statJson: AnyObj): number | undefined => {
+      const fga = extractTeamNum(statJson, 'avgFieldGoalsAttempted');
+      const fta = extractTeamNum(statJson, 'avgFreeThrowsAttempted');
+      const orb = extractTeamNum(statJson, 'avgOffensiveRebounds');
+      const tov = extractTeamNum(statJson, 'avgTurnovers');
+      if (fga && fta !== null && orb !== null && tov !== null) {
+        const estPoss = fga - orb + tov + 0.44 * fta;
+        if (estPoss >= 88 && estPoss <= 112) return +estPoss.toFixed(1);
+      }
+      return undefined;
+    };
+
+    const homePace = calcPaceFromTeamStats(homeStatRes);
+    const awayPace = calcPaceFromTeamStats(awayStatRes);
+    const homeAvgReb = extractTeamNum(homeStatRes, 'avgRebounds') ?? undefined;
+    const awayAvgReb = extractTeamNum(awayStatRes, 'avgRebounds') ?? undefined;
+    const homeAvgAst = extractTeamNum(homeStatRes, 'avgAssists') ?? undefined;
+    const awayAvgAst = extractTeamNum(awayStatRes, 'avgAssists') ?? undefined;
 
     const teamStats = [
       {
@@ -1382,24 +1427,20 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
         homeValue: extractTeamStat(homeStatRes, 'avgRebounds'),
         awayValue: extractTeamStat(awayStatRes, 'avgRebounds'),
       },
+      {
+        label: 'Asistencias / partido',
+        homeValue: extractTeamStat(homeStatRes, 'avgAssists'),
+        awayValue: extractTeamStat(awayStatRes, 'avgAssists'),
+      },
     ];
-
-    const mergedOdds =
-      baseMatch.odds.length > 0
-        ? baseMatch.odds
-        : parseEspnOddsArray(
-            sumRes?.pickcenter ?? sumRes?.odds,
-            baseMatch.id,
-            'nba',
-            baseMatch.homeTeam.name,
-            baseMatch.awayTeam.name,
-            fetchedAt
-          );
 
     return {
       ...baseMatch,
       homeTeam: {
         ...baseMatch.homeTeam,
+        pace: homePace ?? baseMatch.homeTeam.pace,
+        avgRebounds: homeAvgReb ?? baseMatch.homeTeam.avgRebounds,
+        avgAssists: homeAvgAst ?? baseMatch.homeTeam.avgAssists,
         formRecent: homeSched.formRecent,
         recentGames: homeSched.recentGames,
         restDays: homeSched.restDays,
@@ -1407,6 +1448,9 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       },
       awayTeam: {
         ...baseMatch.awayTeam,
+        pace: awayPace ?? baseMatch.awayTeam.pace,
+        avgRebounds: awayAvgReb ?? baseMatch.awayTeam.avgRebounds,
+        avgAssists: awayAvgAst ?? baseMatch.awayTeam.avgAssists,
         formRecent: awaySched.formRecent,
         recentGames: awaySched.recentGames,
         restDays: awaySched.restDays,
@@ -1424,7 +1468,7 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
         avgTotalPointsOrGoals: seriesEvents.length ? totalPts / seriesEvents.length : 224,
         lastMeetings: seriesEvents,
       },
-      odds: mergedOdds,
+      odds: [],
       nbaNews: {
         fetchedAt,
         sourcesChecked: externalNews.sourcesChecked,
@@ -1437,11 +1481,21 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
             : 'GEMINI_API_KEY no configurada en el servidor (Settings > Secrets). Se muestran únicamente los partes oficiales NBA y noticias en vivo (ESPN, RotoWire, Yahoo Sports y CBS Sports).',
         },
         items: externalNews.items,
+        rejectedStaleCount: externalNews.rejectedStaleCount,
+        freshnessWarning: externalNews.freshnessWarning,
       },
       hydrationStatus: homePlayers.length > 0 ? 'ok' : 'not_published',
       hydrationNote: hasCurrentBoxscore
         ? 'Quintetos titulares confirmados, parte médico oficial y noticias actualizadas.'
         : 'Posibles titulares proyectados según rotaciones recientes + parte oficial de lesiones y noticias externas (los titulares definitivos se confirman ~30 min antes del inicio).',
+      provenance: {
+        source: 'ESPN NBA API + Parte Oficial NBA + Medios NBA',
+        fetchedAt,
+        status: homePlayers.length > 0 ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: 'real',
+      },
       updatedAt: fetchedAt,
     };
   } catch (err) {
@@ -1449,6 +1503,15 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
       ...baseMatch,
       hydrationStatus: 'network_error',
       hydrationNote: `Error consultando los datos NBA en vivo: ${err instanceof Error ? err.message : 'Fallo de red'}`,
+      provenance: {
+        source: baseMatch.dataOrigin,
+        fetchedAt,
+        status: 'error',
+        isStale: true,
+        staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+        dataType: 'unavailable',
+        errorMessage: err instanceof Error ? err.message : 'Fallo de red',
+      },
       updatedAt: fetchedAt,
     };
   }
@@ -1456,25 +1519,67 @@ export async function hydrateEspnNbaMatch(baseMatch: MatchRecord): Promise<Match
 
 export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<MatchRecord> {
   const fetchedAt = new Date().toISOString();
-  // id format: espnsoc-{slug}-{eventId}
   const rest = baseMatch.id.replace('espnsoc-', '');
   const lastDash = rest.lastIndexOf('-');
   const slug = rest.slice(0, lastDash);
   const eventId = rest.slice(lastDash + 1);
 
   try {
-    const res = await fetch(
-      `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/summary?event=${eventId}`
+    const res = await fetchWithTimeout(
+      `https://site.api.espn.com/apis/site/v2/sports/soccer/${slug}/summary?event=${eventId}`,
+      undefined,
+      9000
     );
     if (!res.ok) {
       return {
         ...baseMatch,
         hydrationStatus: 'query_error',
         hydrationNote: `El proveedor ESPN Soccer devolvió HTTP ${res.status} al consultar el detalle del partido.`,
+        provenance: {
+          source: 'ESPN Soccer API',
+          fetchedAt,
+          status: 'error',
+          isStale: true,
+          staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+          dataType: 'unavailable',
+          errorMessage: `HTTP ${res.status}`,
+        },
       };
     }
     const sum = (await res.json()) as AnyObj;
     const rosters = (sum.rosters as AnyObj[] | undefined) ?? [];
+
+    // Extract real team IDs from header / boxscore / rosters for historical lineup lookup
+    const boxTeams = (((sum.boxscore as AnyObj | undefined)?.teams as AnyObj[] | undefined) ?? []);
+    const headerComp = ((((sum.header as AnyObj | undefined)?.competitions as AnyObj[] | undefined)?.[0]) ?? {}) as AnyObj;
+    const headerComps = (headerComp.competitors as AnyObj[] | undefined) ?? [];
+    const headerHome = headerComps.find((c) => c.homeAway === 'home') ?? headerComps[0];
+    const headerAway = headerComps.find((c) => c.homeAway === 'away') ?? headerComps[1];
+
+    const homeEspnTeamId =
+      String((rosters[0]?.team as AnyObj | undefined)?.id ?? (headerHome?.team as AnyObj | undefined)?.id ?? baseMatch.homeTeam.id.replace('espnsoc-t-', ''));
+    const awayEspnTeamId =
+      String((rosters[1]?.team as AnyObj | undefined)?.id ?? (headerAway?.team as AnyObj | undefined)?.id ?? baseMatch.awayTeam.id.replace('espnsoc-t-', ''));
+
+    // Extract boxscore team stats when already available (live/finished matches)
+    const parseBoxTeamStat = (teamIdx: number, names: string[]): number | undefined => {
+      const statsArr = (boxTeams[teamIdx]?.statistics as AnyObj[] | undefined) ?? [];
+      for (const n of names) {
+        const found = statsArr.find((s) => String(s.name ?? '').toLowerCase() === n.toLowerCase());
+        const num = Number(found?.displayValue ?? found?.value);
+        if (found && Number.isFinite(num)) return num;
+      }
+      return undefined;
+    };
+
+    const homeBoxShots = parseBoxTeamStat(0, ['totalShots', 'shotsSummary']);
+    const awayBoxShots = parseBoxTeamStat(1, ['totalShots', 'shotsSummary']);
+    const homeBoxSot = parseBoxTeamStat(0, ['shotsOnTarget']);
+    const awayBoxSot = parseBoxTeamStat(1, ['shotsOnTarget']);
+    const homeBoxCorners = parseBoxTeamStat(0, ['wonCorners', 'cornerKicks']);
+    const awayBoxCorners = parseBoxTeamStat(1, ['wonCorners', 'cornerKicks']);
+    const homeBoxYc = parseBoxTeamStat(0, ['yellowCards']);
+    const awayBoxYc = parseBoxTeamStat(1, ['yellowCards']);
 
     const parseRoster = (
       sideIdx: number,
@@ -1497,6 +1602,49 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
         const isFwd = posCode === 'F';
         const isMid = posCode === 'M';
 
+        const rawStats = Array.isArray(entry.stats) ? (entry.stats as AnyObj[]) : [];
+        const getEntryStat = (names: string[]): number | undefined => {
+          const found = rawStats.find((s) => names.includes(String(s.name ?? '')));
+          const v = found?.value !== undefined ? Number(found.value) : NaN;
+          return Number.isFinite(v) ? v : undefined;
+        };
+        const statGoals = getEntryStat(['totalGoals', 'goals']);
+        const statAssists = getEntryStat(['goalAssists', 'assists']);
+        const statShots = getEntryStat(['totalShots', 'shots']);
+        const statSot = getEntryStat(['shotsOnTarget']);
+        const statFouls = getEntryStat(['foulsCommitted']);
+        const statYellows = getEntryStat(['yellowCards']);
+        const statReds = getEntryStat(['redCards']);
+        const statSaves = getEntryStat(['saves']);
+        const statConceded = getEntryStat(['goalsConceded', 'goalsAgainst']);
+        const hasRealEntryStats =
+          posCode === 'G'
+            ? statSaves !== undefined || statConceded !== undefined
+            : statGoals !== undefined || statShots !== undefined || statAssists !== undefined;
+
+        const baseSplit: StatSplitValues = hasRealEntryStats
+          ? {
+              games: 1,
+              minutes: isStarter ? 85 : 25,
+              starterRate: isStarter ? 1 : 0,
+              ...(posCode === 'G'
+                ? { saves: statSaves, goalsConceded: statConceded }
+                : {
+                    goals: statGoals,
+                    assists: statAssists,
+                    shots: statShots,
+                    shotsOnTarget: statSot,
+                    foulsCommitted: statFouls,
+                    yellowCards: statYellows,
+                    redCards: statReds,
+                  }),
+            }
+          : {
+              games: 0,
+              minutes: 0,
+              starterRate: isStarter ? 0.85 : 0.2,
+            };
+
         return {
           id: `espnsoc-p-${String(ath.id ?? `${teamShort}-${idx}`)}`,
           sport: 'football',
@@ -1507,26 +1655,33 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
           teamShort,
           number: Number(entry.jersey) || idx + 1,
           position: String(posObj.displayName ?? posAbbr),
-          availability: isStarter ? 'starter' : 'bench',
+          availability: confirmed ? (isStarter ? 'confirmed_starter' : 'bench') : isStarter ? 'possible_starter' : 'bench',
+          availabilityConfidence: confirmed ? 'confirmed' : 'projected',
+          starterConfidence: confirmed ? (isStarter ? 100 : 15) : isStarter ? 72 : 25,
+          roleReason: confirmed ? 'Once inicial oficial ESPN' : 'Listado previo ESPN',
           isKeyPlayer: isStarter && (isFwd || idx < 4),
           pitchCoord: isStarter ? mapFootballGridCoord(idx, 11, posCode) : undefined,
           impact: {
-            offenseDelta: isFwd ? 0.25 : isMid ? 0.13 : 0.04,
-            defenseDelta: posCode === 'G' || posCode === 'D' ? 0.13 : 0.04,
-            usageShare: isFwd ? 0.17 : isMid ? 0.1 : 0.03,
-            assistShare: isMid ? 0.19 : isFwd ? 0.14 : 0.04,
+            offenseDelta: isFwd ? 0.24 : isMid ? 0.12 : 0.04,
+            defenseDelta: posCode === 'G' || posCode === 'D' ? 0.12 : 0.04,
+            usageShare: isFwd ? 0.16 : isMid ? 0.1 : 0.03,
+            assistShare: isMid ? 0.18 : isFwd ? 0.13 : 0.04,
           },
           splits: {
-            season: { games: 10, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last5: { games: 5, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last10: { games: 10, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            last15: { games: 10, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            home: { games: 5, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.19 : 0.08, shots: isFwd ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isFwd ? 0.95 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            away: { games: 5, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.28 : isMid ? 0.11 : 0.04, assists: isMid ? 0.17 : 0.08, shots: isFwd ? 2.1 : isMid ? 1.05 : 0.4, shotsOnTarget: isFwd ? 0.85 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
-            h2h: { games: 2, minutes: isStarter ? 78 : 25, starterRate: isStarter ? 0.85 : 0.2, goals: isFwd ? 0.3 : isMid ? 0.12 : 0.04, assists: isMid ? 0.18 : 0.08, shots: isFwd ? 2.2 : isMid ? 1.1 : 0.4, shotsOnTarget: isFwd ? 0.9 : 0.4, foulsCommitted: 0.9, foulsDrawn: 1.1, yellowCards: 0.15, redCards: 0.01, passes: isMid ? 46 : 32 },
+            season: baseSplit,
+            last5: baseSplit,
+            last10: baseSplit,
+            last15: baseSplit,
+            home: baseSplit,
+            away: baseSplit,
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.2 },
           },
           recentLogs: [],
-          sampleSizeGames: 10,
+          sampleSizeGames: hasRealEntryStats ? 1 : 0,
+          statsQuality: hasRealEntryStats ? 'estimated' : 'unavailable',
+          statsOriginNote: hasRealEntryStats
+            ? 'Estadísticas del encuentro ESPN (sin historial completo de temporada)'
+            : 'Estadísticas individuales reales no disponibles en esta fuente',
         };
       });
 
@@ -1574,26 +1729,25 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
       }
     }
 
-    const mergedOdds =
-      baseMatch.odds.length > 0
-        ? baseMatch.odds
-        : parseEspnOddsArray(
-            sum.pickcenter ?? sum.odds,
-            baseMatch.id,
-            'football',
-            baseMatch.homeTeam.name,
-            baseMatch.awayTeam.name,
-            fetchedAt
-          );
-
-    return {
+    let hydrated: MatchRecord = {
       ...baseMatch,
-      homeTeam: { ...baseMatch.homeTeam, formation: homeR.formation ?? baseMatch.homeTeam.formation },
-      awayTeam: { ...baseMatch.awayTeam, formation: awayR.formation ?? baseMatch.awayTeam.formation },
-      lineupStatus: homeR.confirmed && awayR.confirmed ? 'confirmed' : homeR.players.length > 0 ? 'provisional' : 'unknown',
-      homePlayers: homeR.players,
-      awayPlayers: awayR.players,
-      odds: mergedOdds,
+      homeTeam: {
+        ...baseMatch.homeTeam,
+        formation: homeR.formation ?? baseMatch.homeTeam.formation,
+        avgShots: homeBoxShots ?? baseMatch.homeTeam.avgShots,
+        avgShotsOnTarget: homeBoxSot ?? baseMatch.homeTeam.avgShotsOnTarget,
+        avgCorners: homeBoxCorners ?? baseMatch.homeTeam.avgCorners,
+        avgYellowCards: homeBoxYc ?? baseMatch.homeTeam.avgYellowCards,
+      },
+      awayTeam: {
+        ...baseMatch.awayTeam,
+        formation: awayR.formation ?? baseMatch.awayTeam.formation,
+        avgShots: awayBoxShots ?? baseMatch.awayTeam.avgShots,
+        avgShotsOnTarget: awayBoxSot ?? baseMatch.awayTeam.avgShotsOnTarget,
+        avgCorners: awayBoxCorners ?? baseMatch.awayTeam.avgCorners,
+        avgYellowCards: awayBoxYc ?? baseMatch.awayTeam.avgYellowCards,
+      },
+      odds: [],
       h2hSummary: {
         played: h2hMeetings.length,
         homeWins: hWins,
@@ -1602,13 +1756,76 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
         avgTotalPointsOrGoals: h2hMeetings.length > 0 ? totalGoals / h2hMeetings.length : 2.5,
         lastMeetings: h2hMeetings.slice(0, 6),
       },
-      hydrationStatus: homeR.players.length > 0 ? 'ok' : 'not_published',
-      hydrationNote:
-        homeR.players.length > 0
-          ? homeR.confirmed
-            ? 'Alineaciones oficiales confirmadas por el proveedor.'
-            : 'Plantilla / once probable disponible previo a confirmación oficial.'
-          : 'Alineación todavía no publicada por la competición (suele confirmarse ~60 min antes del inicio).',
+      teamStatsQuality:
+        baseMatch.homeTeam.ppgOrGpg !== undefined && baseMatch.awayTeam.ppgOrGpg !== undefined
+          ? 'verified'
+          : 'estimated',
+      updatedAt: fetchedAt,
+    };
+
+    if (homeR.confirmed && awayR.confirmed) {
+      hydrated = promoteOfficialToConfirmedLineup(
+        hydrated,
+        homeR.players,
+        awayR.players,
+        'ESPN Soccer / Oficial Competición',
+        fetchedAt,
+        homeR.formation,
+        awayR.formation
+      );
+      hydrated.hydrationStatus = 'ok';
+      hydrated.hydrationNote = 'Alineaciones oficiales confirmadas por la competición y cargadas en el campo táctico.';
+      hydrated.provenance = {
+        source: 'ESPN Soccer Oficial',
+        fetchedAt,
+        status: 'ok',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: 'real',
+      };
+      return hydrated;
+    }
+
+    // Hours before kickoff: build probable XI from ESPN recent starter frequencies + news RSS
+    const probableBundle = await buildProbableFootballLineups({
+      match: hydrated,
+      slug,
+      homeEspnTeamId,
+      awayEspnTeamId,
+      includeSearchGrounding: false,
+    });
+
+    const finalHomePlayers = homeR.players.length >= 11 ? homeR.players : probableBundle.homePlayers;
+    const finalAwayPlayers = awayR.players.length >= 11 ? awayR.players : probableBundle.awayPlayers;
+    const hasProbable = finalHomePlayers.length > 0 || finalAwayPlayers.length > 0;
+
+    return {
+      ...hydrated,
+      homeTeam: {
+        ...hydrated.homeTeam,
+        formation: probableBundle.homeFormation ?? hydrated.homeTeam.formation,
+      },
+      awayTeam: {
+        ...hydrated.awayTeam,
+        formation: probableBundle.awayFormation ?? hydrated.awayTeam.formation,
+      },
+      lineupStatus: hasProbable ? 'provisional' : 'unknown',
+      homePlayers: finalHomePlayers,
+      awayPlayers: finalAwayPlayers,
+      probableLineup: probableBundle.probableLineup,
+      footballNews: probableBundle.footballNews,
+      hydrationStatus: hasProbable ? 'ok' : 'not_published',
+      hydrationNote: hasProbable
+        ? 'Alineación probable calculada a partir de los últimos onces iniciales, plantilla oficial y noticias deportivas recientes (se actualizará automáticamente al confirmarse el once oficial).'
+        : 'Todavía no hay datos suficientes ni convocatoria oficial publicada para proyectar el once probable.',
+      provenance: {
+        source: `ESPN Soccer + ${probableBundle.footballNews.sourcesChecked.slice(0, 3).join(', ')}`,
+        fetchedAt,
+        status: hasProbable ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: hasProbable ? 'estimated' : 'unavailable',
+      },
       updatedAt: fetchedAt,
     };
   } catch (err) {
@@ -1616,217 +1833,16 @@ export async function hydrateEspnSoccerMatch(baseMatch: MatchRecord): Promise<Ma
       ...baseMatch,
       hydrationStatus: 'network_error',
       hydrationNote: `Error de red al consultar detalle: ${err instanceof Error ? err.message : 'desconocido'}`,
+      provenance: {
+        source: 'ESPN Soccer API',
+        fetchedAt,
+        status: 'error',
+        isStale: true,
+        staleAgeMinutes: Math.max(0, Math.round((Date.now() - new Date(baseMatch.updatedAt).getTime()) / 60_000)),
+        dataType: 'unavailable',
+        errorMessage: err instanceof Error ? err.message : 'desconocido',
+      },
       updatedAt: fetchedAt,
     };
   }
-}
-
-/**
- * Fetches real odds from The Odds API (when configured) and merges them cleanly onto existing Football & NBA matches.
- */
-export async function fetchTheOddsApiForSport(
-  sport: 'football' | 'nba',
-  apiKey: string
-): Promise<MatchRecord[]> {
-  const fetchedAt = new Date().toISOString();
-  const keys =
-    sport === 'football'
-      ? [
-          'soccer_spain_la_liga',
-          'soccer_epl',
-          'soccer_germany_bundesliga',
-          'soccer_italy_serie_a',
-          'soccer_france_ligue_one',
-          'soccer_uefa_champs_league',
-          'soccer_uefa_europa_league',
-        ]
-      : ['basketball_nba'];
-
-  const results = await Promise.all(
-    keys.map(async (sk) => {
-      try {
-        const res = await fetch(
-          `https://api.the-odds-api.com/v4/sports/${sk}/odds/?apiKey=${encodeURIComponent(
-            apiKey.trim()
-          )}&regions=eu&markets=h2h,totals`
-        );
-        if (!res.ok) return [];
-        return (await res.json()) as Array<{
-          id: string;
-          sport_title: string;
-          commence_time: string;
-          home_team: string;
-          away_team: string;
-          bookmakers: Array<{
-            title: string;
-            last_update: string;
-            markets: Array<{
-              key: string;
-              outcomes: Array<{ name: string; price: number; point?: number }>;
-            }>;
-          }>;
-        }>;
-      } catch {
-        return [];
-      }
-    })
-  );
-
-  const out: MatchRecord[] = [];
-  for (const ev of results.flat()) {
-    const bm = ev.bookmakers?.[0];
-    if (!bm) continue;
-    const odds: BookmakerOdd[] = [];
-    const h2h = bm.markets?.find((m) => m.key === 'h2h');
-    if (h2h && h2h.outcomes.length >= 2) {
-      const homeO = h2h.outcomes.find((o) => o.name === ev.home_team);
-      const drawO = h2h.outcomes.find((o) => o.name === 'Draw');
-      const awayO = h2h.outcomes.find((o) => o.name === ev.away_team);
-      if (homeO && awayO) {
-        const threeWay: [number, number, number] | undefined = drawO
-          ? [homeO.price, drawO.price, awayO.price]
-          : undefined;
-        odds.push({
-          id: `oddsapi-${ev.id}-h2h-home`,
-          marketCategory: 'match',
-          marketLabel: sport === 'football' ? 'Resultado Final (1X2)' : 'Ganador (Moneyline)',
-          selectionLabel: `Victoria ${ev.home_team}`,
-          side: 'home',
-          decimalOdds: homeO.price,
-          threeWayOdds: threeWay,
-          complementOdds: !drawO ? awayO.price : undefined,
-          bookmaker: bm.title,
-          updatedAt: bm.last_update || fetchedAt,
-        });
-        if (drawO) {
-          odds.push({
-            id: `oddsapi-${ev.id}-h2h-draw`,
-            marketCategory: 'match',
-            marketLabel: 'Resultado Final (1X2)',
-            selectionLabel: 'Empate',
-            side: 'draw',
-            decimalOdds: drawO.price,
-            threeWayOdds: threeWay,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update || fetchedAt,
-          });
-        }
-        odds.push({
-          id: `oddsapi-${ev.id}-h2h-away`,
-          marketCategory: 'match',
-          marketLabel: sport === 'football' ? 'Resultado Final (1X2)' : 'Ganador (Moneyline)',
-          selectionLabel: `Victoria ${ev.away_team}`,
-          side: 'away',
-          decimalOdds: awayO.price,
-          threeWayOdds: threeWay,
-          complementOdds: !drawO ? homeO.price : undefined,
-          bookmaker: bm.title,
-          updatedAt: bm.last_update || fetchedAt,
-        });
-      }
-    }
-
-    const totals = bm.markets?.find((m) => m.key === 'totals');
-    if (totals) {
-      const overO = totals.outcomes.find((o) => o.name === 'Over');
-      const underO = totals.outcomes.find((o) => o.name === 'Under');
-      if (overO && underO) {
-        odds.push({
-          id: `oddsapi-${ev.id}-totals-over`,
-          marketCategory: 'totals',
-          marketLabel: sport === 'football' ? 'Más / Menos Goles' : 'Total Puntos',
-          selectionLabel: `Más de ${overO.point ?? 2.5}`,
-          line: overO.point ?? 2.5,
-          side: 'over',
-          decimalOdds: overO.price,
-          complementOdds: underO.price,
-          bookmaker: bm.title,
-          updatedAt: bm.last_update || fetchedAt,
-        });
-        odds.push({
-          id: `oddsapi-${ev.id}-totals-under`,
-          marketCategory: 'totals',
-          marketLabel: sport === 'football' ? 'Más / Menos Goles' : 'Total Puntos',
-          selectionLabel: `Menos de ${underO.point ?? 2.5}`,
-          line: underO.point ?? 2.5,
-          side: 'under',
-          decimalOdds: underO.price,
-          complementOdds: overO.price,
-          bookmaker: bm.title,
-          updatedAt: bm.last_update || fetchedAt,
-        });
-      }
-    }
-
-    out.push({
-      id: `oddsapi-${ev.id}`,
-      sport,
-      competition: ev.sport_title,
-      season: 'Actual',
-      status: ev.commence_time.slice(0, 10) === isoDateOffset(0) ? 'today' : 'upcoming',
-      kickoffIso: ev.commence_time,
-      venue: 'Cuotas de mercado',
-      homeTeam: {
-        id: `odds-${ev.home_team}`,
-        name: ev.home_team,
-        shortName: ev.home_team.slice(0, 3).toUpperCase(),
-        league: ev.sport_title,
-        record: 'The Odds API',
-        formRecent: [],
-        restDays: sport === 'football' ? 4 : 2,
-      },
-      awayTeam: {
-        id: `odds-${ev.away_team}`,
-        name: ev.away_team,
-        shortName: ev.away_team.slice(0, 3).toUpperCase(),
-        league: ev.sport_title,
-        record: 'The Odds API',
-        formRecent: [],
-        restDays: sport === 'football' ? 4 : 2,
-      },
-      lineupStatus: 'unknown',
-      homePlayers: [],
-      awayPlayers: [],
-      h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: sport === 'football' ? 2.5 : 224, lastMeetings: [] },
-      odds,
-      dataOrigin: 'The Odds API v4',
-      updatedAt: fetchedAt,
-      isOfflineReference: false,
-    });
-  }
-  return out;
-}
-
-/**
- * Merges real odds from secondary feeds (The Odds API or ESPN/DraftKings) into calendar matches.
- */
-export function mergeRealOddsIntoMatches(
-  primaryMatches: MatchRecord[],
-  oddsSources: MatchRecord[]
-): MatchRecord[] {
-  if (oddsSources.length === 0) return primaryMatches;
-  return primaryMatches.map((m) => {
-    if (m.odds.length > 0) return m;
-    const matched = oddsSources.find(
-      (s) =>
-        s.sport === m.sport &&
-        s.odds.length > 0 &&
-        teamsMatch(m.homeTeam.name, s.homeTeam.name) &&
-        teamsMatch(m.awayTeam.name, s.awayTeam.name) &&
-        Math.abs(new Date(m.kickoffIso).getTime() - new Date(s.kickoffIso).getTime()) <= 48 * 3600 * 1000
-    );
-    if (!matched) return m;
-    return {
-      ...m,
-      odds: matched.odds,
-      homeTeam: {
-        ...m.homeTeam,
-        formRecent: m.homeTeam.formRecent.length > 0 ? m.homeTeam.formRecent : matched.homeTeam.formRecent,
-      },
-      awayTeam: {
-        ...m.awayTeam,
-        formRecent: m.awayTeam.formRecent.length > 0 ? m.awayTeam.formRecent : matched.awayTeam.formRecent,
-      },
-    };
-  });
 }

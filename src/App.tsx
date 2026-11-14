@@ -5,7 +5,6 @@ import {
   History,
   LayoutGrid,
   RefreshCw,
-  Scale,
   Search,
   Settings,
   Trophy,
@@ -15,6 +14,7 @@ import {
 import type {
   ApiConfigState,
   AvailabilityStatus,
+  LiveFeedMeta,
   LoggedPrediction,
   MatchRecord,
   MatchStatus,
@@ -25,15 +25,13 @@ import type {
 import { SANDBOX_MATCHES, SANDBOX_STANDINGS, INITIAL_PREDICTION_HISTORY } from './data/sandboxData.ts';
 import { computeFootballMatchPrediction } from './engine/footballModel.ts';
 import { computeNbaMatchPrediction } from './engine/nbaModel.ts';
-import { evaluateMatchOddsDiscrepancies } from './engine/oddsEngine.ts';
 import { MatchDetailView } from './components/MatchDetailView.tsx';
-import { OddsErrorDetector } from './components/OddsErrorDetector.tsx';
 import { StandingsView } from './components/StandingsView.tsx';
 import { HistoryEvaluationView } from './components/HistoryEvaluationView.tsx';
 import { ApiConfigView } from './components/ApiConfigView.tsx';
 import { PlayerDetailModal } from './components/PlayerDetailModal.tsx';
 
-type NavSection = 'overview' | 'matches' | 'odds' | 'history' | 'settings';
+type NavSection = 'overview' | 'matches' | 'history' | 'settings';
 type DataMode = 'live' | 'offline_sim';
 
 const EMPTY_API_CONFIG: ApiConfigState = {
@@ -46,11 +44,16 @@ const EMPTY_API_CONFIG: ApiConfigState = {
   },
   nba: {
     connected: false,
-    provider: 'basketballapi-net',
+    provider: 'espn-nba',
     maskedKey: null,
     reuseFootballKey: false,
     lastChecked: null,
     error: null,
+  },
+  security: {
+    pinConfigured: false,
+    unlocked: false,
+    envProtected: false,
   },
 };
 
@@ -67,11 +70,13 @@ export default function App() {
   const [liveMatches, setLiveMatches] = useState<MatchRecord[]>([]);
   const [liveStandings, setLiveStandings] = useState<StandingEntry[]>([]);
   const [liveErrors, setLiveErrors] = useState<string[]>([]);
+  const [liveFeedMeta, setLiveFeedMeta] = useState<LiveFeedMeta | null>(null);
   const [liveLoading, setLiveLoading] = useState(false);
 
   const [selectedMatchId, setSelectedMatchId] = useState<string | null>(null);
   const [hydratingMatchId, setHydratingMatchId] = useState<string | null>(null);
   const [refreshingNbaNewsId, setRefreshingNbaNewsId] = useState<string | null>(null);
+  const [refreshingFootballLineupId, setRefreshingFootballLineupId] = useState<string | null>(null);
   const [activeModalPlayer, setActiveModalPlayer] = useState<{
     player: PlayerProfile;
     match: MatchRecord;
@@ -90,16 +95,20 @@ export default function App() {
           matches: MatchRecord[];
           standings?: StandingEntry[];
           errors: string[];
+          feedMeta?: LiveFeedMeta;
         };
         setApiConfig(data.config);
         setLiveMatches(data.matches);
         setLiveStandings(data.standings ?? []);
         setLiveErrors(data.errors ?? []);
-        if (
+        setLiveFeedMeta(data.feedMeta ?? null);
+        const fbOk =
           data.config.football.connected ||
+          Object.values(data.config.footballProviders ?? {}).some((p) => p.connected);
+        const nbaOk =
           data.config.nba.connected ||
-          data.matches.length > 0
-        ) {
+          Object.values(data.config.nbaProviders ?? {}).some((p) => p.connected);
+        if (fbOk || nbaOk || data.matches.length > 0) {
           setDataMode('live');
         }
       }
@@ -201,21 +210,6 @@ export default function App() {
     return Array.from(map.values());
   }, [activeMatches, sport, playerOverrides]);
 
-  const topDiscrepanciesPreview = useMemo(() => {
-    const all = activeMatches.flatMap((m) => {
-      const homeOv = m.homePlayers.map((p) => ({
-        ...p,
-        availability: playerOverrides[p.id] ?? p.availability,
-      }));
-      const awayOv = m.awayPlayers.map((p) => ({
-        ...p,
-        availability: playerOverrides[p.id] ?? p.availability,
-      }));
-      return evaluateMatchOddsDiscrepancies(m, homeOv, awayOv);
-    });
-    return all.sort((a, b) => Math.abs(b.edgePct) - Math.abs(a.edgePct)).slice(0, 3);
-  }, [activeMatches, playerOverrides]);
-
   const handleToggleAvailability = (playerId: string, nextStatus: AvailabilityStatus) => {
     setPlayerOverrides((prev) => ({ ...prev, [playerId]: nextStatus }));
   };
@@ -238,12 +232,16 @@ export default function App() {
     }
   };
 
-  const handleResolveHistory = async (id: string, status: 'won' | 'lost') => {
+  const handleResolveHistory = async (
+    id: string,
+    status: 'won' | 'lost',
+    actualValue?: number
+  ) => {
     try {
       const res = await fetch(`/api/history/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify({ status, actualValue }),
       });
       if (res.ok) {
         const updated = (await res.json()) as LoggedPrediction[];
@@ -275,6 +273,30 @@ export default function App() {
       // Keep current match data cleanly if refresh fails
     } finally {
       setRefreshingNbaNewsId(null);
+    }
+  }, []);
+
+  const handleRefreshFootballLineups = useCallback(async (m: MatchRecord) => {
+    if (m.sport !== 'football' || m.isOfflineReference) return;
+    setRefreshingFootballLineupId(m.id);
+    try {
+      const res = await fetch('/api/football/match/refresh-lineups', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ match: m, includeSearchGrounding: true }),
+      });
+      if (res.ok) {
+        const data = (await res.json()) as { match: MatchRecord };
+        if (data.match) {
+          setLiveMatches((prev) =>
+            prev.map((item) => (item.id === data.match.id ? data.match : item))
+          );
+        }
+      }
+    } catch {
+      // Keep current match data cleanly if refresh fails
+    } finally {
+      setRefreshingFootballLineupId(null);
     }
   }, []);
 
@@ -345,8 +367,13 @@ export default function App() {
       availability: playerOverrides[p.id] ?? p.availability,
     }));
     const fbPred =
-      m.sport === 'football' ? computeFootballMatchPrediction(m, homeOv, awayOv) : null;
-    const nbaPred = m.sport === 'nba' ? computeNbaMatchPrediction(m, homeOv, awayOv) : null;
+      m.sport === 'football'
+        ? computeFootballMatchPrediction(m, homeOv, awayOv, historyItems)
+        : null;
+    const nbaPred =
+      m.sport === 'nba'
+        ? computeNbaMatchPrediction(m, homeOv, awayOv, historyItems)
+        : null;
 
     const statusLabel =
       m.status === 'live'
@@ -380,7 +407,11 @@ export default function App() {
               : m.lineupStatus === 'provisional'
               ? 'Alineación probable'
               : 'Alineación por confirmar'}
-            {m.odds.length > 0 ? ` · ${m.odds.length} cuotas` : ''}
+            {fbPred
+              ? ` · Cob. ${fbPred.dataConfidence}%`
+              : nbaPred
+                ? ` · Cob. ${nbaPred.dataConfidence}%`
+                : ''}
           </span>
           <span
             className={`font-mono tabular-nums font-medium ${
@@ -475,7 +506,7 @@ export default function App() {
           Sin conexión API configurada para {sport === 'football' ? 'Fútbol' : 'NBA'}
         </h3>
         <p className="text-xs text-slate-400 leading-relaxed">
-          SportAnalytics AI nunca inventa resultados ni cuotas reales. Introduce tu clave API en Configuración de APIs para cargar partidos en directo, o utiliza el Simulador Matemático Offline para probar los modelos, el campo interactivo y los deslizadores Over/Under.
+          SportAnalytics AI nunca inventa resultados ni estadísticas reales. Introduce tu clave API en Configuración de APIs para cargar partidos en directo, o utiliza el Simulador Matemático Offline para probar los modelos, el campo interactivo y los deslizadores Over/Under.
         </p>
       </div>
       <div className="flex flex-wrap items-center justify-center gap-3">
@@ -497,8 +528,16 @@ export default function App() {
     </div>
   );
 
+  const activeFbProviders = Object.values(apiConfig.footballProviders ?? {})
+    .filter((p) => p.connected)
+    .map((p) => p.provider);
+  const activeNbaProviders = Object.values(apiConfig.nbaProviders ?? {})
+    .filter((p) => p.connected)
+    .map((p) => p.provider);
+  const isFootballConnected = apiConfig.football.connected || activeFbProviders.length > 0;
+  const isNbaConnected = apiConfig.nba.connected || activeNbaProviders.length > 0;
   const isCurrentSportConnected =
-    sport === 'football' ? apiConfig.football.connected : apiConfig.nba.connected;
+    sport === 'football' ? isFootballConnected : isNbaConnected;
 
   return (
     <div className="min-h-screen bg-[#070B14] text-slate-100 flex flex-col pb-20 md:pb-10">
@@ -517,13 +556,12 @@ export default function App() {
             SportAnalytics AI
           </button>
 
-          {/* Zone 2: 4 concise single-line navigation links */}
+          {/* Zone 2: Concise single-line navigation links */}
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-300">
             {(
               [
                 { id: 'overview', label: 'Resumen' },
                 { id: 'matches', label: 'Partidos' },
-                { id: 'odds', label: 'Errores Cuota' },
                 { id: 'history', label: 'Historial' },
               ] as const
             ).map((nav) => (
@@ -605,7 +643,7 @@ export default function App() {
 
           {/* Data Mode Toggle (Honest Live API vs Offline Math Simulator) */}
           <div className="flex items-center gap-2">
-            {(apiConfig.football.connected || apiConfig.nba.connected) && (
+            {(isFootballConnected || isNbaConnected) && (
               <button
                 type="button"
                 onClick={() => loadConfigAndLive(true)}
@@ -661,7 +699,7 @@ export default function App() {
         {dataMode === 'offline_sim' && section !== 'settings' && (
           <div className="rounded-xl border border-slate-800 bg-[#0D1526] px-4 py-2.5 flex flex-wrap items-center justify-between gap-3 text-xs">
             <span className="text-slate-300">
-              Modo Simulador Offline activo · Escenario de verificación matemática para probar modelos, campo/pista, bajas y deslizadores Over/Under (no son cuotas ni eventos en directo).
+              Modo Simulador Offline activo · Escenario de verificación matemática para probar modelos, campo/pista, bajas y deslizadores Over/Under (no son eventos en directo).
             </span>
             <button
               type="button"
@@ -669,6 +707,21 @@ export default function App() {
               className="text-blue-400 hover:text-blue-300 font-semibold whitespace-nowrap cursor-pointer"
             >
               Conectar APIs reales →
+            </button>
+          </div>
+        )}
+
+        {liveFeedMeta?.isStale && dataMode === 'live' && (
+          <div className="rounded-xl border border-amber-500/35 bg-amber-950/25 px-4 py-2.5 flex flex-wrap items-center justify-between gap-2 text-xs text-amber-200">
+            <span>
+              Datos en caché con {liveFeedMeta.cacheAgeMinutes} min de antigüedad: {liveFeedMeta.staleReason ?? 'pulsa Actualizar para reintentar las fuentes en directo'}.
+            </span>
+            <button
+              type="button"
+              onClick={() => void loadConfigAndLive(true)}
+              className="font-semibold text-amber-300 hover:text-amber-200 underline cursor-pointer"
+            >
+              Reintentar actualización
             </button>
           </div>
         )}
@@ -695,8 +748,8 @@ export default function App() {
                 <div className="relative z-10 space-y-3">
                   <div className="text-xs text-slate-300">
                     Fútbol ·{' '}
-                    {apiConfig.football.connected
-                      ? `Conectado (${apiConfig.football.provider})`
+                    {isFootballConnected
+                      ? `Conectado (${activeFbProviders.length > 0 ? activeFbProviders.join(' + ') : apiConfig.football.provider})`
                       : 'API sin configurar'}
                   </div>
                   <h1 className="text-2xl sm:text-3xl font-bold text-white text-balance">
@@ -732,8 +785,8 @@ export default function App() {
                 <div className="relative z-10 space-y-3">
                   <div className="text-xs text-slate-300">
                     NBA ·{' '}
-                    {apiConfig.nba.connected
-                      ? `Conectado (${apiConfig.nba.provider})`
+                    {isNbaConnected
+                      ? `Conectado (${activeNbaProviders.length > 0 ? activeNbaProviders.join(' + ') : apiConfig.nba.provider})`
                       : 'API sin configurar'}
                   </div>
                   <h2 className="text-2xl sm:text-3xl font-bold text-white text-balance">
@@ -789,54 +842,6 @@ export default function App() {
               )}
             </section>
 
-            {/* Top Discrepancies Preview */}
-            {topDiscrepanciesPreview.length > 0 && (
-              <section className="space-y-4">
-                <div className="flex items-center justify-between">
-                  <h2 className="text-lg font-bold text-white">
-                    Mayores discrepancias modelo vs cuota
-                  </h2>
-                  <button
-                    type="button"
-                    onClick={() => setSection('odds')}
-                    className="text-xs font-semibold text-blue-400 hover:text-blue-300 cursor-pointer"
-                  >
-                    Abrir Detector Completo →
-                  </button>
-                </div>
-
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {topDiscrepanciesPreview.map((d) => (
-                    <button
-                      key={d.id}
-                      type="button"
-                      onClick={() => setSection('odds')}
-                      className="text-left rounded-xl border border-slate-800 bg-[#0D1526] hover:border-blue-500/40 p-4 space-y-2 cursor-pointer"
-                    >
-                      <div className="flex items-center justify-between text-xs text-slate-400">
-                        <span className="truncate">{d.matchLabel}</span>
-                        <span
-                          className={`font-mono tabular-nums font-bold ${
-                            d.edgePct >= 0 ? 'text-emerald-400' : 'text-amber-300'
-                          }`}
-                        >
-                          {d.edgePct >= 0 ? `+${d.edgePct.toFixed(1)}%` : `${d.edgePct.toFixed(1)}%`}
-                        </span>
-                      </div>
-                      <div className="text-sm font-bold text-white truncate">
-                        {d.selectionLabel}
-                      </div>
-                      <div className="text-xs font-mono tabular-nums text-slate-300">
-                        Cuota {d.availableOdds.toFixed(2)} · Modelo{' '}
-                        {(d.modelProbability * 100).toFixed(1)}% (justa{' '}
-                        {d.modelFairOdds.toFixed(2)})
-                      </div>
-                    </button>
-                  ))}
-                </div>
-              </section>
-            )}
-
             {/* Standings Preview */}
             <StandingsView sport={sport} standings={activeStandings} />
           </div>
@@ -847,14 +852,17 @@ export default function App() {
           (selectedMatch ? (
             <MatchDetailView
               match={selectedMatch}
+              historyItems={historyItems}
               playerOverrides={playerOverrides}
               onToggleAvailability={handleToggleAvailability}
               onRefreshNbaNews={handleRefreshNbaNews}
+              onRefreshFootballLineups={handleRefreshFootballLineups}
               onSelectPlayer={(player, m) => setActiveModalPlayer({ player, match: m })}
               onLogPrediction={handleLogPrediction}
               onBack={() => setSelectedMatchId(null)}
               hydrating={hydratingMatchId === selectedMatch.id}
               refreshingNbaNews={refreshingNbaNewsId === selectedMatch.id}
+              refreshingFootballLineups={refreshingFootballLineupId === selectedMatch.id}
             />
           ) : (
             <div className="space-y-6">
@@ -869,7 +877,7 @@ export default function App() {
                     </span>
                   </div>
                   <p className="text-sm text-slate-400 mt-1">
-                    Selecciona cualquier encuentro para abrir su resumen, análisis L5/L10/L15, jugadores, H2H y cuotas.
+                    Selecciona cualquier encuentro para abrir su resumen, análisis L5/L10/L15, jugadores, alineaciones y H2H.
                   </p>
                 </div>
 
@@ -960,16 +968,7 @@ export default function App() {
             </div>
           ))}
 
-        {/* VIEW 4: ODDS ERROR DETECTOR */}
-        {section === 'odds' && (
-          <OddsErrorDetector
-            matches={activeMatches}
-            playerOverrides={playerOverrides}
-            onOpenMatch={openMatchAnalysis}
-          />
-        )}
-
-        {/* VIEW 5: HISTORY & EVALUATION */}
+        {/* VIEW 3: HISTORY & CALIBRATION */}
         {section === 'history' && (
           <HistoryEvaluationView
             predictions={historyItems}
@@ -977,7 +976,7 @@ export default function App() {
           />
         )}
 
-        {/* VIEW 6: API SETTINGS */}
+        {/* VIEW 4: API SETTINGS */}
         {section === 'settings' && (
           <ApiConfigView
             config={apiConfig}
@@ -1007,14 +1006,13 @@ export default function App() {
 
       {/* iPhone Thumb-Zone Fixed Bottom Tab Bar */}
       <nav
-        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-15 pb-safe bg-[#070B14]/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-5 items-center"
+        className="md:hidden fixed bottom-0 left-0 right-0 z-40 h-15 pb-safe bg-[#070B14]/95 backdrop-blur-md border-t border-slate-800 grid grid-cols-4 items-center"
         aria-label="Navegación móvil"
       >
         {(
           [
             { id: 'overview', label: 'Resumen', icon: LayoutGrid },
             { id: 'matches', label: 'Partidos', icon: Calendar },
-            { id: 'odds', label: 'Cuotas', icon: Scale },
             { id: 'history', label: 'Historial', icon: History },
             { id: 'settings', label: 'Config.', icon: Settings },
           ] as const

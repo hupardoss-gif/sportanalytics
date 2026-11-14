@@ -10,7 +10,10 @@ import type {
 } from '../types/sports.ts';
 import {
   computeFootballPlayerProp,
+  FOOTBALL_FIELD_STATS,
+  FOOTBALL_GK_STATS,
   FOOTBALL_STAT_CONFIG,
+  isGoalkeeperPosition,
 } from '../engine/footballModel.ts';
 import { computeNbaPlayerProp, NBA_STAT_CONFIG } from '../engine/nbaModel.ts';
 
@@ -22,18 +25,6 @@ interface OverUnderLabProps {
   initialStat?: PropStatKey;
   initialLine?: number;
 }
-
-const FOOTBALL_STATS: FootballPropStat[] = [
-  'shots',
-  'shotsOnTarget',
-  'goals',
-  'assists',
-  'foulsCommitted',
-  'foulsDrawn',
-  'yellowCards',
-  'redCards',
-  'passes',
-];
 
 const NBA_STATS: NbaPropStat[] = [
   'points',
@@ -54,16 +45,25 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
   initialStat,
   initialLine,
 }) => {
+  const isGk = player.sport === 'football' && isGoalkeeperPosition(player.position);
   const availableStats: PropStatKey[] =
-    player.sport === 'football' ? FOOTBALL_STATS : NBA_STATS;
+    player.sport === 'football'
+      ? isGk
+        ? FOOTBALL_GK_STATS
+        : FOOTBALL_FIELD_STATS
+      : NBA_STATS;
 
   const [statKey, setStatKey] = useState<PropStatKey>(
     initialStat && availableStats.includes(initialStat)
       ? initialStat
-      : player.sport === 'football'
-      ? 'shots'
-      : 'points'
+      : availableStats[0]
   );
+
+  useEffect(() => {
+    if (!availableStats.includes(statKey)) {
+      setStatKey(availableStats[0]);
+    }
+  }, [player.id, isGk, availableStats, statKey]);
 
   // Baseline projection to get default recommended line when stat or player changes
   const defaultProjection = useMemo(() => {
@@ -115,17 +115,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
       teammatesOverride
     );
   }, [player, match, statKey, customLine, timeframe, teammatesOverride]);
-
-  const matchingPropOdds = useMemo(
-    () =>
-      (match.odds ?? []).filter(
-        (o) =>
-          o.marketCategory === 'player_prop' &&
-          o.playerId === player.id &&
-          o.statKey === statKey
-      ),
-    [match.odds, player.id, statKey]
-  );
 
   const maxProbBin = useMemo(
     () => Math.max(0.05, ...projection.distribution.map((d) => d.probability)),
@@ -188,57 +177,71 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
         })}
       </div>
 
-      {/* Horizontal Slider + Stepper Controls */}
-      <div className="space-y-3 pt-1">
-        <div className="flex items-center justify-between gap-4">
-          <div>
-            <span className="text-xs text-slate-400 block">Línea seleccionada</span>
-            <span className="text-2xl font-bold font-mono tabular-nums text-white">
-              {projection.line.toFixed(1)}{' '}
-              <span className="text-sm font-normal text-slate-400">
-                {projection.statLabel.toLowerCase()}
-              </span>
-            </span>
-          </div>
-
-          <div className="flex items-center gap-2">
-            <button
-              type="button"
-              onClick={stepDown}
-              aria-label="Reducir línea"
-              className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-            >
-              <Minus className="w-4 h-4" />
-            </button>
-            <button
-              type="button"
-              onClick={stepUp}
-              aria-label="Aumentar línea"
-              className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
-            >
-              <Plus className="w-4 h-4" />
-            </button>
-          </div>
+      {/* Conditional Interactive Simulator vs Honest Unavailable Notice */}
+      {projection.unavailable ? (
+        <div className="rounded-lg border border-slate-800 bg-slate-950/70 p-4 space-y-1.5 text-xs">
+          <span className="font-semibold text-slate-200 block">
+            No disponible — {projection.statLabel}
+          </span>
+          <p className="text-slate-400 leading-relaxed">
+            {projection.unavailableReason ??
+              projection.statsOriginNote ??
+              'La fuente de datos actual no publica estadísticas individuales reales suficientes para calcular líneas Over/Under sobre este jugador.'}
+          </p>
         </div>
+      ) : (
+        <>
+          {/* Horizontal Slider + Stepper Controls */}
+          <div className="space-y-3 pt-1">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <span className="text-xs text-slate-400 block">Línea seleccionada</span>
+                <span className="text-2xl font-bold font-mono tabular-nums text-white">
+                  {projection.line.toFixed(1)}{' '}
+                  <span className="text-sm font-normal text-slate-400">
+                    {projection.statLabel.toLowerCase()}
+                  </span>
+                </span>
+              </div>
 
-        <div>
-          <input
-            type="range"
-            min={projection.minLine}
-            max={projection.maxLine}
-            step={projection.step}
-            value={projection.line}
-            onChange={(e) => setCustomLine(parseFloat(e.target.value))}
-            aria-label={`Deslizador Over/Under para ${projection.statLabel}`}
-            className="analytics-slider"
-          />
-          <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-500 -mt-1">
-            <span>{projection.minLine.toFixed(1)}</span>
-            <span>Media modelo: {projection.expectedValue.toFixed(2)}</span>
-            <span>{projection.maxLine.toFixed(1)}</span>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={stepDown}
+                  aria-label="Reducir línea"
+                  className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Minus className="w-4 h-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={stepUp}
+                  aria-label="Aumentar línea"
+                  className="w-11 h-11 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 flex items-center justify-center transition-colors cursor-pointer"
+                >
+                  <Plus className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <input
+                type="range"
+                min={projection.minLine}
+                max={projection.maxLine}
+                step={projection.step}
+                value={projection.line}
+                onChange={(e) => setCustomLine(parseFloat(e.target.value))}
+                aria-label={`Deslizador Over/Under para ${projection.statLabel}`}
+                className="analytics-slider"
+              />
+              <div className="flex justify-between text-[11px] font-mono tabular-nums text-slate-500 -mt-1">
+                <span>{projection.minLine.toFixed(1)}</span>
+                <span>Media modelo: {projection.expectedValue.toFixed(2)}</span>
+                <span>{projection.maxLine.toFixed(1)}</span>
+              </div>
+            </div>
           </div>
-        </div>
-      </div>
 
       {/* Complementary Over / Under Probability Bar (Always Sums to 100.0%) */}
       <div className="space-y-2">
@@ -250,9 +253,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
             <span className="text-xl font-bold font-mono tabular-nums text-white">
               {projection.probOver.toFixed(1)}%
             </span>
-            <span className="text-slate-400 font-mono tabular-nums ml-2">
-              Cuota justa {(100 / Math.max(1, projection.probOver)).toFixed(2)}
-            </span>
           </div>
           <div className="text-right">
             <span className="text-slate-300 font-semibold block">
@@ -260,9 +260,6 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
             </span>
             <span className="text-xl font-bold font-mono tabular-nums text-slate-200">
               {projection.probUnder.toFixed(1)}%
-            </span>
-            <span className="text-slate-400 font-mono tabular-nums ml-2">
-              Cuota justa {(100 / Math.max(1, projection.probUnder)).toFixed(2)}
             </span>
           </div>
         </div>
@@ -279,32 +276,42 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
         </div>
       </div>
 
-      {/* Real Bookmaker Player Prop Odds Comparison (when published) */}
-      <div className="rounded-lg border border-slate-800 bg-slate-950/60 p-3 text-xs">
-        {matchingPropOdds.length > 0 ? (
-          <div className="space-y-2">
-            <span className="font-semibold text-slate-200 block">
-              Cuotas publicadas para este mercado de jugador:
-            </span>
-            <div className="flex flex-wrap gap-3">
-              {matchingPropOdds.map((o) => (
-                <div
-                  key={o.id}
-                  className="px-3 py-1.5 rounded-md border border-slate-800 bg-[#0D1526] font-mono tabular-nums"
-                >
-                  <span className="text-slate-300">{o.selectionLabel}</span>{' '}
-                  <span className="font-bold text-white ml-1">{o.decimalOdds.toFixed(2)}</span>{' '}
-                  <span className="text-slate-500">({o.bookmaker})</span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ) : (
-          <span className="text-slate-400">
-            La fuente actual no proporciona cuotas individuales para este mercado (se muestran únicamente probabilidades y cuotas justas teóricas del modelo).
-          </span>
-        )}
+      {/* Data Provenance & Sample Quality Indicator */}
+      <div
+        className={`rounded-lg border px-3 py-2.5 text-xs ${
+          projection.statsQuality === 'verified'
+            ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-200'
+            : projection.statsQuality === 'estimated'
+              ? 'border-amber-500/30 bg-amber-950/20 text-amber-200'
+              : 'border-slate-800 bg-slate-950/60 text-slate-300'
+        }`}
+      >
+        <span className="font-semibold block">
+          {projection.statsQuality === 'verified'
+            ? `Datos verificados (${projection.sampleSizeGames} partidos reales)`
+            : projection.statsQuality === 'estimated'
+              ? `Estimación posicional / muestra reducida (${projection.sampleSizeGames} partidos)`
+              : 'Sin datos individuales suficientes'}
+        </span>
+        <span className="text-[11px] opacity-90 block mt-0.5">
+          {projection.statsOriginNote ??
+            (projection.statsQuality === 'verified'
+              ? 'Proyección calculada con estadísticas individuales reales del jugador.'
+              : 'La fuente actual no publica game logs individuales completos; la proyección aplica estimación posicional con mayor amplitud de incertidumbre.')}
+        </span>
       </div>
+
+      {projection.freshnessWarning && (
+        <div
+          className={`rounded-lg border px-3 py-2 text-xs ${
+            projection.dataFreshness === 'stale'
+              ? 'border-amber-500/40 bg-amber-950/30 text-amber-200'
+              : 'border-slate-800 bg-slate-950/60 text-slate-300'
+          }`}
+        >
+          {projection.freshnessWarning}
+        </div>
+      )}
 
       {/* Key Quantitative Summary */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 pt-2 border-t border-slate-800/80 text-xs">
@@ -333,6 +340,21 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
           </span>
         </div>
       </div>
+
+      {projection.multiSplitSummary && (
+        <div className="rounded-lg border border-slate-800/80 bg-slate-950/50 px-3 py-2.5 text-[11px] space-y-1">
+          <div className="flex flex-wrap items-center justify-between gap-2 font-mono tabular-nums text-slate-200">
+            <span>Temp: {projection.multiSplitSummary.seasonAvg}</span>
+            <span>L5: {projection.multiSplitSummary.last5Avg}</span>
+            <span>L10: {projection.multiSplitSummary.last10Avg}</span>
+            <span>Casa/Fuera: {projection.multiSplitSummary.homeAwayAvg}</span>
+            {projection.multiSplitSummary.h2hAvg !== undefined && (
+              <span>H2H: {projection.multiSplitSummary.h2hAvg}</span>
+            )}
+          </div>
+          <p className="text-slate-400">{projection.multiSplitSummary.weightsNote}</p>
+        </div>
+      )}
 
       {/* Probability Distribution Chart */}
       <div className="space-y-2 pt-2 border-t border-slate-800/80">
@@ -370,6 +392,8 @@ export const OverUnderLab: React.FC<OverUnderLabProps> = ({
           })}
         </div>
       </div>
+        </>
+      )}
     </div>
   );
 };

@@ -1,19 +1,23 @@
 import type {
-  BookmakerOdd,
   MatchRecord,
   MatchStatus,
   PlayerProfile,
   StandingEntry,
   TeamRecentGame,
 } from '../src/types/sports.ts';
+import { fetchWithTimeout } from './httpUtils.ts';
 import {
   fetchEspnNbaCalendarAndStandings,
   fetchEspnSoccerEnrichment,
   hydrateEspnNbaMatch,
   hydrateEspnSoccerMatch,
-  mergeRealOddsIntoMatches,
   teamsMatch,
 } from './espnAdapters.ts';
+import {
+  buildProbableFootballLineups,
+  promoteOfficialToConfirmedLineup,
+  resolveEspnSoccerIdsForMatch,
+} from './footballIntelligence.ts';
 
 function isoDateOffset(days: number): string {
   const d = new Date(Date.now() + days * 86400000);
@@ -32,7 +36,6 @@ function classifyKickoffStatus(isoDate: string, rawShort?: string): MatchStatus 
 }
 
 function mapFootballGridCoord(grid: string | null | undefined, idx: number, total: number): { x: number; y: number } {
-  // API-Football grid comes as "row:col" e.g. "1:1" (GK), "2:1".."2:4" (DEF), "3:1".."3:3" (MID), "4:1".."4:3" (FWD)
   if (grid && grid.includes(':')) {
     const [rStr, cStr] = grid.split(':');
     const row = Math.max(1, Math.min(5, Number(rStr) || 1));
@@ -59,19 +62,27 @@ function mapNbaSlotCoord(pos: string, idx: number): { x: number; y: number } {
 
 const TOP_FOOTBALL_LEAGUE_IDS = new Set([140, 39, 2, 135, 78, 61, 3, 141, 45]);
 
+export interface FetchAdapterOptions {
+  includeEspnFallback?: boolean;
+}
+
 export async function fetchFootballCalendarAndStandings(
   provider: string,
-  apiKey: string
+  apiKey: string,
+  options: FetchAdapterOptions = {}
 ): Promise<{ matches: MatchRecord[]; standings: StandingEntry[] }> {
   const fetchedAt = new Date().toISOString();
+  const includeEspnFallback = options.includeEspnFallback !== false;
 
   if (provider === 'api-football') {
     const dates = [isoDateOffset(-1), isoDateOffset(0), isoDateOffset(1), isoDateOffset(2)];
     const fixtureResponses = await Promise.all(
       dates.map(async (d) => {
-        const res = await fetch(`https://v3.football.api-sports.io/fixtures?date=${d}`, {
-          headers: { 'x-apisports-key': apiKey },
-        });
+        const res = await fetchWithTimeout(
+          `https://v3.football.api-sports.io/fixtures?date=${d}`,
+          { headers: { 'x-apisports-key': apiKey } },
+          10000
+        );
         if (!res.ok) throw new Error(`API-Football HTTP ${res.status}`);
         return (await res.json()) as {
           response?: Array<{
@@ -85,7 +96,6 @@ export async function fetchFootballCalendarAndStandings(
     );
 
     const rawAll = fixtureResponses.flatMap((r) => r.response ?? []);
-    // Prioritize top leagues first, then fill up to 40 fixtures
     rawAll.sort((a, b) => {
       const aTop = TOP_FOOTBALL_LEAGUE_IDS.has(a.league.id) ? 0 : 1;
       const bTop = TOP_FOOTBALL_LEAGUE_IDS.has(b.league.id) ? 0 : 1;
@@ -93,55 +103,14 @@ export async function fetchFootballCalendarAndStandings(
       return a.fixture.date.localeCompare(b.fixture.date);
     });
 
-    const matches: MatchRecord[] = rawAll.slice(0, 120).map((item) => ({
-      id: `apifb-${item.fixture.id}`,
-      sport: 'football',
-      competition: `${item.league.name}`,
-      season: String(item.league.season),
-      status: classifyKickoffStatus(item.fixture.date, item.fixture.status.short),
-      kickoffIso: item.fixture.date,
-      minuteOrClock: item.fixture.status.elapsed ? `${item.fixture.status.elapsed}'` : undefined,
-      venue: item.fixture.venue?.name ?? 'Estadio oficial',
-      homeTeam: {
-        id: `apifb-team-${item.teams.home.id}`,
-        name: item.teams.home.name,
-        shortName: item.teams.home.name.slice(0, 3).toUpperCase(),
-        league: item.league.name,
-        record: 'API-Football',
-        formRecent: [],
-        restDays: 4,
-      },
-      awayTeam: {
-        id: `apifb-team-${item.teams.away.id}`,
-        name: item.teams.away.name,
-        shortName: item.teams.away.name.slice(0, 3).toUpperCase(),
-        league: item.league.name,
-        record: 'API-Football',
-        formRecent: [],
-        restDays: 4,
-      },
-      score:
-        item.goals.home !== null && item.goals.away !== null
-          ? { home: item.goals.home, away: item.goals.away }
-          : undefined,
-      lineupStatus: 'provisional',
-      homePlayers: [],
-      awayPlayers: [],
-      h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 2.5, lastMeetings: [] },
-      odds: [],
-      dataOrigin: 'API-Football (v3.football.api-sports.io)',
-      updatedAt: fetchedAt,
-      isOfflineReference: false,
-    }));
-
-    // Fetch standings for LaLiga (140) and Premier League (39)
     const currentYear = new Date().getMonth() >= 7 ? new Date().getFullYear() : new Date().getFullYear() - 1;
     const standingsResults = await Promise.all(
       [140, 39].map(async (leagueId) => {
         try {
-          const sRes = await fetch(
+          const sRes = await fetchWithTimeout(
             `https://v3.football.api-sports.io/standings?league=${leagueId}&season=${currentYear}`,
-            { headers: { 'x-apisports-key': apiKey } }
+            { headers: { 'x-apisports-key': apiKey } },
+            9000
           );
           if (!sRes.ok) return [] as StandingEntry[];
           const sJson = (await sRes.json()) as {
@@ -189,7 +158,74 @@ export async function fetchFootballCalendarAndStandings(
       })
     );
 
-    return { matches, standings: standingsResults.flat() };
+    const standings = standingsResults.flat();
+    const teamMetrics = new Map<string, StandingEntry>();
+    for (const st of standings) teamMetrics.set(st.teamId, st);
+
+    const matches: MatchRecord[] = rawAll.slice(0, 120).map((item) => {
+      const hId = `apifb-team-${item.teams.home.id}`;
+      const aId = `apifb-team-${item.teams.away.id}`;
+      const hSt = teamMetrics.get(hId);
+      const aSt = teamMetrics.get(aId);
+      const hPpg = hSt && hSt.played > 0 ? +(hSt.goalsForOrPtsFor / hSt.played).toFixed(2) : undefined;
+      const hOppg = hSt && hSt.played > 0 ? +(hSt.goalsAgainstOrPtsAgainst / hSt.played).toFixed(2) : undefined;
+      const aPpg = aSt && aSt.played > 0 ? +(aSt.goalsForOrPtsFor / aSt.played).toFixed(2) : undefined;
+      const aOppg = aSt && aSt.played > 0 ? +(aSt.goalsAgainstOrPtsAgainst / aSt.played).toFixed(2) : undefined;
+
+      return {
+        id: `apifb-${item.fixture.id}`,
+        sport: 'football',
+        competition: `${item.league.name}`,
+        season: String(item.league.season),
+        status: classifyKickoffStatus(item.fixture.date, item.fixture.status.short),
+        kickoffIso: item.fixture.date,
+        minuteOrClock: item.fixture.status.elapsed ? `${item.fixture.status.elapsed}'` : undefined,
+        venue: item.fixture.venue?.name ?? 'Estadio oficial',
+        homeTeam: {
+          id: hId,
+          name: item.teams.home.name,
+          shortName: item.teams.home.name.slice(0, 3).toUpperCase(),
+          league: item.league.name,
+          record: hSt ? `${hSt.won}-${hSt.drawn ?? 0}-${hSt.lost} · ${hSt.pointsOrWinPct} pts` : 'API-Football',
+          playedGames: hSt?.played,
+          ppgOrGpg: hPpg,
+          oppgOrGapg: hOppg,
+          attackHome: hPpg !== undefined ? hPpg * 1.08 : undefined,
+          defenseHome: hOppg !== undefined ? hOppg * 0.92 : undefined,
+          formRecent: hSt?.form ?? [],
+          restDays: 4,
+        },
+        awayTeam: {
+          id: aId,
+          name: item.teams.away.name,
+          shortName: item.teams.away.name.slice(0, 3).toUpperCase(),
+          league: item.league.name,
+          record: aSt ? `${aSt.won}-${aSt.drawn ?? 0}-${aSt.lost} · ${aSt.pointsOrWinPct} pts` : 'API-Football',
+          playedGames: aSt?.played,
+          ppgOrGpg: aPpg,
+          oppgOrGapg: aOppg,
+          attackAway: aPpg !== undefined ? aPpg * 0.94 : undefined,
+          defenseAway: aOppg !== undefined ? aOppg * 1.06 : undefined,
+          formRecent: aSt?.form ?? [],
+          restDays: 4,
+        },
+        score:
+          item.goals.home !== null && item.goals.away !== null
+            ? { home: item.goals.home, away: item.goals.away }
+            : undefined,
+        lineupStatus: 'provisional',
+        homePlayers: [],
+        awayPlayers: [],
+        h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 2.5, lastMeetings: [] },
+        odds: [],
+        teamStatsQuality: hSt && aSt ? 'verified' : hSt || aSt ? 'estimated' : 'unavailable',
+        dataOrigin: 'API-Football (v3.football.api-sports.io)',
+        updatedAt: fetchedAt,
+        isOfflineReference: false,
+      };
+    });
+
+    return { matches, standings };
   }
 
   if (provider === 'espn-football') {
@@ -209,17 +245,20 @@ export async function fetchFootballCalendarAndStandings(
       score?: { fullTime?: { home: number | null; away: number | null } };
     }
 
-    // Football-Data v4 restricts /matches date spans to max 10 days per call -> query 2 consecutive windows + ESPN enrichment in parallel
     const [win1Res, win2Res, espnEnrich] = await Promise.all([
-      fetch(
+      fetchWithTimeout(
         `https://api.football-data.org/v4/matches?dateFrom=${isoDateOffset(-4)}&dateTo=${isoDateOffset(5)}`,
-        { headers }
+        { headers },
+        10000
       ),
-      fetch(
+      fetchWithTimeout(
         `https://api.football-data.org/v4/matches?dateFrom=${isoDateOffset(6)}&dateTo=${isoDateOffset(15)}`,
-        { headers }
+        { headers },
+        10000
       ).catch(() => null),
-      fetchEspnSoccerEnrichment().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] })),
+      includeEspnFallback
+        ? fetchEspnSoccerEnrichment().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
     ]);
 
     if (!win1Res.ok) throw new Error(`Football-Data.org HTTP ${win1Res.status}`);
@@ -234,15 +273,15 @@ export async function fetchFootballCalendarAndStandings(
       }
     }
 
-    // Pull additional fixtures from top competitions only if rawMatchMap has < 15 matches (conserves 10 req/min bucket)
     if (rawMatchMap.size < 15) {
       const compRangeFrom = isoDateOffset(0);
       const compRangeTo = isoDateOffset(25);
       for (const compCode of ['PD', 'PL', 'CL']) {
         try {
-          const cRes = await fetch(
+          const cRes = await fetchWithTimeout(
             `https://api.football-data.org/v4/competitions/${compCode}/matches?dateFrom=${compRangeFrom}&dateTo=${compRangeTo}`,
-            { headers }
+            { headers },
+            9000
           );
           if (!cRes.ok) continue;
           const cJson = (await cRes.json()) as { matches?: FdMatchItem[] };
@@ -264,34 +303,38 @@ export async function fetchFootballCalendarAndStandings(
       }
     }
 
-    // Build team strength & standings from ESPN (0 rate-limit cost), falling back to Football-Data if ESPN returned empty
     const standingsList: StandingEntry[] = [...espnEnrich.standings];
     const teamStandingsListByName: Array<{
       teamName: string;
+      played: number;
       record: string;
       ppg: number;
       oppg: number;
       attackStrength: number;
       defenseStrength: number;
       form: ('W' | 'D' | 'L')[];
-    }> = espnEnrich.standings.map((r) => {
-      const played = Math.max(1, r.played);
-      const ppg = r.goalsForOrPtsFor / played;
-      const oppg = r.goalsAgainstOrPtsAgainst / played;
-      return {
-        teamName: r.teamName,
-        record: `${r.won}-${r.drawn ?? 0}-${r.lost} · ${r.pointsOrWinPct} pts`,
-        ppg,
-        oppg,
-        attackStrength: Math.max(0.75, Math.min(2.4, ppg * 1.05)),
-        defenseStrength: Math.max(0.6, Math.min(1.9, oppg)),
-        form: r.form,
-      };
-    });
+    }> = espnEnrich.standings
+      .filter((r) => r.played > 0)
+      .map((r) => {
+        const played = Math.max(1, r.played);
+        const ppg = r.goalsForOrPtsFor / played;
+        const oppg = r.goalsAgainstOrPtsAgainst / played;
+        return {
+          teamName: r.teamName,
+          played: r.played,
+          record: `${r.won}-${r.drawn ?? 0}-${r.lost} · ${r.pointsOrWinPct} pts`,
+          ppg,
+          oppg,
+          attackStrength: Math.max(0.65, Math.min(2.6, ppg)),
+          defenseStrength: Math.max(0.55, Math.min(2.1, oppg)),
+          form: r.form,
+        };
+      });
 
     const teamStandingsMap = new Map<
       string,
       {
+        played: number;
         record: string;
         ppg: number;
         oppg: number;
@@ -304,9 +347,11 @@ export async function fetchFootballCalendarAndStandings(
     if (standingsList.length === 0) {
       for (const comp of ['PD', 'PL', 'BL1', 'SA', 'FL1']) {
         try {
-          const sRes = await fetch(`https://api.football-data.org/v4/competitions/${comp}/standings`, {
-            headers,
-          });
+          const sRes = await fetchWithTimeout(
+            `https://api.football-data.org/v4/competitions/${comp}/standings`,
+            { headers },
+            9000
+          );
           if (!sRes.ok) continue;
           const sJson = (await sRes.json()) as {
             competition?: { name: string };
@@ -341,11 +386,12 @@ export async function fetchFootballCalendarAndStandings(
             const teamKey = `fd-team-${r.team?.id ?? teamShort}`;
 
             teamStandingsMap.set(teamKey, {
+              played: r.playedGames,
               record: `${r.won}-${r.draw}-${r.lost} · ${r.points} pts`,
               ppg,
               oppg,
-              attackStrength: Math.max(0.75, Math.min(2.4, ppg * 1.05)),
-              defenseStrength: Math.max(0.6, Math.min(1.9, oppg)),
+              attackStrength: Math.max(0.65, Math.min(2.6, ppg)),
+              defenseStrength: Math.max(0.55, Math.min(2.1, oppg)),
               form,
             });
 
@@ -389,6 +435,24 @@ export async function fetchFootballCalendarAndStandings(
         const aSt =
           teamStandingsMap.get(aId) ??
           teamStandingsListByName.find((s) => teamsMatch(s.teamName, aName));
+
+        // Propagate ESPN recent form when matching team exists in ESPN schedule
+        const matchingEspn = espnEnrich.matches.find(
+          (em) =>
+            teamsMatch(em.homeTeam.name, hName) &&
+            teamsMatch(em.awayTeam.name, aName) &&
+            Math.abs(new Date(em.kickoffIso).getTime() - new Date(m.utcDate).getTime()) <= 36 * 3600 * 1000
+        );
+
+        const homeForm =
+          hSt?.form && hSt.form.length > 0
+            ? hSt.form
+            : matchingEspn?.homeTeam.formRecent ?? [];
+        const awayForm =
+          aSt?.form && aSt.form.length > 0
+            ? aSt.form
+            : matchingEspn?.awayTeam.formRecent ?? [];
+
         return {
           id: `fd-${m.id}`,
           sport: 'football',
@@ -396,18 +460,19 @@ export async function fetchFootballCalendarAndStandings(
           season: 'Actual',
           status: classifyKickoffStatus(m.utcDate, m.status),
           kickoffIso: m.utcDate,
-          venue: 'Sede oficial',
+          venue: matchingEspn?.venue ?? 'Sede oficial',
           homeTeam: {
             id: hId,
             name: hName,
             shortName: m.homeTeam.tla || hName.slice(0, 3).toUpperCase(),
             league: compName,
             record: hSt?.record ?? 'Football-Data.org',
+            playedGames: hSt?.played,
             ppgOrGpg: hSt?.ppg,
             oppgOrGapg: hSt?.oppg,
             attackHome: hSt ? hSt.attackStrength * 1.08 : undefined,
             defenseHome: hSt ? hSt.defenseStrength * 0.92 : undefined,
-            formRecent: hSt?.form ?? [],
+            formRecent: homeForm,
             restDays: 4,
           },
           awayTeam: {
@@ -416,11 +481,12 @@ export async function fetchFootballCalendarAndStandings(
             shortName: m.awayTeam.tla || aName.slice(0, 3).toUpperCase(),
             league: compName,
             record: aSt?.record ?? 'Football-Data.org',
+            playedGames: aSt?.played,
             ppgOrGpg: aSt?.ppg,
             oppgOrGapg: aSt?.oppg,
             attackAway: aSt ? aSt.attackStrength * 0.94 : undefined,
             defenseAway: aSt ? aSt.defenseStrength * 1.06 : undefined,
-            formRecent: aSt?.form ?? [],
+            formRecent: awayForm,
             restDays: 4,
           },
           score:
@@ -439,158 +505,26 @@ export async function fetchFootballCalendarAndStandings(
             lastMeetings: [],
           },
           odds: [],
+          teamStatsQuality: hSt && aSt ? 'verified' : hSt || aSt ? 'estimated' : 'unavailable',
           dataOrigin: 'Football-Data.org v4',
           updatedAt: fetchedAt,
           isOfflineReference: false,
         };
       });
 
-    // Merge DraftKings odds onto Football-Data matches
-    const fdWithOdds = mergeRealOddsIntoMatches(fdMatches, espnEnrich.matches);
-
-    // Append ESPN matches from leagues/dates not already in Football-Data (e.g. Europa League, Conference League, or additional fixtures)
-    const extraEspnMatches = espnEnrich.matches.filter(
-      (em) =>
-        !fdWithOdds.some(
-          (fm) =>
-            teamsMatch(fm.homeTeam.name, em.homeTeam.name) &&
-            teamsMatch(fm.awayTeam.name, em.awayTeam.name) &&
-            Math.abs(new Date(fm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 48 * 3600 * 1000
+    const extraEspnMatches = includeEspnFallback
+      ? espnEnrich.matches.filter(
+          (em) =>
+            !fdMatches.some(
+              (fm) =>
+                teamsMatch(fm.homeTeam.name, em.homeTeam.name) &&
+                teamsMatch(fm.awayTeam.name, em.awayTeam.name) &&
+                Math.abs(new Date(fm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+            )
         )
-    );
+      : [];
 
-    return { matches: [...fdWithOdds, ...extraEspnMatches], standings: standingsList };
-  }
-
-  if (provider === 'the-odds-api') {
-    const leagueKeys = [
-      'soccer_spain_la_liga',
-      'soccer_epl',
-      'soccer_uefa_champs_league',
-    ];
-    const eventsArrays = await Promise.all(
-      leagueKeys.map(async (lk) => {
-        try {
-          const res = await fetch(
-            `https://api.the-odds-api.com/v4/sports/${lk}/odds/?apiKey=${encodeURIComponent(
-              apiKey
-            )}&regions=eu&markets=h2h,totals`
-          );
-          if (!res.ok) return [];
-          return (await res.json()) as Array<{
-            id: string;
-            sport_title: string;
-            commence_time: string;
-            home_team: string;
-            away_team: string;
-            bookmakers: Array<{
-              title: string;
-              last_update: string;
-              markets: Array<{
-                key: string;
-                outcomes: Array<{ name: string; price: number; point?: number }>;
-              }>;
-            }>;
-          }>;
-        } catch {
-          return [];
-        }
-      })
-    );
-
-    const matches: MatchRecord[] = eventsArrays.flat().slice(0, 30).map((ev) => {
-      const bm = ev.bookmakers[0];
-      const odds: BookmakerOdd[] = [];
-      const h2h = bm?.markets.find((mk) => mk.key === 'h2h');
-      if (h2h && h2h.outcomes.length >= 2) {
-        const homeOut = h2h.outcomes.find((o) => o.name === ev.home_team);
-        const drawOut = h2h.outcomes.find((o) => o.name === 'Draw');
-        const awayOut = h2h.outcomes.find((o) => o.name === ev.away_team);
-        if (homeOut && awayOut) {
-          odds.push({
-            id: `odds-${ev.id}-h2h-home`,
-            marketCategory: 'match',
-            marketLabel: 'Resultado Final (1X2)',
-            selectionLabel: `Victoria ${ev.home_team}`,
-            side: 'home',
-            decimalOdds: homeOut.price,
-            threeWayOdds: drawOut ? [homeOut.price, drawOut.price, awayOut.price] : undefined,
-            complementOdds: !drawOut ? awayOut.price : undefined,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update,
-          });
-          odds.push({
-            id: `odds-${ev.id}-h2h-away`,
-            marketCategory: 'match',
-            marketLabel: 'Resultado Final (1X2)',
-            selectionLabel: `Victoria ${ev.away_team}`,
-            side: 'away',
-            decimalOdds: awayOut.price,
-            threeWayOdds: drawOut ? [homeOut.price, drawOut.price, awayOut.price] : undefined,
-            complementOdds: !drawOut ? homeOut.price : undefined,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update,
-          });
-        }
-      }
-      const totals = bm?.markets.find((mk) => mk.key === 'totals');
-      if (totals) {
-        const over = totals.outcomes.find((o) => o.name === 'Over');
-        const under = totals.outcomes.find((o) => o.name === 'Under');
-        if (over && under) {
-          odds.push({
-            id: `odds-${ev.id}-totals-over`,
-            marketCategory: 'totals',
-            marketLabel: 'Más / Menos Goles',
-            selectionLabel: `Más de ${over.point ?? 2.5} goles`,
-            line: over.point ?? 2.5,
-            side: 'over',
-            decimalOdds: over.price,
-            complementOdds: under.price,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update,
-          });
-        }
-      }
-
-      return {
-        id: `oddsapi-${ev.id}`,
-        sport: 'football',
-        competition: ev.sport_title,
-        season: 'Actual',
-        status: classifyKickoffStatus(ev.commence_time),
-        kickoffIso: ev.commence_time,
-        venue: 'Cuotas en vivo',
-        homeTeam: {
-          id: `odds-${ev.home_team}`,
-          name: ev.home_team,
-          shortName: ev.home_team.slice(0, 3).toUpperCase(),
-          league: ev.sport_title,
-          record: 'The Odds API',
-          formRecent: [],
-          restDays: 4,
-        },
-        awayTeam: {
-          id: `odds-${ev.away_team}`,
-          name: ev.away_team,
-          shortName: ev.away_team.slice(0, 3).toUpperCase(),
-          league: ev.sport_title,
-          record: 'The Odds API',
-          formRecent: [],
-          restDays: 4,
-        },
-        lineupStatus: 'provisional',
-        homePlayers: [],
-        awayPlayers: [],
-        h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 2.5, lastMeetings: [] },
-        odds,
-        dataOrigin: 'The Odds API v4',
-        updatedAt: fetchedAt,
-        isOfflineReference: false,
-      };
-    });
-
-    return { matches, standings: [] };
+    return { matches: [...fdMatches, ...extraEspnMatches], standings: standingsList };
   }
 
   return { matches: [], standings: [] };
@@ -598,9 +532,11 @@ export async function fetchFootballCalendarAndStandings(
 
 export async function fetchNbaCalendarAndStandings(
   provider: string,
-  apiKey: string
+  apiKey: string,
+  options: FetchAdapterOptions = {}
 ): Promise<{ matches: MatchRecord[]; standings: StandingEntry[] }> {
   const fetchedAt = new Date().toISOString();
+  const includeEspnFallback = options.includeEspnFallback !== false;
 
   if (provider === 'espn-nba') {
     return fetchEspnNbaCalendarAndStandings();
@@ -609,9 +545,14 @@ export async function fetchNbaCalendarAndStandings(
   if (provider === 'balldontlie') {
     const dates = [isoDateOffset(-1), isoDateOffset(0), isoDateOffset(1), isoDateOffset(2)];
     const query = dates.map((d) => `dates[]=${d}`).join('&');
-    const res = await fetch(`https://api.balldontlie.io/v1/games?${query}&per_page=40`, {
-      headers: { Authorization: apiKey },
-    });
+    const [res, espnNba] = await Promise.all([
+      fetchWithTimeout(`https://api.balldontlie.io/v1/games?${query}&per_page=40`, {
+        headers: { Authorization: apiKey },
+      }, 10000),
+      includeEspnFallback
+        ? fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
+    ]);
     if (!res.ok) throw new Error(`BallDontLie HTTP ${res.status}`);
     const json = (await res.json()) as {
       data?: Array<{
@@ -631,6 +572,13 @@ export async function fetchNbaCalendarAndStandings(
       const kickoff = g.datetime || `${g.date}T23:00:00Z`;
       const isFinal = g.status === 'Final';
       const isLive = g.period > 0 && !isFinal;
+      const matchingEspn = espnNba.matches.find(
+        (em) =>
+          teamsMatch(em.homeTeam.name, g.home_team.full_name) &&
+          teamsMatch(em.awayTeam.name, g.visitor_team.full_name) &&
+          Math.abs(new Date(em.kickoffIso).getTime() - new Date(kickoff).getTime()) <= 36 * 3600 * 1000
+      );
+
       return {
         id: `bdl-${g.id}`,
         sport: 'nba',
@@ -639,24 +587,36 @@ export async function fetchNbaCalendarAndStandings(
         status: isFinal ? 'finished' : isLive ? 'live' : classifyKickoffStatus(kickoff),
         kickoffIso: kickoff,
         minuteOrClock: isLive ? g.status : undefined,
-        venue: 'NBA Arena',
+        venue: matchingEspn?.venue ?? 'NBA Arena',
         homeTeam: {
           id: `bdl-team-${g.home_team.id}`,
           name: g.home_team.full_name,
           shortName: g.home_team.abbreviation,
           league: 'NBA',
-          record: 'BallDontLie',
-          formRecent: [],
-          restDays: 2,
+          record: matchingEspn?.homeTeam.record ?? 'BallDontLie',
+          playedGames: matchingEspn?.homeTeam.playedGames,
+          ppgOrGpg: matchingEspn?.homeTeam.ppgOrGpg,
+          oppgOrGapg: matchingEspn?.homeTeam.oppgOrGapg,
+          offRating: matchingEspn?.homeTeam.offRating,
+          defRating: matchingEspn?.homeTeam.defRating,
+          pace: matchingEspn?.homeTeam.pace,
+          formRecent: matchingEspn?.homeTeam.formRecent ?? [],
+          restDays: matchingEspn?.homeTeam.restDays ?? 2,
         },
         awayTeam: {
           id: `bdl-team-${g.visitor_team.id}`,
           name: g.visitor_team.full_name,
           shortName: g.visitor_team.abbreviation,
           league: 'NBA',
-          record: 'BallDontLie',
-          formRecent: [],
-          restDays: 2,
+          record: matchingEspn?.awayTeam.record ?? 'BallDontLie',
+          playedGames: matchingEspn?.awayTeam.playedGames,
+          ppgOrGpg: matchingEspn?.awayTeam.ppgOrGpg,
+          oppgOrGapg: matchingEspn?.awayTeam.oppgOrGapg,
+          offRating: matchingEspn?.awayTeam.offRating,
+          defRating: matchingEspn?.awayTeam.defRating,
+          pace: matchingEspn?.awayTeam.pace,
+          formRecent: matchingEspn?.awayTeam.formRecent ?? [],
+          restDays: matchingEspn?.awayTeam.restDays ?? 2,
         },
         score: isLive || isFinal ? { home: g.home_team_score, away: g.visitor_team_score } : undefined,
         lineupStatus: 'provisional',
@@ -664,43 +624,49 @@ export async function fetchNbaCalendarAndStandings(
         awayPlayers: [],
         h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 225, lastMeetings: [] },
         odds: [],
+        teamStatsQuality: matchingEspn?.teamStatsQuality ?? 'unavailable',
         dataOrigin: 'BallDontLie NBA v1',
         updatedAt: fetchedAt,
         isOfflineReference: false,
       };
     });
-    return { matches, standings: [] };
+    return { matches, standings: espnNba.standings };
   }
 
   if (provider === 'api-basketball' || provider === 'api-nba') {
     const dates = [isoDateOffset(-1), isoDateOffset(0), isoDateOffset(1), isoDateOffset(2)];
-    const responses = await Promise.all(
-      dates.map(async (d) => {
-        const url =
-          provider === 'api-nba'
-            ? `https://v2.nba.api-sports.io/games?date=${d}`
-            : `https://v1.basketball.api-sports.io/games?league=12&date=${d}`;
-        const res = await fetch(url, { headers: { 'x-apisports-key': apiKey } });
-        if (!res.ok) throw new Error(`API-Sports NBA HTTP ${res.status}`);
-        return (await res.json()) as {
-          response?: Array<{
-            id: number;
-            date: string | { start?: string };
-            status: { short?: string | number; long?: string };
-            teams: {
-              home: { id: number; name: string; code?: string };
-              visitors?: { id: number; name: string; code?: string };
-              away?: { id: number; name: string; code?: string };
-            };
-            scores?: {
-              home?: { total?: number; points?: number };
-              visitors?: { points?: number };
-              away?: { total?: number };
-            };
-          }>;
-        };
-      })
-    );
+    const [responses, espnNba] = await Promise.all([
+      Promise.all(
+        dates.map(async (d) => {
+          const url =
+            provider === 'api-nba'
+              ? `https://v2.nba.api-sports.io/games?date=${d}`
+              : `https://v1.basketball.api-sports.io/games?league=12&date=${d}`;
+          const res = await fetchWithTimeout(url, { headers: { 'x-apisports-key': apiKey } }, 10000);
+          if (!res.ok) throw new Error(`API-Sports NBA HTTP ${res.status}`);
+          return (await res.json()) as {
+            response?: Array<{
+              id: number;
+              date: string | { start?: string };
+              status: { short?: string | number; long?: string };
+              teams: {
+                home: { id: number; name: string; code?: string };
+                visitors?: { id: number; name: string; code?: string };
+                away?: { id: number; name: string; code?: string };
+              };
+              scores?: {
+                home?: { total?: number; points?: number };
+                visitors?: { points?: number };
+                away?: { total?: number };
+              };
+            }>;
+          };
+        })
+      ),
+      includeEspnFallback
+        ? fetchEspnNbaCalendarAndStandings().catch(() => ({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }))
+        : Promise.resolve({ matches: [] as MatchRecord[], standings: [] as StandingEntry[] }),
+    ]);
 
     const matches: MatchRecord[] = responses
       .flatMap((r) => r.response ?? [])
@@ -713,6 +679,13 @@ export async function fetchNbaCalendarAndStandings(
         const kickoff = typeof g.date === 'string' ? g.date : g.date?.start ?? fetchedAt;
         const isFinished = statusLong.includes('finish');
         const isLive = statusLong.includes('live') || statusLong.includes('quarter');
+        const matchingEspn = espnNba.matches.find(
+          (em) =>
+            teamsMatch(em.homeTeam.name, g.teams.home.name) &&
+            teamsMatch(em.awayTeam.name, away.name) &&
+            Math.abs(new Date(em.kickoffIso).getTime() - new Date(kickoff).getTime()) <= 36 * 3600 * 1000
+        );
+
         return {
           id: `${provider === 'api-nba' ? 'apinba2' : 'apibsk'}-${g.id}`,
           sport: 'nba',
@@ -720,24 +693,36 @@ export async function fetchNbaCalendarAndStandings(
           season: 'Actual',
           status: isFinished ? 'finished' : isLive ? 'live' : classifyKickoffStatus(kickoff),
           kickoffIso: kickoff,
-          venue: 'NBA Arena',
+          venue: matchingEspn?.venue ?? 'NBA Arena',
           homeTeam: {
             id: `nba-team-${g.teams.home.id}`,
             name: g.teams.home.name,
             shortName: g.teams.home.code ?? g.teams.home.name.slice(0, 3).toUpperCase(),
             league: 'NBA',
-            record: 'API-Sports NBA',
-            formRecent: [],
-            restDays: 2,
+            record: matchingEspn?.homeTeam.record ?? 'API-Sports NBA',
+            playedGames: matchingEspn?.homeTeam.playedGames,
+            ppgOrGpg: matchingEspn?.homeTeam.ppgOrGpg,
+            oppgOrGapg: matchingEspn?.homeTeam.oppgOrGapg,
+            offRating: matchingEspn?.homeTeam.offRating,
+            defRating: matchingEspn?.homeTeam.defRating,
+            pace: matchingEspn?.homeTeam.pace,
+            formRecent: matchingEspn?.homeTeam.formRecent ?? [],
+            restDays: matchingEspn?.homeTeam.restDays ?? 2,
           },
           awayTeam: {
             id: `nba-team-${away.id}`,
             name: away.name,
             shortName: away.code ?? away.name.slice(0, 3).toUpperCase(),
             league: 'NBA',
-            record: 'API-Sports NBA',
-            formRecent: [],
-            restDays: 2,
+            record: matchingEspn?.awayTeam.record ?? 'API-Sports NBA',
+            playedGames: matchingEspn?.awayTeam.playedGames,
+            ppgOrGpg: matchingEspn?.awayTeam.ppgOrGpg,
+            oppgOrGapg: matchingEspn?.awayTeam.oppgOrGapg,
+            offRating: matchingEspn?.awayTeam.offRating,
+            defRating: matchingEspn?.awayTeam.defRating,
+            pace: matchingEspn?.awayTeam.pace,
+            formRecent: matchingEspn?.awayTeam.formRecent ?? [],
+            restDays: matchingEspn?.awayTeam.restDays ?? 2,
           },
           score: homePts !== null && awayPts !== null ? { home: homePts, away: awayPts } : undefined,
           lineupStatus: 'provisional',
@@ -745,20 +730,21 @@ export async function fetchNbaCalendarAndStandings(
           awayPlayers: [],
           h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 224, lastMeetings: [] },
           odds: [],
+          teamStatsQuality: matchingEspn?.teamStatsQuality ?? 'unavailable',
           dataOrigin: provider === 'api-nba' ? 'API-NBA v2 (API-Sports)' : 'API-Basketball v1 (API-Sports)',
           updatedAt: fetchedAt,
           isOfflineReference: false,
         };
       });
 
-    // Attempt NBA Standings
     const standings: StandingEntry[] = [];
     try {
       const seasonYear = new Date().getMonth() >= 9 ? new Date().getFullYear() : new Date().getFullYear() - 1;
       if (provider === 'api-nba') {
-        const sRes = await fetch(
+        const sRes = await fetchWithTimeout(
           `https://v2.nba.api-sports.io/standings?league=standard&season=${seasonYear}`,
-          { headers: { 'x-apisports-key': apiKey } }
+          { headers: { 'x-apisports-key': apiKey } },
+          9000
         );
         if (sRes.ok) {
           const sJson = (await sRes.json()) as {
@@ -796,100 +782,7 @@ export async function fetchNbaCalendarAndStandings(
       // Ignore standings fallback error
     }
 
-    return { matches, standings };
-  }
-
-  if (provider === 'the-odds-api') {
-    const res = await fetch(
-      `https://api.the-odds-api.com/v4/sports/basketball_nba/odds/?apiKey=${encodeURIComponent(
-        apiKey
-      )}&regions=eu&markets=h2h,totals`
-    );
-    if (!res.ok) throw new Error(`The Odds API NBA HTTP ${res.status}`);
-    const events = (await res.json()) as Array<{
-      id: string;
-      commence_time: string;
-      home_team: string;
-      away_team: string;
-      bookmakers: Array<{
-        title: string;
-        last_update: string;
-        markets: Array<{
-          key: string;
-          outcomes: Array<{ name: string; price: number; point?: number }>;
-        }>;
-      }>;
-    }>;
-
-    const matches: MatchRecord[] = events.slice(0, 20).map((ev) => {
-      const bm = ev.bookmakers[0];
-      const odds: BookmakerOdd[] = [];
-      const h2h = bm?.markets.find((mk) => mk.key === 'h2h');
-      if (h2h && h2h.outcomes.length >= 2) {
-        const homeOut = h2h.outcomes.find((o) => o.name === ev.home_team);
-        const awayOut = h2h.outcomes.find((o) => o.name === ev.away_team);
-        if (homeOut && awayOut) {
-          odds.push({
-            id: `odds-${ev.id}-ml-home`,
-            marketCategory: 'match',
-            marketLabel: 'Ganador del Partido (Moneyline)',
-            selectionLabel: ev.home_team,
-            side: 'home',
-            decimalOdds: homeOut.price,
-            complementOdds: awayOut.price,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update,
-          });
-          odds.push({
-            id: `odds-${ev.id}-ml-away`,
-            marketCategory: 'match',
-            marketLabel: 'Ganador del Partido (Moneyline)',
-            selectionLabel: ev.away_team,
-            side: 'away',
-            decimalOdds: awayOut.price,
-            complementOdds: homeOut.price,
-            bookmaker: bm.title,
-            updatedAt: bm.last_update,
-          });
-        }
-      }
-      return {
-        id: `oddsnba-${ev.id}`,
-        sport: 'nba',
-        competition: 'NBA',
-        season: 'Actual',
-        status: classifyKickoffStatus(ev.commence_time),
-        kickoffIso: ev.commence_time,
-        venue: 'NBA Arena',
-        homeTeam: {
-          id: `odds-${ev.home_team}`,
-          name: ev.home_team,
-          shortName: ev.home_team.slice(0, 3).toUpperCase(),
-          league: 'NBA',
-          record: 'The Odds API',
-          formRecent: [],
-          restDays: 2,
-        },
-        awayTeam: {
-          id: `odds-${ev.away_team}`,
-          name: ev.away_team,
-          shortName: ev.away_team.slice(0, 3).toUpperCase(),
-          league: 'NBA',
-          record: 'The Odds API',
-          formRecent: [],
-          restDays: 2,
-        },
-        lineupStatus: 'provisional',
-        homePlayers: [],
-        awayPlayers: [],
-        h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 225, lastMeetings: [] },
-        odds,
-        dataOrigin: 'The Odds API v4 (NBA)',
-        updatedAt: fetchedAt,
-        isOfflineReference: false,
-      };
-    });
-    return { matches, standings: [] };
+    return { matches, standings: standings.length > 0 ? standings : espnNba.standings };
   }
 
   if (provider === 'basketballapi-net') {
@@ -918,12 +811,11 @@ export async function fetchNbaCalendarAndStandings(
     const buckets = await Promise.all(
       endpoints.map(async (url) => {
         try {
-          const r = await fetch(url, { headers });
+          const r = await fetchWithTimeout(url, { headers }, 9000);
           if (r.status === 401) {
             authError = 'BasketballAPI.net rechazó la clave API (HTTP 401).';
             return [] as AnyObj[];
           }
-          // On Free plan, paid endpoints return 403 upgrade_required — skip gracefully
           if (!r.ok) return [] as AnyObj[];
           return extractArray(await r.json());
         } catch {
@@ -933,6 +825,13 @@ export async function fetchNbaCalendarAndStandings(
     );
 
     if (authError) throw new Error(authError);
+
+    const espnNba = includeEspnFallback
+      ? await fetchEspnNbaCalendarAndStandings().catch(() => ({
+          matches: [] as MatchRecord[],
+          standings: [] as StandingEntry[],
+        }))
+      : { matches: [] as MatchRecord[], standings: [] as StandingEntry[] };
 
     const rawGames = buckets.flat();
     const seenIds = new Set<string>();
@@ -1028,6 +927,13 @@ export async function fetchNbaCalendarAndStandings(
             : null;
       const leagueName = String(leagueObj?.name ?? g.competition_name ?? g.league ?? g.competition ?? 'NBA / Baloncesto');
 
+      const matchingEspn = espnNba.matches.find(
+        (em) =>
+          teamsMatch(em.homeTeam.name, homeName) &&
+          teamsMatch(em.awayTeam.name, awayName) &&
+          Math.abs(new Date(em.kickoffIso).getTime() - new Date(kickoffIso).getTime()) <= 36 * 3600 * 1000
+      );
+
       matches.push({
         id: `bapi-${idStr}`,
         sport: 'nba',
@@ -1036,24 +942,36 @@ export async function fetchNbaCalendarAndStandings(
         status: isFinal ? 'finished' : isLive ? 'live' : classifyKickoffStatus(kickoffIso),
         kickoffIso,
         minuteOrClock: isLive ? String(statusObj?.short ?? g.clock ?? g.status ?? 'En juego') : undefined,
-        venue: String((g.venue as AnyObj | undefined)?.name ?? g.venue ?? g.arena ?? 'Pabellón oficial'),
+        venue: String((g.venue as AnyObj | undefined)?.name ?? g.venue ?? g.arena ?? matchingEspn?.venue ?? 'Pabellón oficial'),
         homeTeam: {
           id: `bapi-team-${homeId}`,
           name: homeName,
           shortName: homeShort,
           league: leagueName,
-          record: 'BasketballAPI.net',
-          formRecent: [],
-          restDays: 2,
+          record: matchingEspn?.homeTeam.record ?? 'BasketballAPI.net',
+          playedGames: matchingEspn?.homeTeam.playedGames,
+          ppgOrGpg: matchingEspn?.homeTeam.ppgOrGpg,
+          oppgOrGapg: matchingEspn?.homeTeam.oppgOrGapg,
+          offRating: matchingEspn?.homeTeam.offRating,
+          defRating: matchingEspn?.homeTeam.defRating,
+          pace: matchingEspn?.homeTeam.pace,
+          formRecent: matchingEspn?.homeTeam.formRecent ?? [],
+          restDays: matchingEspn?.homeTeam.restDays ?? 2,
         },
         awayTeam: {
           id: `bapi-team-${awayId}`,
           name: awayName,
           shortName: awayShort,
           league: leagueName,
-          record: 'BasketballAPI.net',
-          formRecent: [],
-          restDays: 2,
+          record: matchingEspn?.awayTeam.record ?? 'BasketballAPI.net',
+          playedGames: matchingEspn?.awayTeam.playedGames,
+          ppgOrGpg: matchingEspn?.awayTeam.ppgOrGpg,
+          oppgOrGapg: matchingEspn?.awayTeam.oppgOrGapg,
+          offRating: matchingEspn?.awayTeam.offRating,
+          defRating: matchingEspn?.awayTeam.defRating,
+          pace: matchingEspn?.awayTeam.pace,
+          formRecent: matchingEspn?.awayTeam.formRecent ?? [],
+          restDays: matchingEspn?.awayTeam.restDays ?? 2,
         },
         score: hasScore ? { home: Number(homeScoreVal), away: Number(awayScoreVal) } : undefined,
         lineupStatus: 'provisional',
@@ -1061,13 +979,13 @@ export async function fetchNbaCalendarAndStandings(
         awayPlayers: [],
         h2hSummary: { played: 0, homeWins: 0, draws: 0, awayWins: 0, avgTotalPointsOrGoals: 224, lastMeetings: [] },
         odds: [],
+        teamStatsQuality: matchingEspn?.teamStatsQuality ?? 'unavailable',
         dataOrigin: 'BasketballAPI.net v1',
         updatedAt: fetchedAt,
         isOfflineReference: false,
       });
     }
 
-    // Prioritize NBA matches first, then other leagues
     matches.sort((a, b) => {
       const aNba = a.competition.toUpperCase().includes('NBA') ? 0 : 1;
       const bNba = b.competition.toUpperCase().includes('NBA') ? 0 : 1;
@@ -1075,10 +993,9 @@ export async function fetchNbaCalendarAndStandings(
       return a.kickoffIso.localeCompare(b.kickoffIso);
     });
 
-    // Attempt Standings from BasketballAPI.net (only if enabled on user's plan)
     const standings: StandingEntry[] = [];
     try {
-      const sRes = await fetch('https://api.basketballapi.net/v1/standings', { headers });
+      const sRes = await fetchWithTimeout('https://api.basketballapi.net/v1/standings', { headers }, 8000);
       if (sRes.ok) {
         const sRows = extractArray(await sRes.json());
         sRows.forEach((row, idx) => {
@@ -1122,23 +1039,20 @@ export async function fetchNbaCalendarAndStandings(
       // Standings optional if not enabled on plan
     }
 
-    const espnNba = await fetchEspnNbaCalendarAndStandings().catch(() => ({
-      matches: [] as MatchRecord[],
-      standings: [] as StandingEntry[],
-    }));
-    const enrichedBapi = mergeRealOddsIntoMatches(matches, espnNba.matches);
-    const extraEspnNba = espnNba.matches.filter(
-      (em) =>
-        !enrichedBapi.some(
-          (bm) =>
-            teamsMatch(bm.homeTeam.name, em.homeTeam.name) &&
-            teamsMatch(bm.awayTeam.name, em.awayTeam.name) &&
-            Math.abs(new Date(bm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+    const extraEspnNba = includeEspnFallback
+      ? espnNba.matches.filter(
+          (em) =>
+            !matches.some(
+              (bm) =>
+                teamsMatch(bm.homeTeam.name, em.homeTeam.name) &&
+                teamsMatch(bm.awayTeam.name, em.awayTeam.name) &&
+                Math.abs(new Date(bm.kickoffIso).getTime() - new Date(em.kickoffIso).getTime()) <= 36 * 3600 * 1000
+            )
         )
-    );
+      : [];
 
     return {
-      matches: [...enrichedBapi, ...extraEspnNba],
+      matches: [...matches, ...extraEspnNba],
       standings: standings.length > 0 ? standings : espnNba.standings,
     };
   }
@@ -1147,7 +1061,7 @@ export async function fetchNbaCalendarAndStandings(
 }
 
 /**
- * Hydrates full lineups, injuries, H2H, team strength, recent L15 history, and odds for an individual match clicked by the user.
+ * Hydrates full lineups, injuries, H2H, team strength, and recent L15 history for an individual match.
  */
 export async function hydrateLiveMatchDetails(
   baseMatch: MatchRecord,
@@ -1169,19 +1083,16 @@ export async function hydrateLiveMatchDetails(
     const homeTeamId = baseMatch.homeTeam.id.replace('apifb-team-', '');
     const awayTeamId = baseMatch.awayTeam.id.replace('apifb-team-', '');
 
-    const [lineupRes, injRes, h2hRes, oddsRes] = await Promise.all([
-      fetch(`https://v3.football.api-sports.io/fixtures/lineups?fixture=${fixtureId}`, {
+    const [lineupRes, injRes, h2hRes] = await Promise.all([
+      fetchWithTimeout(`https://v3.football.api-sports.io/fixtures/lineups?fixture=${fixtureId}`, {
         headers: { 'x-apisports-key': apiKey },
-      }).then((r) => r.json()).catch(() => ({ response: [] })),
-      fetch(`https://v3.football.api-sports.io/injuries?fixture=${fixtureId}`, {
+      }, 9000).then((r) => (r.ok ? r.json() : { response: [] })).catch(() => ({ response: [] })),
+      fetchWithTimeout(`https://v3.football.api-sports.io/injuries?fixture=${fixtureId}`, {
         headers: { 'x-apisports-key': apiKey },
-      }).then((r) => r.json()).catch(() => ({ response: [] })),
-      fetch(`https://v3.football.api-sports.io/fixtures/headtohead?h2h=${homeTeamId}-${awayTeamId}&last=5`, {
+      }, 9000).then((r) => (r.ok ? r.json() : { response: [] })).catch(() => ({ response: [] })),
+      fetchWithTimeout(`https://v3.football.api-sports.io/fixtures/headtohead?h2h=${homeTeamId}-${awayTeamId}&last=5`, {
         headers: { 'x-apisports-key': apiKey },
-      }).then((r) => r.json()).catch(() => ({ response: [] })),
-      fetch(`https://v3.football.api-sports.io/odds?fixture=${fixtureId}`, {
-        headers: { 'x-apisports-key': apiKey },
-      }).then((r) => r.json()).catch(() => ({ response: [] })),
+      }, 9000).then((r) => (r.ok ? r.json() : { response: [] })).catch(() => ({ response: [] })),
     ]) as [
       {
         response?: Array<{
@@ -1202,18 +1113,6 @@ export async function hydrateLiveMatchDetails(
           fixture: { date: string };
           teams: { home: { name: string; winner: boolean | null }; away: { name: string; winner: boolean | null } };
           goals: { home: number | null; away: number | null };
-        }>;
-      },
-      {
-        response?: Array<{
-          bookmakers?: Array<{
-            name: string;
-            bets?: Array<{
-              id: number;
-              name: string;
-              values: Array<{ value: string; odd: string }>;
-            }>;
-          }>;
         }>;
       }
     ];
@@ -1241,25 +1140,28 @@ export async function hydrateLiveMatchDetails(
             position: p.pos || 'M',
             photoUrl: `https://media.api-sports.io/football/players/${p.id}.png`,
             availability: 'starter',
+            availabilityConfidence: 'confirmed',
             isKeyPlayer: isForward || idx === 0,
             pitchCoord: mapFootballGridCoord(p.grid, idx, lineup.startXI.length),
             impact: {
-              offenseDelta: isForward ? 0.28 : isMid ? 0.14 : 0.04,
-              defenseDelta: p.pos === 'G' || p.pos === 'D' ? 0.14 : 0.04,
-              usageShare: isForward ? 0.18 : isMid ? 0.1 : 0.03,
-              assistShare: isMid ? 0.2 : isForward ? 0.14 : 0.04,
+              offenseDelta: isForward ? 0.26 : isMid ? 0.13 : 0.04,
+              defenseDelta: p.pos === 'G' || p.pos === 'D' ? 0.13 : 0.04,
+              usageShare: isForward ? 0.17 : isMid ? 0.1 : 0.03,
+              assistShare: isMid ? 0.19 : isForward ? 0.14 : 0.04,
             },
             splits: {
-              season: { games: 15, minutes: 80, starterRate: 0.85, goals: isForward ? 0.35 : isMid ? 0.14 : 0.04, assists: isMid ? 0.22 : 0.1, shots: isForward ? 2.4 : isMid ? 1.2 : 0.4, shotsOnTarget: isForward ? 1.05 : 0.45, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 52 : 36 },
-              last5: { games: 5, minutes: 82, starterRate: 0.9, goals: isForward ? 0.4 : 0.15, assists: 0.2, shots: isForward ? 2.6 : 1.2, shotsOnTarget: isForward ? 1.1 : 0.5, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.15, redCards: 0.01, passes: 44 },
-              last10: { games: 10, minutes: 80, starterRate: 0.85, goals: isForward ? 0.36 : 0.14, assists: 0.18, shots: isForward ? 2.4 : 1.2, shotsOnTarget: isForward ? 1.0 : 0.45, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: 42 },
-              last15: { games: 15, minutes: 80, starterRate: 0.85, goals: isForward ? 0.35 : 0.14, assists: 0.18, shots: isForward ? 2.4 : 1.2, shotsOnTarget: isForward ? 1.0 : 0.45, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: 42 },
-              home: { games: 8, minutes: 81, starterRate: 0.88, goals: isForward ? 0.38 : 0.15, assists: 0.2, shots: isForward ? 2.6 : 1.3, shotsOnTarget: isForward ? 1.1 : 0.5, foulsCommitted: 0.9, foulsDrawn: 1.3, yellowCards: 0.14, redCards: 0.01, passes: 45 },
-              away: { games: 7, minutes: 79, starterRate: 0.82, goals: isForward ? 0.31 : 0.12, assists: 0.16, shots: isForward ? 2.2 : 1.1, shotsOnTarget: isForward ? 0.95 : 0.4, foulsCommitted: 1.1, foulsDrawn: 1.1, yellowCards: 0.18, redCards: 0.01, passes: 39 },
-              h2h: { games: 3, minutes: 80, starterRate: 0.85, goals: isForward ? 0.33 : 0.14, assists: 0.18, shots: isForward ? 2.4 : 1.2, shotsOnTarget: isForward ? 1.0 : 0.45, foulsCommitted: 1.0, foulsDrawn: 1.2, yellowCards: 0.16, redCards: 0.01, passes: 42 },
+              season: { games: 0, minutes: 0, starterRate: 0.85 },
+              last5: { games: 0, minutes: 0, starterRate: 0.85 },
+              last10: { games: 0, minutes: 0, starterRate: 0.85 },
+              last15: { games: 0, minutes: 0, starterRate: 0.85 },
+              home: { games: 0, minutes: 0, starterRate: 0.85 },
+              away: { games: 0, minutes: 0, starterRate: 0.85 },
+              h2h: { games: 0, minutes: 0, starterRate: 0.85 },
             },
             recentLogs: [],
-            sampleSizeGames: 15,
+            sampleSizeGames: 0,
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Alineación API-Football; estadísticas individuales reales no disponibles en esta fuente',
           });
         });
 
@@ -1277,19 +1179,22 @@ export async function hydrateLiveMatchDetails(
             position: p.pos || 'SUB',
             photoUrl: `https://media.api-sports.io/football/players/${p.id}.png`,
             availability: 'bench',
+            availabilityConfidence: 'confirmed',
             isKeyPlayer: false,
             impact: { offenseDelta: 0.08, defenseDelta: 0.04, usageShare: 0.06, assistShare: 0.06 },
             splits: {
-              season: { games: 12, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last5: { games: 5, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last10: { games: 10, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              last15: { games: 12, minutes: 26, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
-              home: { games: 6, minutes: 27, starterRate: 0.2, goals: 0.11, assists: 0.09, shots: 0.85, shotsOnTarget: 0.38, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.11, redCards: 0.01, passes: 19 },
-              away: { games: 6, minutes: 25, starterRate: 0.2, goals: 0.09, assists: 0.07, shots: 0.75, shotsOnTarget: 0.32, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.13, redCards: 0.01, passes: 17 },
-              h2h: { games: 2, minutes: 25, starterRate: 0.2, goals: 0.1, assists: 0.08, shots: 0.8, shotsOnTarget: 0.35, foulsCommitted: 0.7, foulsDrawn: 0.7, yellowCards: 0.12, redCards: 0.01, passes: 18 },
+              season: { games: 0, minutes: 0, starterRate: 0.2 },
+              last5: { games: 0, minutes: 0, starterRate: 0.2 },
+              last10: { games: 0, minutes: 0, starterRate: 0.2 },
+              last15: { games: 0, minutes: 0, starterRate: 0.2 },
+              home: { games: 0, minutes: 0, starterRate: 0.2 },
+              away: { games: 0, minutes: 0, starterRate: 0.2 },
+              h2h: { games: 0, minutes: 0, starterRate: 0.2 },
             },
             recentLogs: [],
-            sampleSizeGames: 12,
+            sampleSizeGames: 0,
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Suplente API-Football; estadísticas individuales reales no disponibles en esta fuente',
           });
         });
       }
@@ -1308,20 +1213,23 @@ export async function hydrateLiveMatchDetails(
             position: 'Baja',
             photoUrl: inj.player.photo,
             availability: inj.player.type?.toLowerCase().includes('question') ? 'doubtful' : 'out',
+            availabilityConfidence: 'confirmed',
             injuryNote: inj.player.reason || 'Lesión / Baja reportada',
             isKeyPlayer: true,
             impact: { offenseDelta: 0.18, defenseDelta: 0.09, usageShare: 0.12, assistShare: 0.12 },
             splits: {
-              season: { games: 10, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last5: { games: 5, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last10: { games: 10, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              last15: { games: 10, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              home: { games: 5, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              away: { games: 5, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
-              h2h: { games: 2, minutes: 70, starterRate: 0.7, goals: 0.18, assists: 0.14, shots: 1.5, shotsOnTarget: 0.6, foulsCommitted: 0.9, foulsDrawn: 1.0, yellowCards: 0.15, redCards: 0.01, passes: 35 },
+              season: { games: 0, minutes: 0, starterRate: 0 },
+              last5: { games: 0, minutes: 0, starterRate: 0 },
+              last10: { games: 0, minutes: 0, starterRate: 0 },
+              last15: { games: 0, minutes: 0, starterRate: 0 },
+              home: { games: 0, minutes: 0, starterRate: 0 },
+              away: { games: 0, minutes: 0, starterRate: 0 },
+              h2h: { games: 0, minutes: 0, starterRate: 0 },
             },
             recentLogs: [],
-            sampleSizeGames: 10,
+            sampleSizeGames: 0,
+            statsQuality: 'unavailable',
+            statsOriginNote: 'Parte médico oficial API-Football; sin estadísticas individuales',
           });
         }
       }
@@ -1344,61 +1252,7 @@ export async function hydrateLiveMatchDetails(
       0
     );
 
-    const parsedOdds: BookmakerOdd[] = [];
-    const bm = oddsRes.response?.[0]?.bookmakers?.[0];
-    if (bm?.bets) {
-      const winnerBet = bm.bets.find((b) => b.name === 'Match Winner');
-      if (winnerBet && winnerBet.values.length >= 3) {
-        const o1 = Number(winnerBet.values.find((v) => v.value === 'Home')?.odd || 0);
-        const ox = Number(winnerBet.values.find((v) => v.value === 'Draw')?.odd || 0);
-        const o2 = Number(winnerBet.values.find((v) => v.value === 'Away')?.odd || 0);
-        if (o1 > 1 && ox > 1 && o2 > 1) {
-          parsedOdds.push({
-            id: `apifb-odd-1`,
-            marketCategory: 'match',
-            marketLabel: 'Resultado Final (1X2)',
-            selectionLabel: `Victoria ${baseMatch.homeTeam.name}`,
-            side: 'home',
-            decimalOdds: o1,
-            threeWayOdds: [o1, ox, o2],
-            bookmaker: bm.name,
-            updatedAt: fetchedAt,
-          });
-          parsedOdds.push({
-            id: `apifb-odd-2`,
-            marketCategory: 'match',
-            marketLabel: 'Resultado Final (1X2)',
-            selectionLabel: `Victoria ${baseMatch.awayTeam.name}`,
-            side: 'away',
-            decimalOdds: o2,
-            threeWayOdds: [o1, ox, o2],
-            bookmaker: bm.name,
-            updatedAt: fetchedAt,
-          });
-        }
-      }
-      const ouBet = bm.bets.find((b) => b.name === 'Goals Over/Under');
-      if (ouBet) {
-        const over25 = ouBet.values.find((v) => v.value === 'Over 2.5');
-        const under25 = ouBet.values.find((v) => v.value === 'Under 2.5');
-        if (over25 && under25) {
-          parsedOdds.push({
-            id: `apifb-odd-ou25`,
-            marketCategory: 'totals',
-            marketLabel: 'Más / Menos Goles',
-            selectionLabel: 'Más de 2.5 goles',
-            line: 2.5,
-            side: 'over',
-            decimalOdds: Number(over25.odd),
-            complementOdds: Number(under25.odd),
-            bookmaker: bm.name,
-            updatedAt: fetchedAt,
-          });
-        }
-      }
-    }
-
-    return {
+    const baseHydrated: MatchRecord = {
       ...baseMatch,
       homeTeam: {
         ...baseMatch.homeTeam,
@@ -1411,6 +1265,7 @@ export async function hydrateLiveMatchDetails(
       lineupStatus: homeLineup && awayLineup ? 'confirmed' : 'provisional',
       homePlayers,
       awayPlayers,
+      odds: [],
       h2hSummary: {
         played: h2hMeetings.length,
         homeWins: (h2hRes.response ?? []).filter(
@@ -1427,8 +1282,66 @@ export async function hydrateLiveMatchDetails(
         avgTotalPointsOrGoals: h2hMeetings.length ? h2hGoals / h2hMeetings.length : 2.5,
         lastMeetings: h2hMeetings,
       },
-      odds: parsedOdds.length > 0 ? parsedOdds : baseMatch.odds,
       updatedAt: fetchedAt,
+    };
+
+    if (homeLineup && awayLineup) {
+      const confirmed = promoteOfficialToConfirmedLineup(
+        baseHydrated,
+        homePlayers,
+        awayPlayers,
+        'API-Football Oficial',
+        fetchedAt,
+        homeLineup.formation,
+        awayLineup.formation
+      );
+      return {
+        ...confirmed,
+        hydrationStatus: 'ok',
+        hydrationNote: 'Once inicial oficial confirmado por API-Football.',
+        provenance: {
+          source: 'API-Football Oficial',
+          fetchedAt,
+          status: 'ok',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: 'real',
+        },
+      };
+    }
+
+    const espnIds = await resolveEspnSoccerIdsForMatch(
+      baseMatch.competition,
+      baseMatch.homeTeam.name,
+      baseMatch.awayTeam.name
+    );
+    const probBundle = await buildProbableFootballLineups({
+      match: baseHydrated,
+      slug: espnIds.slug,
+      homeEspnTeamId: espnIds.homeEspnTeamId,
+      awayEspnTeamId: espnIds.awayEspnTeamId,
+    });
+    const probHome = probBundle.homePlayers.length >= 11 ? probBundle.homePlayers : homePlayers;
+    const probAway = probBundle.awayPlayers.length >= 11 ? probBundle.awayPlayers : awayPlayers;
+    return {
+      ...baseHydrated,
+      homePlayers: probHome,
+      awayPlayers: probAway,
+      lineupStatus: probHome.length > 0 && probAway.length > 0 ? 'provisional' : 'unknown',
+      probableLineup: probBundle.probableLineup,
+      footballNews: probBundle.footballNews,
+      hydrationStatus: probHome.length > 0 ? 'ok' : 'not_published',
+      hydrationNote: probBundle.probableLineup
+        ? 'Alineación probable calculada con últimos partidos + noticias deportivas previas.'
+        : 'Alineación oficial pendiente de publicación.',
+      provenance: {
+        source: `API-Football + ${probBundle.footballNews.sourcesChecked.slice(0, 2).join(', ')}`,
+        fetchedAt,
+        status: probHome.length > 0 ? 'ok' : 'partial',
+        isStale: false,
+        staleAgeMinutes: 0,
+        dataType: probHome.length > 0 ? 'estimated' : 'unavailable',
+      },
     };
   }
 
@@ -1436,12 +1349,12 @@ export async function hydrateLiveMatchDetails(
     const homeTeamId = baseMatch.homeTeam.id.replace('bdl-team-', '');
     const awayTeamId = baseMatch.awayTeam.id.replace('bdl-team-', '');
     const [hPlayersRes, aPlayersRes] = await Promise.all([
-      fetch(`https://api.balldontlie.io/v1/players?team_ids[]=${homeTeamId}&per_page=12`, {
+      fetchWithTimeout(`https://api.balldontlie.io/v1/players?team_ids[]=${homeTeamId}&per_page=12`, {
         headers: { Authorization: apiKey },
-      }).then((r) => r.json()).catch(() => ({ data: [] })),
-      fetch(`https://api.balldontlie.io/v1/players?team_ids[]=${awayTeamId}&per_page=12`, {
+      }, 9000).then((r) => (r.ok ? r.json() : { data: [] })).catch(() => ({ data: [] })),
+      fetchWithTimeout(`https://api.balldontlie.io/v1/players?team_ids[]=${awayTeamId}&per_page=12`, {
         headers: { Authorization: apiKey },
-      }).then((r) => r.json()).catch(() => ({ data: [] })),
+      }, 9000).then((r) => (r.ok ? r.json() : { data: [] })).catch(() => ({ data: [] })),
     ]) as [
       { data?: Array<{ id: number; first_name: string; last_name: string; position: string; jersey_number?: string }> },
       { data?: Array<{ id: number; first_name: string; last_name: string; position: string; jersey_number?: string }> }
@@ -1456,9 +1369,6 @@ export async function hydrateLiveMatchDetails(
       arr.slice(0, 10).map((p, idx) => {
         const isStarter = idx < 5;
         const pos = p.position || (['PG', 'SG', 'SF', 'PF', 'C'][idx % 5]);
-        const basePts = isStarter ? 17.5 - idx * 1.4 : 8.5;
-        const baseReb = pos.includes('C') || pos.includes('F') ? 7.2 : 4.1;
-        const baseAst = pos.includes('G') ? 5.2 : 2.3;
         return {
           id: `bdl-p-${p.id}`,
           sport: 'nba',
@@ -1469,26 +1379,29 @@ export async function hydrateLiveMatchDetails(
           teamShort,
           number: Number(p.jersey_number) || idx + 1,
           position: pos,
-          availability: isStarter ? 'starter' : 'bench',
+          availability: isStarter ? 'possible_starter' : 'available',
+          availabilityConfidence: 'projected',
           isKeyPlayer: idx < 3,
           pitchCoord: isStarter ? mapNbaSlotCoord(pos, idx) : undefined,
           impact: {
-            offenseDelta: isStarter ? 3.2 : 1.1,
+            offenseDelta: isStarter ? 3.0 : 1.1,
             defenseDelta: 1.4,
-            usageShare: isStarter ? 0.22 : 0.13,
-            assistShare: pos.includes('G') ? 0.25 : 0.12,
+            usageShare: isStarter ? 0.21 : 0.13,
+            assistShare: pos.includes('G') ? 0.24 : 0.12,
           },
           splits: {
-            season: { games: 30, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.1 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last5: { games: 5, minutes: isStarter ? 32 : 20, starterRate: isStarter ? 0.95 : 0.2, points: basePts * 1.05, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.2 : 1.0, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last10: { games: 10, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.1 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last15: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.1 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            home: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts * 1.04, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.2 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            away: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts * 0.96, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.0 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            h2h: { games: 2, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: basePts, rebounds: baseReb, assists: baseAst, threes: pos.includes('G') ? 2.1 : 0.9, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
+            season: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last5: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last10: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            last15: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            home: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            away: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
           },
           recentLogs: [],
-          sampleSizeGames: 30,
+          sampleSizeGames: 0,
+          statsQuality: 'unavailable',
+          statsOriginNote: 'Plantilla BallDontLie (estadísticas individuales reales no disponibles en esta fuente)',
         };
       });
 
@@ -1496,6 +1409,7 @@ export async function hydrateLiveMatchDetails(
       ...baseMatch,
       homePlayers: mapBdlRoster(hPlayersRes.data ?? [], baseMatch.homeTeam.id, baseMatch.homeTeam.name, baseMatch.homeTeam.shortName),
       awayPlayers: mapBdlRoster(aPlayersRes.data ?? [], baseMatch.awayTeam.id, baseMatch.awayTeam.name, baseMatch.awayTeam.shortName),
+      odds: [],
       updatedAt: fetchedAt,
     };
   }
@@ -1537,7 +1451,7 @@ export async function hydrateLiveMatchDetails(
     let rateLimited = false;
     const safeFdFetch = async <T>(url: string): Promise<T> => {
       try {
-        const r = await fetch(url, { headers });
+        const r = await fetchWithTimeout(url, { headers }, 9000);
         if (r.status === 429) {
           rateLimited = true;
           return {} as T;
@@ -1606,6 +1520,7 @@ export async function hydrateLiveMatchDetails(
 
       const n = recentGames.length;
       return {
+        played: n,
         recentGames,
         formRecent: recentGames.slice(0, 5).map((g) => g.result).reverse(),
         homeRecord: `${hw}-${hd}-${hl}`,
@@ -1641,7 +1556,11 @@ export async function hydrateLiveMatchDetails(
 
       if (starters.length === 0) {
         try {
-          const tRes = await fetch(`https://api.football-data.org/v4/teams/${teamIdStr}`, { headers });
+          const tRes = await fetchWithTimeout(
+            `https://api.football-data.org/v4/teams/${teamIdStr}`,
+            { headers },
+            9000
+          );
           if (tRes.ok) {
             const tJson = (await tRes.json()) as { squad?: FdPlayer[] };
             const squad = tJson.squad ?? [];
@@ -1658,6 +1577,8 @@ export async function hydrateLiveMatchDetails(
             const pickedIds = new Set(ordered.map((x) => x.id));
             starters = ordered.slice(0, 11);
             subs = squad.filter((s) => !pickedIds.has(s.id)).slice(0, 7);
+          } else if (tRes.status === 429) {
+            rateLimited = true;
           }
         } catch {
           // Keep empty if team squad fails
@@ -1678,26 +1599,29 @@ export async function hydrateLiveMatchDetails(
           teamShort,
           number: p.shirtNumber || idx + 1,
           position: p.position || pos,
-          availability: isStarter ? 'starter' : 'bench',
+          availability: isStarter ? (confirmed ? 'confirmed_starter' : 'possible_starter') : 'bench',
+          availabilityConfidence: confirmed ? 'confirmed' : 'projected',
           isKeyPlayer: isStarter && (isForward || idx < 4),
           pitchCoord: isStarter ? mapFootballGridCoord(null, idx, starters.length || 11) : undefined,
           impact: {
-            offenseDelta: isForward ? 0.25 : isMid ? 0.13 : 0.04,
+            offenseDelta: isForward ? 0.24 : isMid ? 0.13 : 0.04,
             defenseDelta: pos === 'G' || pos === 'D' ? 0.13 : 0.04,
             usageShare: isForward ? 0.17 : isMid ? 0.1 : 0.03,
-            assistShare: isMid ? 0.19 : isForward ? 0.14 : 0.04,
+            assistShare: isMid ? 0.18 : isForward ? 0.13 : 0.04,
           },
           splits: {
-            season: { games: isStarter ? 14 : 10, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : isMid ? 0.13 : 0.04, assists: isMid ? 0.2 : 0.09, shots: isForward ? 2.3 : isMid ? 1.15 : 0.4, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: isMid ? 48 : 34 },
-            last5: { games: 5, minutes: isStarter ? 80 : 28, starterRate: isStarter ? 0.88 : 0.2, goals: isForward ? 0.35 : 0.14, assists: 0.18, shots: isForward ? 2.4 : 1.1, shotsOnTarget: isForward ? 1.0 : 0.45, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.15, redCards: 0.01, passes: 42 },
-            last10: { games: 10, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : 0.13, assists: 0.16, shots: isForward ? 2.3 : 1.1, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: 40 },
-            last15: { games: 14, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.32 : 0.13, assists: 0.16, shots: isForward ? 2.3 : 1.1, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: 40 },
-            home: { games: 7, minutes: isStarter ? 80 : 27, starterRate: isStarter ? 0.86 : 0.2, goals: isForward ? 0.36 : 0.14, assists: 0.18, shots: isForward ? 2.5 : 1.2, shotsOnTarget: isForward ? 1.05 : 0.45, foulsCommitted: 0.9, foulsDrawn: 1.25, yellowCards: 0.14, redCards: 0.01, passes: 43 },
-            away: { games: 7, minutes: isStarter ? 76 : 25, starterRate: isStarter ? 0.82 : 0.2, goals: isForward ? 0.28 : 0.11, assists: 0.14, shots: isForward ? 2.1 : 1.0, shotsOnTarget: isForward ? 0.85 : 0.38, foulsCommitted: 1.0, foulsDrawn: 1.05, yellowCards: 0.18, redCards: 0.01, passes: 37 },
-            h2h: { games: 3, minutes: isStarter ? 78 : 26, starterRate: isStarter ? 0.84 : 0.2, goals: isForward ? 0.3 : 0.13, assists: 0.16, shots: isForward ? 2.3 : 1.1, shotsOnTarget: isForward ? 0.95 : 0.42, foulsCommitted: 0.95, foulsDrawn: 1.15, yellowCards: 0.16, redCards: 0.01, passes: 40 },
+            season: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last5: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last10: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            last15: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            home: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            away: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.84 : 0.2 },
           },
           recentLogs: [],
-          sampleSizeGames: 14,
+          sampleSizeGames: 0,
+          statsQuality: 'unavailable',
+          statsOriginNote: 'Plantilla oficial Football-Data.org; estadísticas individuales reales no disponibles en esta fuente',
         };
       };
 
@@ -1755,14 +1679,13 @@ export async function hydrateLiveMatchDetails(
     ];
 
     const hasConfirmed = homeRes.confirmed && awayRes.confirmed;
-    const hasAnyPlayers = homeRes.players.length > 0 && awayRes.players.length > 0;
-
-    return {
+    let fdHydrated: MatchRecord = {
       ...baseMatch,
       venue: detailRes.venue || baseMatch.venue,
       homeTeam: {
         ...baseMatch.homeTeam,
         formation: detailRes.homeTeam?.formation || baseMatch.homeTeam.formation || '4-3-3',
+        playedGames: baseMatch.homeTeam.playedGames ?? (hHist.played > 0 ? hHist.played : undefined),
         recentGames: hHist.recentGames,
         formRecent: hHist.formRecent.length > 0 ? hHist.formRecent : baseMatch.homeTeam.formRecent,
         homeRecord: hHist.homeRecord,
@@ -1774,6 +1697,7 @@ export async function hydrateLiveMatchDetails(
       awayTeam: {
         ...baseMatch.awayTeam,
         formation: detailRes.awayTeam?.formation || baseMatch.awayTeam.formation || '4-3-3',
+        playedGames: baseMatch.awayTeam.playedGames ?? (aHist.played > 0 ? aHist.played : undefined),
         recentGames: aHist.recentGames,
         formRecent: aHist.formRecent.length > 0 ? aHist.formRecent : baseMatch.awayTeam.formRecent,
         homeRecord: aHist.homeRecord,
@@ -1782,10 +1706,13 @@ export async function hydrateLiveMatchDetails(
         oppgOrGapg: aHist.oppg ?? baseMatch.awayTeam.oppgOrGapg,
         restDays: aHist.restDays,
       },
-      lineupStatus: hasConfirmed ? 'confirmed' : hasAnyPlayers ? 'provisional' : 'unknown',
-      homePlayers: homeRes.players,
-      awayPlayers: awayRes.players,
       teamStats,
+      teamStatsQuality:
+        (hHist.ppg !== undefined || baseMatch.homeTeam.ppgOrGpg !== undefined) &&
+        (aHist.ppg !== undefined || baseMatch.awayTeam.ppgOrGpg !== undefined)
+          ? 'verified'
+          : 'estimated',
+      odds: [],
       h2hSummary: {
         played: h2hMeetings.length,
         homeWins: (h2hRes.matches ?? []).filter(
@@ -1802,15 +1729,84 @@ export async function hydrateLiveMatchDetails(
         avgTotalPointsOrGoals: h2hMeetings.length ? h2hGoals / h2hMeetings.length : 2.5,
         lastMeetings: h2hMeetings,
       },
-      hydrationStatus: hasAnyPlayers ? 'ok' : rateLimited ? 'query_error' : 'partial',
-      hydrationNote: hasConfirmed
-        ? 'Once inicial oficial confirmado + historial reciente L15 y H2H cargados.'
-        : hasAnyPlayers
-          ? 'Once probable generado desde la plantilla oficial y últimos 15 partidos (la alineación definitiva se confirma ~60 min antes del inicio).'
-          : rateLimited
-            ? 'Football-Data.org devolvió HTTP 429 (límite de 10 peticiones/minuto del plan gratuito). Espera ~45 s y vuelve a abrir este partido.'
-            : 'Football-Data.org todavía no devolvió jugadores para este encuentro (convocatoria pendiente).',
       updatedAt: fetchedAt,
+    };
+
+    if (hasConfirmed) {
+      fdHydrated = promoteOfficialToConfirmedLineup(
+        fdHydrated,
+        homeRes.players,
+        awayRes.players,
+        'Football-Data.org Oficial',
+        fetchedAt,
+        detailRes.homeTeam?.formation,
+        detailRes.awayTeam?.formation
+      );
+      return {
+        ...fdHydrated,
+        hydrationStatus: 'ok',
+        hydrationNote: 'Once inicial oficial confirmado + historial reciente L15 y H2H cargados.',
+        provenance: {
+          source: 'Football-Data.org Oficial',
+          fetchedAt,
+          status: 'ok',
+          isStale: false,
+          staleAgeMinutes: 0,
+          dataType: 'real',
+        },
+      };
+    }
+
+    const espnIds = await resolveEspnSoccerIdsForMatch(
+      baseMatch.competition,
+      baseMatch.homeTeam.name,
+      baseMatch.awayTeam.name
+    );
+    const probBundle = await buildProbableFootballLineups({
+      match: {
+        ...fdHydrated,
+        homePlayers: homeRes.players,
+        awayPlayers: awayRes.players,
+      },
+      slug: espnIds.slug,
+      homeEspnTeamId: espnIds.homeEspnTeamId,
+      awayEspnTeamId: espnIds.awayEspnTeamId,
+    });
+
+    const finalHome = probBundle.homePlayers.length >= 11 ? probBundle.homePlayers : homeRes.players;
+    const finalAway = probBundle.awayPlayers.length >= 11 ? probBundle.awayPlayers : awayRes.players;
+    const hasAnyPlayers = finalHome.length > 0 && finalAway.length > 0;
+
+    return {
+      ...fdHydrated,
+      homeTeam: {
+        ...fdHydrated.homeTeam,
+        formation: probBundle.homeFormation ?? fdHydrated.homeTeam.formation,
+      },
+      awayTeam: {
+        ...fdHydrated.awayTeam,
+        formation: probBundle.awayFormation ?? fdHydrated.awayTeam.formation,
+      },
+      lineupStatus: hasAnyPlayers ? 'provisional' : 'unknown',
+      homePlayers: finalHome,
+      awayPlayers: finalAway,
+      probableLineup: probBundle.probableLineup,
+      footballNews: probBundle.footballNews,
+      hydrationStatus: hasAnyPlayers ? 'ok' : rateLimited ? 'query_error' : 'partial',
+      hydrationNote: hasAnyPlayers
+        ? 'Once probable calculado desde últimos partidos + plantilla oficial y fuentes deportivas (se actualizará automáticamente al publicarse el once oficial).'
+        : rateLimited
+          ? 'Football-Data.org devolvió HTTP 429 (límite de 10 peticiones/minuto del plan gratuito). Espera ~45 s y vuelve a abrir este partido.'
+          : 'Football-Data.org todavía no devolvió jugadores para este encuentro (convocatoria pendiente).',
+      provenance: {
+        source: `Football-Data.org + ${probBundle.footballNews.sourcesChecked.slice(0, 2).join(', ')}`,
+        fetchedAt,
+        status: rateLimited ? 'error' : hasAnyPlayers ? 'ok' : 'partial',
+        isStale: rateLimited,
+        staleAgeMinutes: 0,
+        dataType: hasAnyPlayers ? 'estimated' : 'unavailable',
+        errorMessage: rateLimited ? 'HTTP 429 Football-Data.org (rate limit)' : undefined,
+      },
     };
   }
 
@@ -1833,25 +1829,15 @@ export async function hydrateLiveMatchDetails(
       return [];
     };
 
-    let statusErrorCode: number | null = null;
     const [gameRes, homeRosterRes, awayRosterRes] = await Promise.all([
-      fetch(`https://api.basketballapi.net/v1/games/${gameId}`, { headers })
-        .then(async (r) => {
-          if (r.status === 401 || r.status === 403) statusErrorCode = r.status;
-          return r.ok ? r.json() : {};
-        })
+      fetchWithTimeout(`https://api.basketballapi.net/v1/games/${gameId}`, { headers }, 8000)
+        .then((r) => (r.ok ? r.json() : {}))
         .catch(() => ({})) as Promise<AnyObj>,
-      fetch(`https://api.basketballapi.net/v1/players?team_id=${homeTeamId}`, { headers })
-        .then((r) => {
-          if (r.status === 401 || r.status === 403) statusErrorCode = r.status;
-          return r.ok ? r.json() : {};
-        })
+      fetchWithTimeout(`https://api.basketballapi.net/v1/players?team_id=${homeTeamId}`, { headers }, 8000)
+        .then((r) => (r.ok ? r.json() : {}))
         .catch(() => ({})),
-      fetch(`https://api.basketballapi.net/v1/players?team_id=${awayTeamId}`, { headers })
-        .then((r) => {
-          if (r.status === 401 || r.status === 403) statusErrorCode = r.status;
-          return r.ok ? r.json() : {};
-        })
+      fetchWithTimeout(`https://api.basketballapi.net/v1/players?team_id=${awayTeamId}`, { headers }, 8000)
+        .then((r) => (r.ok ? r.json() : {}))
         .catch(() => ({})),
     ]);
 
@@ -1871,10 +1857,26 @@ export async function hydrateLiveMatchDetails(
         const isDoubtful = statusStr.includes('doubt') || statusStr.includes('quest') || statusStr.includes('day');
         const isStarter = !isOut && idx < 5;
 
-        const avgPts = Number(p.ppg ?? p.points_per_game ?? (isStarter ? 17.5 - idx * 1.4 : 8.2));
-        const avgReb = Number(p.rpg ?? p.rebounds_per_game ?? (pos.includes('C') || pos.includes('F') ? 7.1 : 4.0));
-        const avgAst = Number(p.apg ?? p.assists_per_game ?? (pos.includes('G') ? 5.1 : 2.2));
-        const avg3pm = Number(p.fg3m ?? (pos.includes('G') ? 2.1 : 0.9));
+        const rawPts = p.ppg ?? p.points_per_game;
+        const rawReb = p.rpg ?? p.rebounds_per_game;
+        const rawAst = p.apg ?? p.assists_per_game;
+        const raw3pm = p.fg3m;
+        const hasRealAvg = rawPts !== undefined && Number.isFinite(Number(rawPts));
+        const realSplit = hasRealAvg
+          ? {
+              games: 0,
+              minutes: isStarter ? 30 : 19,
+              starterRate: isStarter ? 0.85 : 0.15,
+              points: Number(rawPts),
+              ...(rawReb !== undefined && Number.isFinite(Number(rawReb)) ? { rebounds: Number(rawReb) } : {}),
+              ...(rawAst !== undefined && Number.isFinite(Number(rawAst)) ? { assists: Number(rawAst) } : {}),
+              ...(raw3pm !== undefined && Number.isFinite(Number(raw3pm)) ? { threes: Number(raw3pm) } : {}),
+            }
+          : {
+              games: 0,
+              minutes: 0,
+              starterRate: isStarter ? 0.85 : 0.15,
+            };
 
         return {
           id: `bapi-p-${String(p.id ?? `${teamShort}-${idx}`)}`,
@@ -1887,27 +1889,32 @@ export async function hydrateLiveMatchDetails(
           number: Number(p.jersey_number ?? p.number ?? idx + 1),
           position: pos,
           photoUrl: typeof p.photo_url === 'string' ? p.photo_url : typeof p.image === 'string' ? p.image : undefined,
-          availability: isOut ? 'out' : isDoubtful ? 'doubtful' : isStarter ? 'starter' : 'bench',
+          availability: isOut ? 'out' : isDoubtful ? 'doubtful' : isStarter ? 'possible_starter' : 'available',
+          availabilityConfidence: isOut || isDoubtful ? 'confirmed' : 'projected',
           injuryNote: isOut || isDoubtful ? String(p.injury_note ?? p.injury_status ?? 'Reporte de disponibilidad') : undefined,
           isKeyPlayer: idx < 3,
           pitchCoord: isStarter ? mapNbaSlotCoord(pos, idx) : undefined,
           impact: {
-            offenseDelta: isStarter ? 3.2 : 1.1,
+            offenseDelta: isStarter ? 3.0 : 1.1,
             defenseDelta: 1.4,
-            usageShare: isStarter ? 0.22 : 0.13,
-            assistShare: pos.includes('G') ? 0.25 : 0.12,
+            usageShare: isStarter ? 0.21 : 0.13,
+            assistShare: pos.includes('G') ? 0.24 : 0.12,
           },
           splits: {
-            season: { games: 30, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last5: { games: 5, minutes: isStarter ? 32 : 20, starterRate: isStarter ? 0.95 : 0.2, points: avgPts * 1.04, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last10: { games: 10, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            last15: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            home: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts * 1.04, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            away: { games: 15, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts * 0.96, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
-            h2h: { games: 2, minutes: isStarter ? 31 : 19, starterRate: isStarter ? 0.9 : 0.15, points: avgPts, rebounds: avgReb, assists: avgAst, threes: avg3pm, steals: 0.9, blocks: 0.6, turnovers: 1.8 },
+            season: realSplit,
+            last5: realSplit,
+            last10: realSplit,
+            last15: realSplit,
+            home: realSplit,
+            away: realSplit,
+            h2h: { games: 0, minutes: 0, starterRate: isStarter ? 0.85 : 0.15 },
           },
           recentLogs: [],
-          sampleSizeGames: 30,
+          sampleSizeGames: 0,
+          statsQuality: hasRealAvg ? 'estimated' : 'unavailable',
+          statsOriginNote: hasRealAvg
+            ? 'Promedios globales BasketballAPI.net (sin desglose partido a partido)'
+            : 'Estadísticas individuales reales no disponibles en esta fuente',
         };
       });
 
@@ -1925,12 +1932,12 @@ export async function hydrateLiveMatchDetails(
         lineupStatus: boxHome.length >= 5 && boxAway.length >= 5 ? 'confirmed' : 'provisional',
         homePlayers: hp,
         awayPlayers: ap,
+        odds: [],
         hydrationStatus: 'ok',
         hydrationNote: 'Plantilla y rotación cargadas desde BasketballAPI.net.',
         updatedAt: fetchedAt,
       };
     }
-    // If BasketballAPI.net returns 403/empty, transparently enrich via official ESPN NBA + injury feeds below
   }
 
   if (baseMatch.sport === 'nba') {
@@ -1940,7 +1947,7 @@ export async function hydrateLiveMatchDetails(
       const matchedEspn = espnNba.matches.find((em) => {
         const tDiff = Math.abs(new Date(em.kickoffIso).getTime() - baseTime);
         return (
-          tDiff <= 48 * 3600_000 &&
+          tDiff <= 36 * 3600_000 &&
           teamsMatch(em.homeTeam.name, baseMatch.homeTeam.name) &&
           teamsMatch(em.awayTeam.name, baseMatch.awayTeam.name)
         );
@@ -1952,7 +1959,7 @@ export async function hydrateLiveMatchDetails(
           id: baseMatch.id,
           competition: baseMatch.competition || hydratedEspn.competition,
           score: baseMatch.score ?? hydratedEspn.score,
-          odds: baseMatch.odds.length > 0 ? baseMatch.odds : hydratedEspn.odds,
+          odds: [],
           dataOrigin: `${baseMatch.dataOrigin} + ESPN NBA / Parte Oficial`,
         };
       }
@@ -1962,4 +1969,442 @@ export async function hydrateLiveMatchDetails(
   }
 
   return baseMatch;
+}
+
+const GENERIC_VENUES = new Set([
+  'sede oficial',
+  'estadio oficial',
+  'pabellón oficial',
+  'nba arena',
+  'estadio',
+  '',
+]);
+
+const GENERIC_RECORDS = new Set([
+  'football-data.org',
+  'api-football',
+  'basketballapi.net',
+  'balldontlie',
+  'api-sports nba',
+  '',
+]);
+
+function isBetterVenue(candidate: string | undefined, current: string | undefined): boolean {
+  const c = (candidate ?? '').trim();
+  const cur = (current ?? '').trim();
+  if (!c) return false;
+  if (GENERIC_VENUES.has(c.toLowerCase())) return false;
+  if (!cur || GENERIC_VENUES.has(cur.toLowerCase())) return true;
+  return c.length > cur.length && cur === 'Sede oficial';
+}
+
+function isBetterRecord(candidate: string | undefined, current: string | undefined): boolean {
+  const c = (candidate ?? '').trim();
+  const cur = (current ?? '').trim();
+  if (!c || GENERIC_RECORDS.has(c.toLowerCase())) return false;
+  if (!cur || GENERIC_RECORDS.has(cur.toLowerCase())) return true;
+  return false;
+}
+
+function qualityRank(q: MatchRecord['teamStatsQuality']): number {
+  if (q === 'verified') return 3;
+  if (q === 'estimated') return 2;
+  return 1;
+}
+
+function mergeTeamInfo(primary: MatchRecord['homeTeam'], secondary: MatchRecord['homeTeam']): MatchRecord['homeTeam'] {
+  return {
+    ...primary,
+    shortName:
+      primary.shortName && primary.shortName.length >= 2 && primary.shortName !== 'LOC' && primary.shortName !== 'VIS'
+        ? primary.shortName
+        : secondary.shortName,
+    formation: primary.formation ?? secondary.formation,
+    record: isBetterRecord(secondary.record, primary.record) ? secondary.record : primary.record,
+    homeRecord: primary.homeRecord && primary.homeRecord !== '-' ? primary.homeRecord : secondary.homeRecord,
+    awayRecord: primary.awayRecord && primary.awayRecord !== '-' ? primary.awayRecord : secondary.awayRecord,
+    playedGames: primary.playedGames ?? secondary.playedGames,
+    ppgOrGpg: primary.ppgOrGpg ?? secondary.ppgOrGpg,
+    oppgOrGapg: primary.oppgOrGapg ?? secondary.oppgOrGapg,
+    formRecent: primary.formRecent.length > 0 ? primary.formRecent : secondary.formRecent,
+    recentGames:
+      (primary.recentGames?.length ?? 0) >= (secondary.recentGames?.length ?? 0)
+        ? primary.recentGames
+        : secondary.recentGames,
+    restDays: primary.restDays !== 4 && primary.restDays !== 2 ? primary.restDays : secondary.restDays ?? primary.restDays,
+    isBackToBack: primary.isBackToBack ?? secondary.isBackToBack,
+    attackHome: primary.attackHome ?? secondary.attackHome,
+    attackAway: primary.attackAway ?? secondary.attackAway,
+    defenseHome: primary.defenseHome ?? secondary.defenseHome,
+    defenseAway: primary.defenseAway ?? secondary.defenseAway,
+    avgCorners: primary.avgCorners ?? secondary.avgCorners,
+    avgYellowCards: primary.avgYellowCards ?? secondary.avgYellowCards,
+    avgShots: primary.avgShots ?? secondary.avgShots,
+    avgShotsOnTarget: primary.avgShotsOnTarget ?? secondary.avgShotsOnTarget,
+    offRating: primary.offRating ?? secondary.offRating,
+    defRating: primary.defRating ?? secondary.defRating,
+    pace: primary.pace ?? secondary.pace,
+    homeCourtBoost: primary.homeCourtBoost ?? secondary.homeCourtBoost,
+    avgRebounds: primary.avgRebounds ?? secondary.avgRebounds,
+    avgAssists: primary.avgAssists ?? secondary.avgAssists,
+  };
+}
+
+export interface MultiSourceMatchBatch {
+  provider: string;
+  label: string;
+  matches: MatchRecord[];
+}
+
+/**
+ * Merges and cross-checks equivalent matches across multiple simultaneously active providers.
+ * Preserves per-provider sourceIds so match hydration can query ALL connected sources in parallel,
+ * enriches missing metrics across sources, and flags genuine score/status/time discrepancies.
+ */
+export function mergeMatchesAcrossSources(batches: MultiSourceMatchBatch[]): MatchRecord[] {
+  const canonical: MatchRecord[] = [];
+
+  for (const batch of batches) {
+    for (const rawMatch of batch.matches) {
+      const incoming: MatchRecord = {
+        ...rawMatch,
+        sourceIds: {
+          ...(rawMatch.sourceIds ?? {}),
+          [batch.provider]: rawMatch.id,
+        },
+        verifiedSources: Array.from(
+          new Set([...(rawMatch.verifiedSources ?? [batch.label || rawMatch.dataOrigin])])
+        ),
+      };
+
+      const incomingTs = new Date(incoming.kickoffIso).getTime();
+      const existingIdx = canonical.findIndex((existing) => {
+        if (existing.sport !== incoming.sport) return false;
+        const existingTs = new Date(existing.kickoffIso).getTime();
+        const timeDiff = Math.abs(existingTs - incomingTs);
+        if (!Number.isFinite(timeDiff) || timeDiff > 36 * 3600_000) return false;
+        return (
+          teamsMatch(existing.homeTeam.name, incoming.homeTeam.name) &&
+          teamsMatch(existing.awayTeam.name, incoming.awayTeam.name)
+        );
+      });
+
+      if (existingIdx === -1) {
+        canonical.push(incoming);
+        continue;
+      }
+
+      const current = canonical[existingIdx];
+      const discrepancies = [...(current.sourceDiscrepancies ?? [])];
+
+      if (
+        current.score &&
+        incoming.score &&
+        (current.score.home !== incoming.score.home || current.score.away !== incoming.score.away)
+      ) {
+        discrepancies.push(
+          `Marcador distinto: ${current.verifiedSources?.[0] ?? current.dataOrigin} (${current.score.home}-${current.score.away}) vs ${batch.label} (${incoming.score.home}-${incoming.score.away})`
+        );
+      }
+
+      if (
+        current.status !== incoming.status &&
+        ((current.status === 'finished' && incoming.status !== 'finished') ||
+          (incoming.status === 'finished' && current.status !== 'finished'))
+      ) {
+        discrepancies.push(
+          `Estado distinto: ${current.verifiedSources?.[0] ?? current.dataOrigin} (${current.status}) vs ${batch.label} (${incoming.status})`
+        );
+      }
+
+      const kickoffDiffMin = Math.round(
+        Math.abs(new Date(current.kickoffIso).getTime() - incomingTs) / 60_000
+      );
+      if (Number.isFinite(kickoffDiffMin) && kickoffDiffMin > 20 && kickoffDiffMin <= 24 * 60) {
+        discrepancies.push(`Diferencia horaria entre fuentes (${kickoffDiffMin} min)`);
+      }
+
+      const mergedSources = Array.from(
+        new Set([
+          ...(current.verifiedSources ?? [current.dataOrigin]),
+          ...(incoming.verifiedSources ?? [batch.label]),
+        ])
+      );
+
+      const resolvedStatus: MatchStatus =
+        current.status === 'live' || incoming.status === 'live'
+          ? 'live'
+          : current.status === 'finished' || incoming.status === 'finished'
+            ? 'finished'
+            : current.status;
+
+      const resolvedLineupStatus =
+        current.lineupStatus === 'confirmed' || incoming.lineupStatus === 'confirmed'
+          ? 'confirmed'
+          : current.lineupStatus === 'provisional' || incoming.lineupStatus === 'provisional'
+            ? 'provisional'
+            : 'unknown';
+
+      const mergedQuality =
+        qualityRank(incoming.teamStatsQuality) > qualityRank(current.teamStatsQuality)
+          ? incoming.teamStatsQuality
+          : current.teamStatsQuality;
+
+      canonical[existingIdx] = {
+        ...current,
+        status: resolvedStatus,
+        minuteOrClock: current.minuteOrClock ?? incoming.minuteOrClock,
+        venue: isBetterVenue(incoming.venue, current.venue) ? incoming.venue : current.venue,
+        score: current.score ?? incoming.score,
+        lineupStatus: resolvedLineupStatus,
+        homeTeam: mergeTeamInfo(current.homeTeam, incoming.homeTeam),
+        awayTeam: mergeTeamInfo(current.awayTeam, incoming.awayTeam),
+        teamStats:
+          current.teamStats && current.teamStats.length > 0 ? current.teamStats : incoming.teamStats,
+        teamStatsQuality: mergedQuality,
+        h2hSummary:
+          current.h2hSummary.played >= incoming.h2hSummary.played
+            ? current.h2hSummary
+            : incoming.h2hSummary,
+        sourceIds: {
+          ...(current.sourceIds ?? {}),
+          ...(incoming.sourceIds ?? {}),
+        },
+        verifiedSources: mergedSources,
+        sourceDiscrepancies: discrepancies.length > 0 ? Array.from(new Set(discrepancies)) : undefined,
+        dataOrigin:
+          mergedSources.length > 1
+            ? `${mergedSources.join(' + ')} (verificado ${mergedSources.length} fuentes)`
+            : mergedSources[0] ?? current.dataOrigin,
+        updatedAt:
+          incoming.updatedAt > current.updatedAt ? incoming.updatedAt : current.updatedAt,
+      };
+    }
+  }
+
+  return canonical;
+}
+
+export function mergeStandingsAcrossSources(batches: StandingEntry[][]): StandingEntry[] {
+  const byKey = new Map<string, StandingEntry>();
+
+  for (const list of batches) {
+    for (const row of list) {
+      const leagueKey = (row.league || 'league').toLowerCase().trim();
+      let matchedKey: string | null = null;
+      for (const [k, existing] of byKey.entries()) {
+        if (existing.league.toLowerCase().trim() !== leagueKey) continue;
+        if (
+          (row.conference && existing.conference && row.conference !== existing.conference)
+        ) {
+          continue;
+        }
+        if (teamsMatch(existing.teamName, row.teamName)) {
+          matchedKey = k;
+          break;
+        }
+      }
+
+      if (!matchedKey) {
+        const key = `${leagueKey}:${row.conference ?? ''}:${row.teamName.toLowerCase()}`;
+        byKey.set(key, row);
+      } else {
+        const cur = byKey.get(matchedKey)!;
+        const curRichness =
+          (cur.played > 0 ? 2 : 0) +
+          (cur.form.length > 0 ? 1 : 0) +
+          (cur.homeRecord !== '-' ? 1 : 0) +
+          (cur.goalsForOrPtsFor > 0 ? 1 : 0);
+        const rowRichness =
+          (row.played > 0 ? 2 : 0) +
+          (row.form.length > 0 ? 1 : 0) +
+          (row.homeRecord !== '-' ? 1 : 0) +
+          (row.goalsForOrPtsFor > 0 ? 1 : 0);
+
+        const winner = rowRichness > curRichness ? row : cur;
+        const loser = winner === cur ? row : cur;
+        byKey.set(matchedKey, {
+          ...winner,
+          form: winner.form.length > 0 ? winner.form : loser.form,
+          homeRecord: winner.homeRecord !== '-' ? winner.homeRecord : loser.homeRecord,
+          awayRecord: winner.awayRecord !== '-' ? winner.awayRecord : loser.awayRecord,
+          goalsForOrPtsFor: winner.goalsForOrPtsFor || loser.goalsForOrPtsFor,
+          goalsAgainstOrPtsAgainst: winner.goalsAgainstOrPtsAgainst || loser.goalsAgainstOrPtsAgainst,
+        });
+      }
+    }
+  }
+
+  return Array.from(byKey.values());
+}
+
+function normalizePlayerLookupName(name: string): string {
+  return name
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function enrichPlayerListFromSecondary(
+  primary: PlayerProfile[],
+  secondary: PlayerProfile[]
+): PlayerProfile[] {
+  if (primary.length === 0) return secondary;
+  if (secondary.length === 0) return primary;
+
+  const secByName = new Map<string, PlayerProfile>();
+  for (const sp of secondary) {
+    secByName.set(normalizePlayerLookupName(sp.name), sp);
+  }
+
+  return primary.map((p) => {
+    const match = secByName.get(normalizePlayerLookupName(p.name));
+    if (!match) return p;
+
+    const pHasRealStats =
+      p.statsQuality === 'verified' ||
+      (p.statsQuality === 'estimated' && p.sampleSizeGames > 0);
+    const secHasRealStats =
+      match.statsQuality === 'verified' ||
+      (match.statsQuality === 'estimated' && match.sampleSizeGames > 0);
+
+    const betterSplits = !pHasRealStats && secHasRealStats ? match.splits : p.splits;
+    const betterLogs = p.recentLogs.length >= match.recentLogs.length ? p.recentLogs : match.recentLogs;
+    const betterQuality = !pHasRealStats && secHasRealStats ? match.statsQuality : p.statsQuality;
+    const betterOrigin =
+      !pHasRealStats && secHasRealStats ? match.statsOriginNote : p.statsOriginNote;
+
+    // Cross-verify injury / confirmed out flags across sources
+    const secConfirmedAbsence =
+      match.availabilityConfidence === 'confirmed' &&
+      (match.availability === 'out' || match.availability === 'suspended' || match.availability === 'doubtful');
+    const keepConfirmedStarter =
+      p.availability === 'confirmed_starter' && p.availabilityConfidence === 'confirmed';
+
+    const mergedAvailability =
+      !keepConfirmedStarter && secConfirmedAbsence && p.availability !== 'out'
+        ? match.availability
+        : p.availability;
+
+    return {
+      ...p,
+      photoUrl: p.photoUrl ?? match.photoUrl,
+      availability: mergedAvailability,
+      availabilityConfidence:
+        !keepConfirmedStarter && secConfirmedAbsence
+          ? match.availabilityConfidence
+          : p.availabilityConfidence,
+      injuryNote: p.injuryNote ?? match.injuryNote,
+      minutesRestriction: p.minutesRestriction ?? match.minutesRestriction,
+      latestNews: p.latestNews ?? match.latestNews,
+      splits: betterSplits,
+      recentLogs: betterLogs,
+      sampleSizeGames: Math.max(p.sampleSizeGames, match.sampleSizeGames),
+      statsQuality: betterQuality,
+      statsOriginNote: betterOrigin,
+      lastLogDate: p.lastLogDate ?? match.lastLogDate,
+      dataFreshness: p.dataFreshness ?? match.dataFreshness,
+    };
+  });
+}
+
+/**
+ * Combines multiple hydrated MatchRecord results for the same fixture obtained from
+ * concurrently running providers (e.g. football-data + espn-football, or basketballapi-net + espn-nba).
+ */
+export function mergeHydratedMatchDetails(
+  baseMatch: MatchRecord,
+  variants: Array<{ provider: string; label: string; match: MatchRecord }>
+): MatchRecord {
+  if (variants.length === 0) return baseMatch;
+
+  // Prefer confirmed lineup, then most hydrated players / verified team stats
+  const ranked = [...variants].sort((a, b) => {
+    const scoreVariant = (m: MatchRecord): number => {
+      let s = 0;
+      if (m.hydrationStatus === 'ok') s += 40;
+      if (m.lineupStatus === 'confirmed') s += 35;
+      else if (m.lineupStatus === 'provisional') s += 15;
+      if (m.homePlayers.length > 0 && m.awayPlayers.length > 0) s += 20;
+      if (m.homePlayers.some((p) => p.statsQuality === 'verified' || p.sampleSizeGames > 0)) s += 25;
+      if ((m.homeTeam.recentGames?.length ?? 0) > 0) s += 15;
+      if (m.h2hSummary.played > 0) s += 10;
+      return s;
+    };
+    return scoreVariant(b.match) - scoreVariant(a.match);
+  });
+
+  let merged = { ...ranked[0].match };
+  const discrepancies = new Set<string>(baseMatch.sourceDiscrepancies ?? []);
+  const allSources = new Set<string>(baseMatch.verifiedSources ?? []);
+  const mergedSourceIds: Record<string, string> = { ...(baseMatch.sourceIds ?? {}) };
+
+  for (const v of variants) {
+    mergedSourceIds[v.provider] = v.match.sourceIds?.[v.provider] ?? v.match.id;
+    allSources.add(v.label);
+    for (const d of v.match.sourceDiscrepancies ?? []) discrepancies.add(d);
+  }
+
+  for (let i = 1; i < ranked.length; i++) {
+    const sec = ranked[i].match;
+    if (
+      merged.score &&
+      sec.score &&
+      (merged.score.home !== sec.score.home || merged.score.away !== sec.score.away)
+    ) {
+      discrepancies.add(
+        `Marcador distinto al contrastar fuentes (${merged.score.home}-${merged.score.away} vs ${sec.score.home}-${sec.score.away})`
+      );
+    }
+
+    merged = {
+      ...merged,
+      venue: isBetterVenue(sec.venue, merged.venue) ? sec.venue : merged.venue,
+      score: merged.score ?? sec.score,
+      homeTeam: mergeTeamInfo(merged.homeTeam, sec.homeTeam),
+      awayTeam: mergeTeamInfo(merged.awayTeam, sec.awayTeam),
+      homePlayers: enrichPlayerListFromSecondary(merged.homePlayers, sec.homePlayers),
+      awayPlayers: enrichPlayerListFromSecondary(merged.awayPlayers, sec.awayPlayers),
+      probableLineup: merged.probableLineup ?? sec.probableLineup,
+      confirmedLineup: merged.confirmedLineup ?? sec.confirmedLineup,
+      h2hSummary: merged.h2hSummary.played >= sec.h2hSummary.played ? merged.h2hSummary : sec.h2hSummary,
+      teamStats:
+        merged.teamStats && merged.teamStats.length > 0 ? merged.teamStats : sec.teamStats,
+      teamStatsQuality:
+        qualityRank(sec.teamStatsQuality) > qualityRank(merged.teamStatsQuality)
+          ? sec.teamStatsQuality
+          : merged.teamStatsQuality,
+      footballNews: merged.footballNews ?? sec.footballNews,
+      nbaNews: merged.nbaNews ?? sec.nbaNews,
+    };
+  }
+
+  const verifiedList = Array.from(allSources).filter(Boolean);
+  const nowIso = new Date().toISOString();
+  const originLabel =
+    verifiedList.length > 1
+      ? `${verifiedList.join(' + ')} (contrastado ${verifiedList.length} fuentes)`
+      : verifiedList[0] ?? merged.dataOrigin;
+
+  return {
+    ...merged,
+    id: baseMatch.id,
+    sourceIds: mergedSourceIds,
+    verifiedSources: verifiedList,
+    sourceDiscrepancies: discrepancies.size > 0 ? Array.from(discrepancies) : undefined,
+    dataOrigin: originLabel,
+    updatedAt: nowIso,
+    provenance: {
+      source: originLabel,
+      fetchedAt: nowIso,
+      status: merged.hydrationStatus === 'ok' ? 'ok' : merged.provenance?.status ?? 'partial',
+      isStale: Boolean(merged.provenance?.isStale),
+      staleAgeMinutes: 0,
+      dataType: merged.provenance?.dataType ?? (merged.teamStatsQuality === 'verified' ? 'real' : 'estimated'),
+      errorMessage: merged.provenance?.errorMessage,
+    },
+  };
 }

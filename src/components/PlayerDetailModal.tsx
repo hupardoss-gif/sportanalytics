@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { X, ArrowLeftRight, TrendingUp, Newspaper, ExternalLink, Clock } from 'lucide-react';
 import type {
   AvailabilityStatus,
@@ -7,6 +7,7 @@ import type {
   PropStatKey,
   TimeframeSplit,
 } from '../types/sports.ts';
+import { isGoalkeeperPosition } from '../engine/footballModel.ts';
 import { PlayerAvatar } from './PlayerAvatar.tsx';
 import { OverUnderLab } from './OverUnderLab.tsx';
 
@@ -37,14 +38,21 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
   onClose,
   onChangeAvailability,
 }) => {
+  const currentPlayer =
+    teammates.find((t) => t.id === player.id) ?? player;
+  const isGk =
+    currentPlayer.sport === 'football' && isGoalkeeperPosition(currentPlayer.position);
+
   const [timeframe, setTimeframe] = useState<TimeframeSplit>('season');
   const [comparePlayerId, setComparePlayerId] = useState<string>('');
   const [trendStat, setTrendStat] = useState<PropStatKey>(
-    player.sport === 'football' ? 'shots' : 'points'
+    currentPlayer.sport === 'football' ? (isGk ? 'saves' : 'shots') : 'points'
   );
 
-  const currentPlayer =
-    teammates.find((t) => t.id === player.id) ?? player;
+  useEffect(() => {
+    setTrendStat(currentPlayer.sport === 'football' ? (isGk ? 'saves' : 'shots') : 'points');
+  }, [currentPlayer.id, currentPlayer.sport, isGk]);
+
   const split = currentPlayer.splits[timeframe] ?? currentPlayer.splits.season;
 
   const comparePlayer = useMemo(
@@ -64,26 +72,49 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
     return Math.max(1, ...vals);
   }, [currentPlayer.recentLogs, trendStat]);
 
+  const formatMetricVal = (
+    p: PlayerProfile,
+    val: number | undefined,
+    decimals: number,
+    suffix = ''
+  ): string => {
+    if (p.statsQuality === 'unavailable' || val === undefined || !Number.isFinite(val)) {
+      return 'N/D';
+    }
+    return `${val.toFixed(decimals)}${suffix}`;
+  };
+
   const metricRows =
     currentPlayer.sport === 'football'
-      ? [
-          { key: 'goals', label: 'Goles / partido', val: split.goals ?? 0, cmp: compareSplit?.goals ?? 0 },
-          { key: 'assists', label: 'Asistencias / p', val: split.assists ?? 0, cmp: compareSplit?.assists ?? 0 },
-          { key: 'shots', label: 'Tiros totales', val: split.shots ?? 0, cmp: compareSplit?.shots ?? 0 },
-          { key: 'shotsOnTarget', label: 'Tiros a puerta', val: split.shotsOnTarget ?? 0, cmp: compareSplit?.shotsOnTarget ?? 0 },
-          { key: 'foulsCommitted', label: 'Faltas cometidas', val: split.foulsCommitted ?? 0, cmp: compareSplit?.foulsCommitted ?? 0 },
-          { key: 'foulsDrawn', label: 'Faltas recibidas', val: split.foulsDrawn ?? 0, cmp: compareSplit?.foulsDrawn ?? 0 },
-          { key: 'yellowCards', label: 'Tarjetas amarillas', val: split.yellowCards ?? 0, cmp: compareSplit?.yellowCards ?? 0 },
-          { key: 'passes', label: 'Pases / partido', val: split.passes ?? 0, cmp: compareSplit?.passes ?? 0 },
-        ]
+      ? isGk
+        ? [
+            { key: 'saves', label: 'Paradas / partido', val: split.saves, cmp: compareSplit?.saves, decimals: 2, suffix: '' },
+            { key: 'goalsConceded', label: 'Goles encajados / p', val: split.goalsConceded, cmp: compareSplit?.goalsConceded, decimals: 2, suffix: '' },
+            { key: 'savePct', label: '% Paradas', val: split.savePct, cmp: compareSplit?.savePct, decimals: 1, suffix: '%' },
+            { key: 'cleanSheets', label: 'Porterías a cero', val: split.cleanSheets, cmp: compareSplit?.cleanSheets, decimals: 2, suffix: '' },
+            { key: 'last5Saves', label: 'Paradas Últ. 5', val: currentPlayer.splits.last5?.saves, cmp: comparePlayer?.splits.last5?.saves, decimals: 2, suffix: '' },
+            { key: 'last10Saves', label: 'Paradas Últ. 10', val: currentPlayer.splits.last10?.saves, cmp: comparePlayer?.splits.last10?.saves, decimals: 2, suffix: '' },
+            { key: 'foulsCommitted', label: 'Faltas cometidas', val: split.foulsCommitted, cmp: compareSplit?.foulsCommitted, decimals: 2, suffix: '' },
+            { key: 'yellowCards', label: 'Tarjetas amarillas', val: split.yellowCards, cmp: compareSplit?.yellowCards, decimals: 2, suffix: '' },
+          ]
+        : [
+            { key: 'goals', label: 'Goles / partido', val: split.goals, cmp: compareSplit?.goals, decimals: 2, suffix: '' },
+            { key: 'assists', label: 'Asistencias / p', val: split.assists, cmp: compareSplit?.assists, decimals: 2, suffix: '' },
+            { key: 'shots', label: 'Tiros totales', val: split.shots, cmp: compareSplit?.shots, decimals: 2, suffix: '' },
+            { key: 'shotsOnTarget', label: 'Tiros a puerta', val: split.shotsOnTarget, cmp: compareSplit?.shotsOnTarget, decimals: 2, suffix: '' },
+            { key: 'foulsCommitted', label: 'Faltas cometidas', val: split.foulsCommitted, cmp: compareSplit?.foulsCommitted, decimals: 2, suffix: '' },
+            { key: 'foulsDrawn', label: 'Faltas recibidas', val: split.foulsDrawn, cmp: compareSplit?.foulsDrawn, decimals: 2, suffix: '' },
+            { key: 'yellowCards', label: 'Tarjetas amarillas', val: split.yellowCards, cmp: compareSplit?.yellowCards, decimals: 2, suffix: '' },
+            { key: 'passes', label: 'Pases / partido', val: split.passes, cmp: compareSplit?.passes, decimals: 1, suffix: '' },
+          ]
       : [
-          { key: 'points', label: 'Puntos', val: split.points ?? 0, cmp: compareSplit?.points ?? 0 },
-          { key: 'rebounds', label: 'Rebotes', val: split.rebounds ?? 0, cmp: compareSplit?.rebounds ?? 0 },
-          { key: 'assists', label: 'Asistencias', val: split.assists ?? 0, cmp: compareSplit?.assists ?? 0 },
-          { key: 'threes', label: 'Triples anotados', val: split.threes ?? 0, cmp: compareSplit?.threes ?? 0 },
-          { key: 'steals', label: 'Robos', val: split.steals ?? 0, cmp: compareSplit?.steals ?? 0 },
-          { key: 'blocks', label: 'Tapones', val: split.blocks ?? 0, cmp: compareSplit?.blocks ?? 0 },
-          { key: 'turnovers', label: 'Pérdidas', val: split.turnovers ?? 0, cmp: compareSplit?.turnovers ?? 0 },
+          { key: 'points', label: 'Puntos', val: split.points, cmp: compareSplit?.points, decimals: 1, suffix: '' },
+          { key: 'rebounds', label: 'Rebotes', val: split.rebounds, cmp: compareSplit?.rebounds, decimals: 1, suffix: '' },
+          { key: 'assists', label: 'Asistencias', val: split.assists, cmp: compareSplit?.assists, decimals: 1, suffix: '' },
+          { key: 'threes', label: 'Triples anotados', val: split.threes, cmp: compareSplit?.threes, decimals: 1, suffix: '' },
+          { key: 'steals', label: 'Robos', val: split.steals, cmp: compareSplit?.steals, decimals: 1, suffix: '' },
+          { key: 'blocks', label: 'Tapones', val: split.blocks, cmp: compareSplit?.blocks, decimals: 1, suffix: '' },
+          { key: 'turnovers', label: 'Pérdidas', val: split.turnovers, cmp: compareSplit?.turnovers, decimals: 1, suffix: '' },
         ];
 
   return (
@@ -114,9 +145,33 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
               <p className="text-xs text-slate-400">
                 {currentPlayer.teamName} · {currentPlayer.position} · #{currentPlayer.number} ·{' '}
                 <span className="font-mono tabular-nums">
-                  {split.minutes.toFixed(1)} min/p · {(split.starterRate * 100).toFixed(0)}% titular
+                  {currentPlayer.statsQuality === 'unavailable' && split.minutes === 0
+                    ? 'Sin estadísticas individuales previas'
+                    : `${split.minutes.toFixed(1)} min/p · ${(split.starterRate * 100).toFixed(0)}% titular`}
                 </span>
               </p>
+              <div className="flex flex-wrap items-center gap-2 mt-1">
+                <span
+                  className={`px-2 py-0.5 rounded border text-[10px] font-semibold ${
+                    currentPlayer.statsQuality === 'verified'
+                      ? 'border-emerald-500/35 bg-emerald-950/25 text-emerald-300'
+                      : currentPlayer.statsQuality === 'unavailable'
+                        ? 'border-slate-700 bg-slate-900 text-slate-300'
+                        : 'border-amber-500/35 bg-amber-950/25 text-amber-300'
+                  }`}
+                >
+                  {currentPlayer.statsQuality === 'verified'
+                    ? `Datos verificados (${currentPlayer.sampleSizeGames} p.)`
+                    : currentPlayer.statsQuality === 'unavailable'
+                      ? 'Sin datos individuales suficientes'
+                      : 'Estimación posicional'}
+                </span>
+                {currentPlayer.statsOriginNote && (
+                  <span className="text-[11px] text-slate-400">
+                    {currentPlayer.statsOriginNote}
+                  </span>
+                )}
+              </div>
               {currentPlayer.injuryNote && (
                 <p className="text-xs text-amber-300 mt-0.5">{currentPlayer.injuryNote}</p>
               )}
@@ -194,7 +249,18 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
             </div>
           </div>
 
-          {currentPlayer.sport === 'nba' && currentPlayer.latestNews && (
+          {(currentPlayer.roleReason || currentPlayer.starterConfidence !== undefined) && (
+            <div className="rounded-lg border border-slate-800 bg-slate-950/60 px-3.5 py-2 text-xs text-slate-300 flex flex-wrap items-center justify-between gap-2">
+              <span>{currentPlayer.roleReason ?? 'Estado de rotación en convocatoria'}</span>
+              {currentPlayer.starterConfidence !== undefined && (
+                <span className="font-mono tabular-nums font-semibold text-sky-300">
+                  Prob. titular: {currentPlayer.starterConfidence}%
+                </span>
+              )}
+            </div>
+          )}
+
+          {currentPlayer.latestNews && (
             <div className="rounded-xl border border-slate-800 bg-[#0D1526] p-4 space-y-2 text-xs">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 font-semibold text-slate-100">
@@ -211,12 +277,14 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
                   </span>
                 </div>
                 <span className="text-slate-400 font-mono tabular-nums">
-                  {new Date(currentPlayer.latestNews.publishedAt).toLocaleString('es-ES', {
-                    day: '2-digit',
-                    month: 'short',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}
+                  {currentPlayer.latestNews.publishedAt
+                    ? new Date(currentPlayer.latestNews.publishedAt).toLocaleString('es-ES', {
+                        day: '2-digit',
+                        month: 'short',
+                        hour: '2-digit',
+                        minute: '2-digit',
+                      })
+                    : 'Fecha no publicada por la fuente'}
                 </span>
               </div>
               <p className="text-slate-300 leading-relaxed">{currentPlayer.latestNews.summary}</p>
@@ -269,29 +337,32 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
               </div>
             </div>
 
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-              {metricRows.map((row) => (
-                <div
-                  key={row.key}
-                  className="p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 space-y-1"
-                >
-                  <span className="text-[11px] text-slate-400 block truncate">{row.label}</span>
-                  <div className="flex items-baseline justify-between gap-2">
-                    <span className="text-lg font-bold font-mono tabular-nums text-white">
-                      {row.val.toFixed(currentPlayer.sport === 'football' && row.key !== 'passes' ? 2 : 1)}
-                    </span>
-                    {comparePlayer && (
-                      <span className="text-xs font-mono tabular-nums text-blue-400">
-                        vs{' '}
-                        {row.cmp.toFixed(
-                          currentPlayer.sport === 'football' && row.key !== 'passes' ? 2 : 1
-                        )}
+            {currentPlayer.statsQuality === 'unavailable' && metricRows.every((r) => r.val === undefined) ? (
+              <p className="text-xs text-slate-400 py-2">
+                No disponible: {currentPlayer.statsOriginNote ?? 'la fuente actual no proporciona promedios individuales reales para este jugador.'}
+              </p>
+            ) : (
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                {metricRows.map((row) => (
+                  <div
+                    key={row.key}
+                    className="p-3 rounded-lg bg-slate-950/60 border border-slate-800/80 space-y-1"
+                  >
+                    <span className="text-[11px] text-slate-400 block truncate">{row.label}</span>
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-lg font-bold font-mono tabular-nums text-white">
+                        {formatMetricVal(currentPlayer, row.val, row.decimals, row.suffix)}
                       </span>
-                    )}
+                      {comparePlayer && (
+                        <span className="text-xs font-mono tabular-nums text-blue-400">
+                          vs {formatMetricVal(comparePlayer, row.cmp, row.decimals, row.suffix)}
+                        </span>
+                      )}
+                    </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
 
           {/* Recent Game Log Chart */}
@@ -305,12 +376,18 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
               </div>
               <div className="flex items-center gap-1.5">
                 {(currentPlayer.sport === 'football'
-                  ? ([
-                      { k: 'shots', l: 'Tiros' },
-                      { k: 'shotsOnTarget', l: 'A puerta' },
-                      { k: 'goals', l: 'Goles' },
-                      { k: 'passes', l: 'Pases' },
-                    ] as const)
+                  ? isGk
+                    ? ([
+                        { k: 'saves', l: 'Paradas' },
+                        { k: 'goalsConceded', l: 'Encajados' },
+                        { k: 'passes', l: 'Pases' },
+                      ] as const)
+                    : ([
+                        { k: 'shots', l: 'Tiros' },
+                        { k: 'shotsOnTarget', l: 'A puerta' },
+                        { k: 'goals', l: 'Goles' },
+                        { k: 'passes', l: 'Pases' },
+                      ] as const)
                   : ([
                       { k: 'points', l: 'Puntos' },
                       { k: 'rebounds', l: 'Rebotes' },
@@ -334,29 +411,35 @@ export const PlayerDetailModal: React.FC<PlayerDetailModalProps> = ({
               </div>
             </div>
 
-            <div className="h-32 flex items-end gap-3 pt-4">
-              {currentPlayer.recentLogs.map((log, i) => {
-                const val = log.stats[trendStat] ?? 0;
-                const hPct = Math.max(6, (val / maxLogVal) * 100);
-                return (
-                  <div key={i} className="flex-1 flex flex-col items-center justify-end h-full">
-                    <span className="text-xs font-mono tabular-nums font-semibold text-slate-200 mb-1">
-                      {val}
-                    </span>
-                    <div
-                      style={{ height: `${hPct}%` }}
-                      className="w-full max-w-[44px] rounded-t bg-blue-500/80"
-                    />
-                    <span className="text-[11px] font-mono text-slate-400 mt-1.5">
-                      {log.isHome ? 'vs' : '@'} {log.opponent}
-                    </span>
-                    <span className="text-[10px] font-mono tabular-nums text-slate-500">
-                      {log.minutes}&apos;
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
+            {currentPlayer.recentLogs.length === 0 ? (
+              <p className="text-xs text-slate-400 py-4 text-center">
+                La fuente actual no publica logs individuales de últimos partidos para este jugador.
+              </p>
+            ) : (
+              <div className="h-32 flex items-end gap-3 pt-4">
+                {currentPlayer.recentLogs.map((log, i) => {
+                  const val = log.stats[trendStat] ?? 0;
+                  const hPct = Math.max(6, (val / maxLogVal) * 100);
+                  return (
+                    <div key={i} className="flex-1 flex flex-col items-center justify-end h-full">
+                      <span className="text-xs font-mono tabular-nums font-semibold text-slate-200 mb-1">
+                        {val}
+                      </span>
+                      <div
+                        style={{ height: `${hPct}%` }}
+                        className="w-full max-w-[44px] rounded-t bg-blue-500/80"
+                      />
+                      <span className="text-[11px] font-mono text-slate-400 mt-1.5">
+                        {log.isHome ? 'vs' : '@'} {log.opponent}
+                      </span>
+                      <span className="text-[10px] font-mono tabular-nums text-slate-500">
+                        {log.minutes}&apos;
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>

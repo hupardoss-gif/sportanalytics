@@ -1,54 +1,29 @@
 import type {
   AvailabilityStatus,
+  DataFreshnessStatus,
+  DataReliability,
+  LoggedPrediction,
+  MatchNarrativeExplanation,
   MatchRecord,
   NbaPredictionResult,
   NbaPropStat,
   PlayerProfile,
   PropDistributionBin,
   PropProjectionResult,
+  StatExpectationWithInterval,
   TimeframeSplit,
 } from '../types/sports.ts';
+import {
+  applyBinaryCalibration,
+  fitEmpiricalCalibrationProfile,
+} from './calibrationEngine.ts';
+import {
+  evaluateMatchStatOverUnder,
+  negBinPmf,
+  normalCdf,
+} from './distributionMath.ts';
 
-function normalCdf(x: number, mean: number, stdDev: number): number {
-  const z = (x - mean) / (Math.max(0.05, stdDev) * Math.SQRT2);
-  const sign = z < 0 ? -1 : 1;
-  const az = Math.abs(z);
-  const t = 1 / (1 + 0.3275911 * az);
-  const y =
-    1 -
-    (((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) *
-      t) *
-      Math.exp(-az * az);
-  return 0.5 * (1 + sign * y);
-}
-
-function negBinPmf(k: number, mu: number, alpha: number): number {
-  if (mu <= 0) return k === 0 ? 1 : 0;
-  const effAlpha = Math.max(0.02, alpha);
-  const r = 1 / effAlpha;
-  const p = r / (r + mu);
-  const logGamma = (z: number): number => {
-    const g = 7;
-    const c = [
-      0.99999999999980993, 676.5203681218851, -1259.1392167224028,
-      771.32342877765313, -176.61502916214059, 12.507343278686905,
-      -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
-    ];
-    if (z < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * z)) - logGamma(1 - z);
-    z -= 1;
-    let x = c[0];
-    for (let i = 1; i < g + 2; i++) x += c[i] / (z + i);
-    const t = z + g + 0.5;
-    return 0.5 * Math.log(2 * Math.PI) + (z + 0.5) * Math.log(t) - t + Math.log(x);
-  };
-  const logPmf =
-    logGamma(k + r) -
-    logGamma(k + 1) -
-    logGamma(r) +
-    r * Math.log(p) +
-    k * Math.log(1 - p);
-  return Math.exp(logPmf);
-}
+export { evaluateMatchStatOverUnder };
 
 export function getNbaAvailabilityFactor(
   status: AvailabilityStatus,
@@ -85,6 +60,14 @@ export function getNbaAvailabilityFactor(
   return factor;
 }
 
+function parseNbaPlayedGames(record?: string, explicitPlayed?: number): number {
+  if (explicitPlayed !== undefined && explicitPlayed > 0) return explicitPlayed;
+  if (!record) return 0;
+  const m = record.match(/(\d+)\s*-\s*(\d+)/);
+  if (m) return Number(m[1]) + Number(m[2]);
+  return 0;
+}
+
 export function calculateNbaAbsenceImpact(
   players: PlayerProfile[],
   teamLabel: string
@@ -119,8 +102,8 @@ export function calculateNbaAbsenceImpact(
       const offHit = p.impact.offenseDelta * lossRatio;
       const defHit = p.impact.defenseDelta * lossRatio;
       offRatingDelta -= offHit;
-      defRatingDelta += defHit; // Positive DRtg delta means worse defense
-      paceDelta -= p.isKeyPlayer ? 0.8 * lossRatio : 0;
+      defRatingDelta += defHit;
+      paceDelta -= p.isKeyPlayer ? 0.75 * lossRatio : 0;
       vacatedUsage += p.impact.usageShare * lossRatio;
       vacatedAssistShare += p.impact.assistShare * lossRatio;
       vacatedMinutes += baseMin * lossRatio;
@@ -144,8 +127,8 @@ export function calculateNbaAbsenceImpact(
   }
 
   return {
-    offRatingDelta,
-    defRatingDelta,
+    offRatingDelta: Math.max(-14, Math.min(8, offRatingDelta)),
+    defRatingDelta: Math.max(-6, Math.min(10, defRatingDelta)),
     paceDelta,
     vacatedUsage: Math.min(0.42, vacatedUsage),
     vacatedAssistShare: Math.min(0.45, vacatedAssistShare),
@@ -155,42 +138,82 @@ export function calculateNbaAbsenceImpact(
 }
 
 /**
- * Pace-Adjusted Efficiency Rating & Monte Carlo-calibrated Normal NBA Game Model.
+ * Pace-Adjusted Efficiency Rating & Heteroscedastic Normal NBA Game Model.
+ * Applies Bayesian shrinkage toward league mean (114.5), avoids 99.8% overconfident
+ * pre-match extremes, and clearly separates dataConfidence from win probability.
  */
 export function computeNbaMatchPrediction(
   match: MatchRecord,
   homePlayersOverride?: PlayerProfile[],
-  awayPlayersOverride?: PlayerProfile[]
+  awayPlayersOverride?: PlayerProfile[],
+  calibrationHistory?: LoggedPrediction[]
 ): NbaPredictionResult {
   const homePlayers = homePlayersOverride ?? match.homePlayers;
   const awayPlayers = awayPlayersOverride ?? match.awayPlayers;
+  const modelWarnings: string[] = [];
 
   const homeImpact = calculateNbaAbsenceImpact(homePlayers, match.homeTeam.shortName);
   const awayImpact = calculateNbaAbsenceImpact(awayPlayers, match.awayTeam.shortName);
 
-  const basePaceHome = match.homeTeam.pace ?? 99.5;
-  const basePaceAway = match.awayTeam.pace ?? 99.2;
+  const hasHomeRatings = match.homeTeam.offRating !== undefined && match.homeTeam.defRating !== undefined;
+  const hasAwayRatings = match.awayTeam.offRating !== undefined && match.awayTeam.defRating !== undefined;
+  const hasPaceData = match.homeTeam.pace !== undefined || match.awayTeam.pace !== undefined;
+
+  const basePaceHome = match.homeTeam.pace ?? 99.4;
+  const basePaceAway = match.awayTeam.pace ?? 99.4;
   const expectedPace = Math.max(
     91,
     Math.min(108, (basePaceHome + basePaceAway) / 2 + (homeImpact.paceDelta + awayImpact.paceDelta) * 0.5)
   );
 
-  // League average baseline ~114.5 pts / 100 possessions
+  // League average baseline 114.5 pts / 100 possessions with Bayesian shrinkage k=16 games
   const leagueAvgEff = 114.5;
-  const homeOff = (match.homeTeam.offRating ?? 116.5) + homeImpact.offRatingDelta;
-  const homeDef = (match.homeTeam.defRating ?? 112.8) + homeImpact.defRatingDelta;
-  const awayOff = (match.awayTeam.offRating ?? 115.0) + awayImpact.offRatingDelta;
-  const awayDef = (match.awayTeam.defRating ?? 113.5) + awayImpact.defRatingDelta;
+  const homePlayed = parseNbaPlayedGames(
+    match.homeTeam.record,
+    match.homeTeam.playedGames ?? match.homeTeam.recentGames?.length
+  );
+  const awayPlayed = parseNbaPlayedGames(
+    match.awayTeam.record,
+    match.awayTeam.playedGames ?? match.awayTeam.recentGames?.length
+  );
 
-  // Back-to-back fatigue adjustment
-  const homeFatigue = match.homeTeam.isBackToBack ? -1.4 : match.homeTeam.restDays >= 2 ? 0.5 : 0;
+  const shrinkHome = hasHomeRatings ? (homePlayed > 0 ? homePlayed / (homePlayed + 16) : 0.65) : 0;
+  const shrinkAway = hasAwayRatings ? (awayPlayed > 0 ? awayPlayed / (awayPlayed + 16) : 0.65) : 0;
+
+  const shrunkHomeOff = leagueAvgEff + shrinkHome * ((match.homeTeam.offRating ?? leagueAvgEff) - leagueAvgEff);
+  const shrunkHomeDef = leagueAvgEff + shrinkHome * ((match.homeTeam.defRating ?? leagueAvgEff) - leagueAvgEff);
+  const shrunkAwayOff = leagueAvgEff + shrinkAway * ((match.awayTeam.offRating ?? leagueAvgEff) - leagueAvgEff);
+  const shrunkAwayDef = leagueAvgEff + shrinkAway * ((match.awayTeam.defRating ?? leagueAvgEff) - leagueAvgEff);
+
+  if (!hasHomeRatings || !hasAwayRatings) {
+    modelWarnings.push(
+      'Faltan ratings ofensivos/defensivos reales de al menos una franquicia; se usa media de liga NBA (114.5).'
+    );
+  } else if ((homePlayed > 0 && homePlayed < 12) || (awayPlayed > 0 && awayPlayed < 12)) {
+    modelWarnings.push(
+      'Muestra temprana de temporada (<12 partidos); ratings ajustados por regresión bayesiana.'
+    );
+  }
+
+  const homeOff = shrunkHomeOff + homeImpact.offRatingDelta;
+  const homeDef = shrunkHomeDef + homeImpact.defRatingDelta;
+  const awayOff = shrunkAwayOff + awayImpact.offRatingDelta;
+  const awayDef = shrunkAwayDef + awayImpact.defRatingDelta;
+
+  const homeFatigue = match.homeTeam.isBackToBack ? -1.4 : match.homeTeam.restDays >= 2 ? 0.45 : 0;
   const awayFatigue = match.awayTeam.isBackToBack ? -1.7 : match.awayTeam.restDays >= 2 ? 0.4 : 0;
-  const homeCourtBoost = match.homeTeam.homeCourtBoost ?? 2.6;
+  const homeCourtBoost = match.homeTeam.homeCourtBoost ?? 2.4;
 
-  // Recent form momentum
   const winRate = (form: ('W' | 'D' | 'L')[]) =>
     form.length ? form.filter((f) => f === 'W').length / form.length : 0.5;
-  const formDelta = (winRate(match.homeTeam.formRecent) - winRate(match.awayTeam.formRecent)) * 1.6;
+  const formDelta =
+    match.homeTeam.formRecent.length > 0 || match.awayTeam.formRecent.length > 0
+      ? (winRate(match.homeTeam.formRecent) - winRate(match.awayTeam.formRecent)) * 1.4
+      : 0;
+
+  if (!match.homeTeam.formRecent.length && !match.awayTeam.formRecent.length) {
+    modelWarnings.push('Sin historial reciente L5 cargado aún; momento de forma en neutro.');
+  }
 
   const homeEffExpected = homeOff + awayDef - leagueAvgEff + homeCourtBoost / 2 + homeFatigue + formDelta * 0.5;
   const awayEffExpected = awayOff + homeDef - leagueAvgEff - homeCourtBoost / 2 + awayFatigue - formDelta * 0.5;
@@ -200,19 +223,419 @@ export function computeNbaMatchPrediction(
   const expectedTotal = expectedHomePts + expectedAwayPts;
   const expectedSpreadHome = expectedHomePts - expectedAwayPts;
 
-  // NBA game spread standard deviation ~ 11.8 pts; widens slightly when starters are doubtful
-  const doubtfulPenalty =
-    [...homePlayers, ...awayPlayers].filter((p) => p.availability === 'doubtful').length * 0.55;
-  const spreadStdDev = 11.8 + doubtfulPenalty;
-  const totalStdDev = 14.2 + doubtfulPenalty;
+  // Heteroscedastic spread dispersion (~12.6 base + injury/missing-data/extreme-spread variance)
+  const doubtfulCount = [...homePlayers, ...awayPlayers].filter((p) => p.availability === 'doubtful').length;
+  const missingRatingsPenalty = (!hasHomeRatings || !hasAwayRatings ? 2.4 : 0) + (!hasPaceData ? 0.6 : 0);
+  const spreadStdDev =
+    12.6 + doubtfulCount * 0.75 + missingRatingsPenalty + Math.abs(expectedSpreadHome) * 0.08;
+  const totalStdDev = 14.8 + doubtfulCount * 0.75 + missingRatingsPenalty;
 
-  const probHomeWin = 1 - normalCdf(0, expectedSpreadHome, spreadStdDev);
-  const probAwayWin = 1 - probHomeWin;
+  const unboundedHome = 1 - normalCdf(0, expectedSpreadHome, spreadStdDev);
+  // Pre-match NBA outcome probabilities remain naturally bounded within [4%, 96%]
+  const rawProbHomeWin = Math.max(0.04, Math.min(0.96, unboundedHome));
+  const rawProbAwayWin = 1 - rawProbHomeWin;
 
-  const lineupBonus = match.lineupStatus === 'confirmed' ? 12 : 4;
-  const dataConfidence = Math.round(
-    Math.max(55, Math.min(93, 72 + lineupBonus - doubtfulPenalty * 4))
-  );
+  let probHomeWin = rawProbHomeWin;
+  let probAwayWin = rawProbAwayWin;
+  let calibrationApplied = false;
+  let calibrationNote: string | undefined;
+
+  if (calibrationHistory && calibrationHistory.length > 0) {
+    const profile = fitEmpiricalCalibrationProfile(calibrationHistory, 'nba');
+    if (profile.active && (profile.temperature !== 1 || profile.bias !== 0)) {
+      probHomeWin = Math.max(0.04, Math.min(0.96, applyBinaryCalibration(rawProbHomeWin, profile)));
+      probAwayWin = 1 - probHomeWin;
+      calibrationApplied = true;
+      calibrationNote = profile.summary;
+    }
+  }
+
+  // Honest dataConfidence (measures input completeness, NOT win probability)
+  let dataConfidence = 26;
+  if (hasHomeRatings && hasAwayRatings) dataConfidence += 28;
+  else if (hasHomeRatings || hasAwayRatings) dataConfidence += 12;
+
+  if (match.homeTeam.formRecent.length > 0 && match.awayTeam.formRecent.length > 0) dataConfidence += 10;
+  if (homePlayers.length >= 5 && awayPlayers.length >= 5) dataConfidence += 12;
+  if (match.lineupStatus === 'confirmed') dataConfidence += 14;
+  else if (match.lineupStatus === 'provisional') dataConfidence += 6;
+  else modelWarnings.push('Quintetos no publicados todavía; rotación estimada.');
+
+  if (doubtfulCount > 0) {
+    dataConfidence -= Math.min(12, doubtfulCount * 3);
+    modelWarnings.push(`${doubtfulCount} jugador(es) en duda (GTD) amplían la varianza esperada.`);
+  }
+
+  dataConfidence = Math.max(20, Math.min(93, Math.round(dataConfidence)));
+
+  const dataQuality: DataReliability =
+    hasHomeRatings && hasAwayRatings && homePlayers.length >= 5 && awayPlayers.length >= 5
+      ? 'verified'
+      : hasHomeRatings || hasAwayRatings
+        ? 'estimated'
+        : 'unavailable';
+
+  // Team Rebounds & Assists projections with 80% uncertainty intervals and explicit reliability
+  const paceFactor = expectedPace / 99.5;
+  const activeRosterSum = (players: PlayerProfile[], key: 'rebounds' | 'assists'): number =>
+    players.reduce((acc, p) => {
+      const f = getNbaAvailabilityFactor(p.availability, p.minutesRestriction, p.splits.season.minutes || 28);
+      return acc + (p.splits.season[key] ?? 0) * f;
+    }, 0);
+
+  const rosterRebHome = activeRosterSum(homePlayers, 'rebounds');
+  const rosterRebAway = activeRosterSum(awayPlayers, 'rebounds');
+  const rosterAstHome = activeRosterSum(homePlayers, 'assists');
+  const rosterAstAway = activeRosterSum(awayPlayers, 'assists');
+
+  const hasHomeReb = match.homeTeam.avgRebounds !== undefined;
+  const hasAwayReb = match.awayTeam.avgRebounds !== undefined;
+  const hasHomeAst = match.homeTeam.avgAssists !== undefined;
+  const hasAwayAst = match.awayTeam.avgAssists !== undefined;
+
+  const expectedReboundsHome = +(
+    hasHomeReb
+      ? match.homeTeam.avgRebounds! * (0.62 + 0.38 * paceFactor)
+      : rosterRebHome > 18
+        ? rosterRebHome * 1.07 * (0.7 + 0.3 * paceFactor)
+        : 43.4 * paceFactor
+  ).toFixed(1);
+
+  const expectedReboundsAway = +(
+    hasAwayReb
+      ? match.awayTeam.avgRebounds! * (0.62 + 0.38 * paceFactor)
+      : rosterRebAway > 18
+        ? rosterRebAway * 1.07 * (0.7 + 0.3 * paceFactor)
+        : 42.8 * paceFactor
+  ).toFixed(1);
+
+  const expectedAssistsHome = +(
+    hasHomeAst
+      ? match.homeTeam.avgAssists! * (0.6 + 0.4 * paceFactor)
+      : rosterAstHome > 10
+        ? rosterAstHome * 1.05 * (0.7 + 0.3 * paceFactor)
+        : 26.2 * paceFactor
+  ).toFixed(1);
+
+  const expectedAssistsAway = +(
+    hasAwayAst
+      ? match.awayTeam.avgAssists! * (0.6 + 0.4 * paceFactor)
+      : rosterAstAway > 10
+        ? rosterAstAway * 1.05 * (0.7 + 0.3 * paceFactor)
+        : 25.4 * paceFactor
+  ).toFixed(1);
+
+  const teamPtsStd = 10.8 + doubtfulCount * 0.5 + missingRatingsPenalty * 0.6;
+  const halfStep = (v: number, min: number, max: number) =>
+    Math.max(min, Math.min(max, Math.round(v * 2) / 2 - (Math.round(v * 2) % 2 === 0 ? 0.5 : 0)));
+
+  const hasHomeBasis = hasHomeRatings || match.homeTeam.pace !== undefined || rosterRebHome > 18;
+  const hasAwayBasis = hasAwayRatings || match.awayTeam.pace !== undefined || rosterRebAway > 18;
+  const hasAnyBasis = hasHomeBasis || hasAwayBasis;
+
+  const rebHomeRel: DataReliability = hasHomeReb
+    ? 'verified'
+    : rosterRebHome > 18
+      ? 'estimated'
+      : 'unavailable';
+  const rebAwayRel: DataReliability = hasAwayReb
+    ? 'verified'
+    : rosterRebAway > 18
+      ? 'estimated'
+      : 'unavailable';
+  const astHomeRel: DataReliability = hasHomeAst
+    ? 'verified'
+    : rosterAstHome > 10
+      ? 'estimated'
+      : 'unavailable';
+  const astAwayRel: DataReliability = hasAwayAst
+    ? 'verified'
+    : rosterAstAway > 10
+      ? 'estimated'
+      : 'unavailable';
+  const paceRel: DataReliability =
+    match.homeTeam.pace !== undefined && match.awayTeam.pace !== undefined
+      ? 'verified'
+      : hasPaceData
+        ? 'estimated'
+        : 'unavailable';
+  const ptsHomeRel: DataReliability = hasHomeRatings ? 'verified' : hasAnyBasis ? 'estimated' : 'unavailable';
+  const ptsAwayRel: DataReliability = hasAwayRatings ? 'verified' : hasAnyBasis ? 'estimated' : 'unavailable';
+  const matchPtsRel: DataReliability =
+    hasHomeRatings && hasAwayRatings ? 'verified' : hasAnyBasis ? 'estimated' : 'unavailable';
+
+  const expectedStats: StatExpectationWithInterval[] = [
+    ptsHomeRel === 'unavailable'
+      ? {
+          key: 'pts_home',
+          label: `Puntos esperados (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'pts',
+          reliability: 'unavailable',
+          note: 'No disponible: sin ratings ofensivos/defensivos ni estadísticas recientes suficientes',
+        }
+      : {
+          key: 'pts_home',
+          label: `Puntos esperados (${match.homeTeam.shortName})`,
+          pointEstimate: +expectedHomePts.toFixed(1),
+          intervalLow: +Math.max(70, expectedHomePts - 1.28 * teamPtsStd).toFixed(1),
+          intervalHigh: +(expectedHomePts + 1.28 * teamPtsStd).toFixed(1),
+          unit: 'pts',
+          reliability: ptsHomeRel,
+          note: hasHomeRatings ? 'Basado en ORtg/DRtg verificados y ritmo' : 'Estimado desde rival y rotación',
+          distributionSpec: {
+            kind: 'normal',
+            mean: +expectedHomePts.toFixed(1),
+            stdDev: +teamPtsStd.toFixed(2),
+            minLine: 85.5,
+            maxLine: 145.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedHomePts, 85.5, 145.5),
+          },
+        },
+    ptsAwayRel === 'unavailable'
+      ? {
+          key: 'pts_away',
+          label: `Puntos esperados (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'pts',
+          reliability: 'unavailable',
+          note: 'No disponible: sin ratings ofensivos/defensivos ni estadísticas recientes suficientes',
+        }
+      : {
+          key: 'pts_away',
+          label: `Puntos esperados (${match.awayTeam.shortName})`,
+          pointEstimate: +expectedAwayPts.toFixed(1),
+          intervalLow: +Math.max(70, expectedAwayPts - 1.28 * teamPtsStd).toFixed(1),
+          intervalHigh: +(expectedAwayPts + 1.28 * teamPtsStd).toFixed(1),
+          unit: 'pts',
+          reliability: ptsAwayRel,
+          note: hasAwayRatings ? 'Basado en ORtg/DRtg verificados y ritmo' : 'Estimado desde rival y rotación',
+          distributionSpec: {
+            kind: 'normal',
+            mean: +expectedAwayPts.toFixed(1),
+            stdDev: +teamPtsStd.toFixed(2),
+            minLine: 85.5,
+            maxLine: 145.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedAwayPts, 85.5, 145.5),
+          },
+        },
+    matchPtsRel === 'unavailable'
+      ? {
+          key: 'pts_total',
+          label: 'Total de puntos del partido',
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'pts',
+          reliability: 'unavailable',
+          note: 'No disponible: sin métricas ofensivas/defensivas suficientes',
+        }
+      : {
+          key: 'pts_total',
+          label: 'Total de puntos del partido',
+          pointEstimate: +expectedTotal.toFixed(1),
+          intervalLow: +Math.max(155, expectedTotal - 1.28 * totalStdDev).toFixed(1),
+          intervalHigh: +(expectedTotal + 1.28 * totalStdDev).toFixed(1),
+          unit: 'pts',
+          reliability: matchPtsRel,
+          note: matchPtsRel === 'verified' ? 'Suma de eficiencia ajustada por pace real' : 'Estimación combinada del modelo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: +expectedTotal.toFixed(1),
+            stdDev: +totalStdDev.toFixed(2),
+            minLine: 185.5,
+            maxLine: 265.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedTotal, 185.5, 265.5),
+          },
+        },
+    paceRel === 'unavailable'
+      ? {
+          key: 'pace',
+          label: 'Ritmo estimado (posesiones)',
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'pos',
+          reliability: 'unavailable',
+          note: 'No disponible: sin datos de posesiones por partido',
+        }
+      : {
+          key: 'pace',
+          label: 'Ritmo estimado (posesiones)',
+          pointEstimate: +expectedPace.toFixed(1),
+          intervalLow: +(expectedPace - 3.6).toFixed(1),
+          intervalHigh: +(expectedPace + 3.6).toFixed(1),
+          unit: 'pos',
+          reliability: paceRel,
+          note: paceRel === 'verified' ? 'Promedio real de ritmo de ambas franquicias' : 'Estimación de ritmo ajustada por modelo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: +expectedPace.toFixed(1),
+            stdDev: 2.81,
+            minLine: 90.5,
+            maxLine: 109.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedPace, 90.5, 109.5),
+          },
+        },
+    rebHomeRel === 'unavailable'
+      ? {
+          key: 'reb_home',
+          label: `Rebotes esperados (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'reb',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedio real de rebotes ni plantilla suficiente',
+        }
+      : {
+          key: 'reb_home',
+          label: `Rebotes esperados (${match.homeTeam.shortName})`,
+          pointEstimate: expectedReboundsHome,
+          intervalLow: +Math.max(24, expectedReboundsHome - 5.2).toFixed(1),
+          intervalHigh: +(expectedReboundsHome + 5.2).toFixed(1),
+          unit: 'reb',
+          reliability: rebHomeRel,
+          note: hasHomeReb ? 'Promedio real ajustado por ritmo' : 'Estimación del modelo desde rotación/ritmo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: expectedReboundsHome,
+            stdDev: 4.06,
+            minLine: 30.5,
+            maxLine: 58.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedReboundsHome, 30.5, 58.5),
+          },
+        },
+    rebAwayRel === 'unavailable'
+      ? {
+          key: 'reb_away',
+          label: `Rebotes esperados (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'reb',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedio real de rebotes ni plantilla suficiente',
+        }
+      : {
+          key: 'reb_away',
+          label: `Rebotes esperados (${match.awayTeam.shortName})`,
+          pointEstimate: expectedReboundsAway,
+          intervalLow: +Math.max(24, expectedReboundsAway - 5.2).toFixed(1),
+          intervalHigh: +(expectedReboundsAway + 5.2).toFixed(1),
+          unit: 'reb',
+          reliability: rebAwayRel,
+          note: hasAwayReb ? 'Promedio real ajustado por ritmo' : 'Estimación del modelo desde rotación/ritmo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: expectedReboundsAway,
+            stdDev: 4.06,
+            minLine: 30.5,
+            maxLine: 58.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedReboundsAway, 30.5, 58.5),
+          },
+        },
+    astHomeRel === 'unavailable'
+      ? {
+          key: 'ast_home',
+          label: `Asistencias esperadas (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'ast',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedio real de asistencias ni plantilla suficiente',
+        }
+      : {
+          key: 'ast_home',
+          label: `Asistencias esperadas (${match.homeTeam.shortName})`,
+          pointEstimate: expectedAssistsHome,
+          intervalLow: +Math.max(12, expectedAssistsHome - 4.2).toFixed(1),
+          intervalHigh: +(expectedAssistsHome + 4.2).toFixed(1),
+          unit: 'ast',
+          reliability: astHomeRel,
+          note: hasHomeAst ? 'Promedio real ajustado por ritmo' : 'Estimación del modelo desde rotación/ritmo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: expectedAssistsHome,
+            stdDev: 3.28,
+            minLine: 15.5,
+            maxLine: 38.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedAssistsHome, 15.5, 38.5),
+          },
+        },
+    astAwayRel === 'unavailable'
+      ? {
+          key: 'ast_away',
+          label: `Asistencias esperadas (${match.awayTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'ast',
+          reliability: 'unavailable',
+          note: 'No disponible: sin promedio real de asistencias ni plantilla suficiente',
+        }
+      : {
+          key: 'ast_away',
+          label: `Asistencias esperadas (${match.awayTeam.shortName})`,
+          pointEstimate: expectedAssistsAway,
+          intervalLow: +Math.max(12, expectedAssistsAway - 4.2).toFixed(1),
+          intervalHigh: +(expectedAssistsAway + 4.2).toFixed(1),
+          unit: 'ast',
+          reliability: astAwayRel,
+          note: hasAwayAst ? 'Promedio real ajustado por ritmo' : 'Estimación del modelo desde rotación/ritmo',
+          distributionSpec: {
+            kind: 'normal',
+            mean: expectedAssistsAway,
+            stdDev: 3.28,
+            minLine: 15.5,
+            maxLine: 38.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedAssistsAway, 15.5, 38.5),
+          },
+        },
+    matchPtsRel === 'unavailable'
+      ? {
+          key: 'spread_home',
+          label: `Diferencia esperada (${match.homeTeam.shortName})`,
+          pointEstimate: null,
+          intervalLow: null,
+          intervalHigh: null,
+          unit: 'pts',
+          reliability: 'unavailable',
+          note: 'No disponible: sin métricas ofensivas/defensivas suficientes',
+        }
+      : {
+          key: 'spread_home',
+          label: `Diferencia esperada (${match.homeTeam.shortName})`,
+          pointEstimate: +expectedSpreadHome.toFixed(1),
+          intervalLow: +(expectedSpreadHome - 1.28 * spreadStdDev).toFixed(1),
+          intervalHigh: +(expectedSpreadHome + 1.28 * spreadStdDev).toFixed(1),
+          unit: 'pts',
+          reliability: matchPtsRel,
+          note: 'Margen local (positivo si favorece al equipo local)',
+          distributionSpec: {
+            kind: 'normal',
+            mean: +expectedSpreadHome.toFixed(1),
+            stdDev: +spreadStdDev.toFixed(2),
+            minLine: -20.5,
+            maxLine: 20.5,
+            step: 0.5,
+            defaultLine: halfStep(expectedSpreadHome, -20.5, 20.5),
+          },
+        },
+  ];
 
   return {
     expectedPace,
@@ -220,12 +643,23 @@ export function computeNbaMatchPrediction(
     expectedAwayPts,
     expectedTotal,
     expectedSpreadHome,
+    expectedReboundsHome,
+    expectedReboundsAway,
+    expectedAssistsHome,
+    expectedAssistsAway,
+    expectedStats,
     probHomeWin,
     probAwayWin,
+    rawProbHomeWin,
+    rawProbAwayWin,
     spreadStdDev,
     totalStdDev,
     absenceImpactSummary: [...homeImpact.notes, ...awayImpact.notes],
     dataConfidence,
+    dataQuality,
+    calibrationApplied,
+    calibrationNote,
+    modelWarnings,
   };
 }
 
@@ -243,12 +677,45 @@ export const NBA_STAT_CONFIG: Record<
   pra: { label: 'Puntos + Rebotes + Asistencias', min: 12.5, max: 62.5, step: 0.5 },
 };
 
+function evaluateNbaLogFreshness(
+  player: PlayerProfile,
+  referenceIso: string
+): { freshness: DataFreshnessStatus; warning?: string } {
+  const latest = player.recentLogs[0]?.date ?? player.lastLogDate;
+  if (!latest) {
+    return {
+      freshness: player.sampleSizeGames > 0 ? 'aging' : 'unknown',
+      warning: player.sampleSizeGames === 0 ? 'Sin registros recientes individuales en esta fuente.' : undefined,
+    };
+  }
+  const latestMs = new Date(latest).getTime();
+  const refMs = new Date(referenceIso).getTime();
+  if (!Number.isFinite(latestMs) || !Number.isFinite(refMs)) {
+    return { freshness: 'unknown' };
+  }
+  const ageDays = Math.round((refMs - latestMs) / 86_400_000);
+  if (ageDays > 45) {
+    return {
+      freshness: 'stale',
+      warning: `Último partido registrado hace ${ageDays} días (${latest}); el modelo amplía la varianza por posible cambio de rol o inactividad.`,
+    };
+  }
+  if (ageDays > 21) {
+    return {
+      freshness: 'aging',
+      warning: `Último game log hace ${ageDays} días (${latest}).`,
+    };
+  }
+  return { freshness: 'fresh' };
+}
+
 /**
  * Computes NBA Player Prop Over/Under distribution accounting for:
- * - Selected split (Season, L5, L10, L15, Home, Away, H2H)
- * - Minutes & rotation projection
+ * - Multi-split blend (Season 30% + L5 30% + L10 25% + Home/Away 15%) when available
+ * - Log staleness detection widening dispersion when recentLogs > 45 days old
+ * - Minutes & rotation projection (respecting confirmed/projected status & minutes limits)
  * - Pace & Opponent Defense matchup
- * - Usage / Minutes / Assist redistribution when a teammate (e.g., Stephen Curry) is OUT!
+ * - Zero-sum proportional teammate redistribution when key players sit or are limited
  */
 export function computeNbaPlayerProp(
   player: PlayerProfile,
@@ -264,8 +731,52 @@ export function computeNbaPlayerProp(
   const oppTeam = isHome ? match.awayTeam : match.homeTeam;
   const ownTeam = isHome ? match.homeTeam : match.awayTeam;
 
-  const splitVals = player.splits[timeframe] ?? player.splits.season;
+  const statsQuality: DataReliability =
+    player.statsQuality ??
+    (player.sampleSizeGames >= 8 ? 'verified' : player.sampleSizeGames > 0 ? 'estimated' : 'unavailable');
+
   const seasonVals = player.splits.season;
+  const hasRealStat =
+    statsQuality !== 'unavailable' &&
+    (statKey === 'pra'
+      ? seasonVals.points !== undefined &&
+        seasonVals.rebounds !== undefined &&
+        seasonVals.assists !== undefined
+      : seasonVals[statKey] !== undefined && Number.isFinite(seasonVals[statKey]));
+
+  if (!hasRealStat) {
+    return {
+      statKey,
+      statLabel: cfg.label,
+      line: customLine ?? cfg.min,
+      minLine: cfg.min,
+      maxLine: cfg.max,
+      step: cfg.step,
+      expectedValue: 0,
+      median: 0,
+      stdDev: 0,
+      intervalLow: 0,
+      intervalHigh: 0,
+      probOver: 0,
+      probUnder: 0,
+      expectedMinutes: 0,
+      absenceAdjustmentPct: 0,
+      sampleConfidence: 0,
+      sampleSizeGames: player.sampleSizeGames,
+      statsQuality: 'unavailable',
+      statsOriginNote:
+        player.statsOriginNote ?? 'Estadísticas individuales reales no disponibles en esta fuente',
+      dataFreshness: 'unknown',
+      unavailable: true,
+      unavailableReason: `No hay registros individuales reales de "${cfg.label}" para ${player.name}.`,
+      distribution: [],
+    };
+  }
+
+  const last5Vals = player.splits.last5 ?? seasonVals;
+  const last10Vals = player.splits.last10 ?? seasonVals;
+  const venueVals = isHome ? (player.splits.home ?? seasonVals) : (player.splits.away ?? seasonVals);
+  const splitVals = player.splits[timeframe] ?? seasonVals;
 
   const extractStat = (v: typeof seasonVals): number => {
     if (statKey === 'pra') {
@@ -274,17 +785,40 @@ export function computeNbaPlayerProp(
     return v[statKey] ?? 0;
   };
 
-  const splitStat = extractStat(splitVals);
   const seasonStat = extractStat(seasonVals);
-  const basePerGame = timeframe === 'season' ? seasonStat : splitStat * 0.62 + seasonStat * 0.38;
+  const last5Stat = extractStat(last5Vals);
+  const last10Stat = extractStat(last10Vals);
+  const venueStat = extractStat(venueVals);
+  const splitStat = extractStat(splitVals);
 
-  // Calculate vacated usage/minutes/assists from teammates who are OUT, DOUBTFUL, PROBABLE, or minutes-restricted
+  const hasMultiWindowSamples =
+    (last5Vals.games ?? 0) > 0 && (last10Vals.games ?? 0) > 0 && (seasonVals.games ?? 0) > 0;
+
+  const compositeMean = hasMultiWindowSamples
+    ? seasonStat * 0.30 + last5Stat * 0.30 + last10Stat * 0.25 + venueStat * 0.15
+    : seasonStat;
+
+  const basePerGame = timeframe === 'season' ? compositeMean : splitStat * 0.62 + compositeMean * 0.38;
+
+  const { freshness: dataFreshness, warning: freshnessWarning } = evaluateNbaLogFreshness(
+    player,
+    match.kickoffIso
+  );
+
+  // Compute vacated minutes/usage/assists AND total active weights so redistribution sums cleanly <= 100%
+  const playerBaseMin = Math.max(10, seasonVals.minutes || 26);
+  const playerAvail = getNbaAvailabilityFactor(player.availability, player.minutesRestriction, playerBaseMin);
+
   let vacatedUsage = 0;
   let vacatedAssists = 0;
   let vacatedMinutes = 0;
+  let totalActiveMinutesWeight = playerBaseMin * playerAvail;
+  let totalActiveUsageWeight = Math.max(0.05, player.impact.usageShare * playerAvail);
+  let totalActiveAssistWeight = Math.max(0.05, player.impact.assistShare * playerAvail);
+
   for (const mate of teamPlayers) {
     if (mate.id === player.id) continue;
-    const mateBaseMin = mate.splits.season.minutes || 30;
+    const mateBaseMin = mate.splits.season.minutes || 28;
     const avail = getNbaAvailabilityFactor(mate.availability, mate.minutesRestriction, mateBaseMin);
     if (avail < 0.99 && (mate.isKeyPlayer || avail === 0 || mate.minutesRestriction)) {
       const loss = 1 - avail;
@@ -292,52 +826,62 @@ export function computeNbaPlayerProp(
       vacatedAssists += mate.impact.assistShare * loss;
       vacatedMinutes += mateBaseMin * loss;
     }
+    if (avail > 0) {
+      totalActiveMinutesWeight += mateBaseMin * avail;
+      totalActiveUsageWeight += mate.impact.usageShare * avail;
+      totalActiveAssistWeight += mate.impact.assistShare * avail;
+    }
   }
 
-  // Distribute vacated minutes & usage proportionally to active players, respecting minutes restrictions
-  const baseMinutes = Math.max(10, seasonVals.minutes || 26);
   let expectedMinutes = 0;
   if (player.availability === 'out' || player.availability === 'suspended') {
     expectedMinutes = 0;
   } else if (player.availability === 'doubtful') {
-    expectedMinutes = baseMinutes * 0.52;
+    expectedMinutes = playerBaseMin * 0.52;
   } else if (player.minutesRestriction) {
     expectedMinutes = player.minutesRestriction.maxMinutes
-      ? Math.min(baseMinutes, player.minutesRestriction.maxMinutes)
-      : baseMinutes * 0.78;
+      ? Math.min(playerBaseMin, player.minutesRestriction.maxMinutes)
+      : playerBaseMin * 0.78;
   } else {
     const isStarterRole =
       player.availability === 'confirmed_starter' ||
       player.availability === 'possible_starter' ||
       player.availability === 'starter';
     const isBenchRole = player.availability === 'bench' || player.availability === 'available';
-    const boostCap = isBenchRole
-      ? Math.min(8.5, vacatedMinutes * 0.28)
-      : Math.min(4.2, vacatedMinutes * 0.14);
+    const shareOfActiveMin = (playerBaseMin * playerAvail) / Math.max(60, totalActiveMinutesWeight);
+    const rawMinShare = vacatedMinutes * shareOfActiveMin * (isBenchRole ? 1.15 : 0.88);
+    const boostCap = isBenchRole ? Math.min(7.5, rawMinShare) : Math.min(4.0, rawMinShare);
     const probableDiscount = player.availability === 'probable' ? 0.92 : 1;
-    const roleBaseline = isStarterRole ? Math.max(baseMinutes, 24) : baseMinutes;
-    expectedMinutes = Math.min(41.5, roleBaseline * probableDiscount + boostCap);
+    const roleBaseline = isStarterRole ? Math.max(playerBaseMin, 24) : playerBaseMin;
+    expectedMinutes = Math.min(40.5, roleBaseline * probableDiscount + boostCap);
   }
 
-  const minutesRatio = expectedMinutes / baseMinutes;
+  const minutesRatio = expectedMinutes / playerBaseMin;
 
-  // Usage boost when star teammates sit
+  // Normalized proportional redistribution (caps extreme blowup if multiple stars sit)
   let absenceBoostRatio = 0;
-  if (expectedMinutes > 0) {
+  if (expectedMinutes > 0 && !player.minutesRestriction) {
+    const usageShareOfActive =
+      (player.impact.usageShare * playerAvail) / Math.max(0.28, totalActiveUsageWeight);
+    const assistShareOfActive =
+      (player.impact.assistShare * playerAvail) / Math.max(0.28, totalActiveAssistWeight);
+
     if (statKey === 'points' || statKey === 'threes') {
-      absenceBoostRatio = vacatedUsage * (player.isKeyPlayer ? 0.52 : 0.42);
+      absenceBoostRatio = Math.min(0.24, vacatedUsage * usageShareOfActive * 1.45);
     } else if (statKey === 'assists') {
-      absenceBoostRatio = vacatedAssists * 0.48;
+      absenceBoostRatio = Math.min(0.26, vacatedAssists * assistShareOfActive * 1.5);
     } else if (statKey === 'rebounds') {
-      absenceBoostRatio = vacatedUsage * 0.14;
+      absenceBoostRatio = Math.min(0.14, vacatedUsage * usageShareOfActive * 0.55);
     } else if (statKey === 'pra') {
-      absenceBoostRatio = vacatedUsage * 0.38 + vacatedAssists * 0.18;
+      absenceBoostRatio = Math.min(
+        0.22,
+        vacatedUsage * usageShareOfActive * 1.1 + vacatedAssists * assistShareOfActive * 0.65
+      );
     } else if (statKey === 'turnovers') {
-      absenceBoostRatio = vacatedUsage * 0.3;
+      absenceBoostRatio = Math.min(0.18, vacatedUsage * usageShareOfActive * 0.9);
     }
   }
 
-  // Pace & opponent defensive rating multiplier
   const avgPace = ((ownTeam.pace ?? 99.5) + (oppTeam.pace ?? 99.5)) / 2;
   const paceFactor = avgPace / 99.5;
   const oppDefFactor =
@@ -356,13 +900,40 @@ export function computeNbaPlayerProp(
   );
   const line = customLine ?? defaultLine;
 
+  const freshnessPenalty = dataFreshness === 'stale' ? 14 : dataFreshness === 'aging' ? 5 : 0;
+  const sampleConfidence = Math.max(
+    18,
+    (player.sampleSizeGames <= 0
+      ? 28
+      : statsQuality === 'estimated'
+        ? Math.min(54, 34 + player.sampleSizeGames * 2.2)
+        : Math.min(
+            93,
+            52 + Math.min(32, player.sampleSizeGames * 0.7) + (match.lineupStatus === 'confirmed' ? 8 : 0)
+          )) - freshnessPenalty
+  );
+
+  const lowSampleVarianceMultiplier =
+    (statsQuality === 'verified' ? 1.0 : 1.3) * (dataFreshness === 'stale' ? 1.18 : 1.0);
+
+  const multiSplitSummary = {
+    seasonAvg: +seasonStat.toFixed(1),
+    last5Avg: +last5Stat.toFixed(1),
+    last10Avg: +last10Stat.toFixed(1),
+    homeAwayAvg: +venueStat.toFixed(1),
+    h2hAvg: player.splits.h2h?.games ? +extractStat(player.splits.h2h).toFixed(1) : undefined,
+    weightsNote: hasMultiWindowSamples
+      ? 'Modelo ponderado NBA: 30% Temp + 30% L5 + 25% L10 + 15% Local/Visitante'
+      : 'Sin logs completos multi-ventana; se aplica base disponible',
+  };
+
   if (cfg.discreteAlpha !== undefined) {
-    // Discrete Negative Binomial distribution for 3PM, Steals, Blocks, Turnovers
+    const effAlpha = cfg.discreteAlpha * lowSampleVarianceMultiplier;
     const maxK = Math.max(Math.ceil(cfg.max) + 3, Math.ceil(expectedValue * 3) + 3);
     const probs: number[] = [];
     let rawSum = 0;
     for (let k = 0; k <= maxK; k++) {
-      const p = negBinPmf(k, expectedValue, cfg.discreteAlpha);
+      const p = negBinPmf(k, expectedValue, effAlpha);
       probs.push(p);
       rawSum += p;
     }
@@ -391,9 +962,9 @@ export function computeNbaPlayerProp(
         });
       }
     }
-    const probUnder = Math.max(0.1, Math.min(99.9, Math.round(cumUnder * 1000) / 10));
+    const probUnder = Math.max(0.5, Math.min(99.5, Math.round(cumUnder * 1000) / 10));
     const probOver = Math.round((100 - probUnder) * 10) / 10;
-    const stdDev = Math.sqrt(expectedValue + cfg.discreteAlpha * expectedValue * expectedValue);
+    const stdDev = Math.sqrt(expectedValue + effAlpha * expectedValue * expectedValue);
 
     return {
       statKey,
@@ -411,25 +982,30 @@ export function computeNbaPlayerProp(
       probUnder,
       expectedMinutes,
       absenceAdjustmentPct: absenceBoostRatio * 100,
-      sampleConfidence: Math.min(93, 60 + player.sampleSizeGames * 0.7),
+      sampleConfidence,
+      sampleSizeGames: player.sampleSizeGames,
+      statsQuality,
+      statsOriginNote: player.statsOriginNote,
+      dataFreshness,
+      freshnessWarning,
+      multiSplitSummary,
       distribution,
     };
   }
 
-  // Continuous-approximated Normal distribution for Points, Rebounds, Assists, PRA
   const coeffVar =
     statKey === 'points'
       ? 0.27
       : statKey === 'rebounds'
-      ? 0.34
-      : statKey === 'assists'
-      ? 0.36
-      : 0.24; // PRA
+        ? 0.34
+        : statKey === 'assists'
+          ? 0.36
+          : 0.24;
   const doubtfulUncertainty = player.availability === 'doubtful' ? 1.25 : 1.0;
-  const stdDev = Math.max(1.4, expectedValue * coeffVar * doubtfulUncertainty);
+  const stdDev = Math.max(1.5, expectedValue * coeffVar * doubtfulUncertainty * lowSampleVarianceMultiplier);
 
   const probUnderRaw = normalCdf(line, expectedValue, stdDev);
-  const probUnder = Math.max(0.1, Math.min(99.9, Math.round(probUnderRaw * 1000) / 10));
+  const probUnder = Math.max(0.5, Math.min(99.5, Math.round(probUnderRaw * 1000) / 10));
   const probOver = Math.round((100 - probUnder) * 10) / 10;
 
   const binStep = statKey === 'pra' ? 4 : statKey === 'points' ? 3 : 1;
@@ -464,7 +1040,160 @@ export function computeNbaPlayerProp(
     probUnder,
     expectedMinutes,
     absenceAdjustmentPct: absenceBoostRatio * 100,
-    sampleConfidence: Math.min(94, 62 + player.sampleSizeGames * 0.65),
+    sampleConfidence,
+    sampleSizeGames: player.sampleSizeGames,
+    statsQuality,
+    statsOriginNote: player.statsOriginNote,
+    dataFreshness,
+    freshnessWarning,
+    multiSplitSummary,
     distribution,
   };
 }
+
+/**
+ * Generates a specific pre-match NBA narrative explanation covering pace, ORtg/DRtg,
+ * rest/B2B fatigue, absences, positional tactical matchups (Guards, Wings, Paint/Rebounding),
+ * H2H sample gating, and data limits.
+ */
+export function buildNbaMatchExplanation(
+  match: MatchRecord,
+  pred: NbaPredictionResult,
+  homePlayersOverride?: PlayerProfile[],
+  awayPlayersOverride?: PlayerProfile[]
+): MatchNarrativeExplanation {
+  const h = match.homeTeam;
+  const a = match.awayTeam;
+  const homePlayers = (homePlayersOverride ?? match.homePlayers).filter(
+    (p) => p.availability !== 'out' && p.availability !== 'suspended'
+  );
+  const awayPlayers = (awayPlayersOverride ?? match.awayPlayers).filter(
+    (p) => p.availability !== 'out' && p.availability !== 'suspended'
+  );
+
+  const favLabel =
+    pred.probHomeWin >= 0.55
+      ? `Ventaja local para ${h.name} (${(pred.probHomeWin * 100).toFixed(1)}% vs ${(pred.probAwayWin * 100).toFixed(1)}%)`
+      : pred.probAwayWin >= 0.55
+        ? `Ventaja visitante para ${a.name} (${(pred.probAwayWin * 100).toFixed(1)}% vs ${(pred.probHomeWin * 100).toFixed(1)}%)`
+        : `Encuentro muy igualado (${h.shortName} ${(pred.probHomeWin * 100).toFixed(1)}% vs ${a.shortName} ${(pred.probAwayWin * 100).toFixed(1)}%)`;
+
+  const paceStat = pred.expectedStats.find((s) => s.key === 'pace');
+  const rebHomeStat = pred.expectedStats.find((s) => s.key === 'reb_home');
+  const rebAwayStat = pred.expectedStats.find((s) => s.key === 'reb_away');
+  const astHomeStat = pred.expectedStats.find((s) => s.key === 'ast_home');
+  const astAwayStat = pred.expectedStats.find((s) => s.key === 'ast_away');
+
+  const homeFavoringFactors: string[] = [
+    `Proyección de ${pred.expectedHomePts.toFixed(1)} puntos${
+      rebHomeStat?.pointEstimate != null || astHomeStat?.pointEstimate != null
+        ? ` (${rebHomeStat?.pointEstimate != null ? `${rebHomeStat.pointEstimate.toFixed(1)} reb` : 'reb N/D'}, ${
+            astHomeStat?.pointEstimate != null ? `${astHomeStat.pointEstimate.toFixed(1)} ast` : 'ast N/D'
+          })`
+        : ''
+    }.`,
+  ];
+  if (h.offRating !== undefined && h.defRating !== undefined) {
+    homeFavoringFactors.push(`Eficiencia: ORtg ${h.offRating.toFixed(1)} / DRtg ${h.defRating.toFixed(1)} (Net ${(h.offRating - h.defRating >= 0 ? '+' : '')}${(h.offRating - h.defRating).toFixed(1)}).`);
+  }
+  if (h.homeRecord) homeFavoringFactors.push(`Balance en casa: ${h.homeRecord}.`);
+  homeFavoringFactors.push(
+    h.isBackToBack
+      ? `Situación de Back-to-Back (penalización por fatiga aplicada).`
+      : `Descanso de ${h.restDays} días${h.restDays >= 2 ? ' (frescura favorable)' : ''}.`
+  );
+
+  const awayFavoringFactors: string[] = [
+    `Proyección de ${pred.expectedAwayPts.toFixed(1)} puntos${
+      rebAwayStat?.pointEstimate != null || astAwayStat?.pointEstimate != null
+        ? ` (${rebAwayStat?.pointEstimate != null ? `${rebAwayStat.pointEstimate.toFixed(1)} reb` : 'reb N/D'}, ${
+            astAwayStat?.pointEstimate != null ? `${astAwayStat.pointEstimate.toFixed(1)} ast` : 'ast N/D'
+          })`
+        : ''
+    }.`,
+  ];
+  if (a.offRating !== undefined && a.defRating !== undefined) {
+    awayFavoringFactors.push(`Eficiencia: ORtg ${a.offRating.toFixed(1)} / DRtg ${a.defRating.toFixed(1)} (Net ${(a.offRating - a.defRating >= 0 ? '+' : '')}${(a.offRating - a.defRating).toFixed(1)}).`);
+  }
+  if (a.awayRecord) awayFavoringFactors.push(`Rendimiento fuera de casa: ${a.awayRecord}.`);
+  awayFavoringFactors.push(
+    a.isBackToBack
+      ? `Juega en Back-to-Back visitante (-1.7 pts de ajuste de fatiga).`
+      : `Descanso de ${a.restDays} días antes del salto inicial.`
+  );
+
+  const pickTopRole = (players: PlayerProfile[], posHints: string[]) =>
+    players
+      .filter(
+        (p) =>
+          p.statsQuality !== 'unavailable' &&
+          p.splits.season.points !== undefined &&
+          posHints.some((hint) => p.position.toUpperCase().includes(hint))
+      )
+      .sort((x, y) => (y.splits.season.points ?? 0) - (x.splits.season.points ?? 0))[0];
+
+  const homeGuard = pickTopRole(homePlayers, ['PG', 'SG', 'G']);
+  const awayGuard = pickTopRole(awayPlayers, ['PG', 'SG', 'G']);
+  const homeBig = pickTopRole(homePlayers, ['C', 'PF', 'F']);
+  const awayBig = pickTopRole(awayPlayers, ['C', 'PF', 'F']);
+
+  const tacticalMatchups: string[] = [
+    `${
+      paceStat?.pointEstimate != null
+        ? `Ritmo proyectado de ${paceStat.pointEstimate.toFixed(1)} posesiones/48m y total`
+        : 'Total'
+    } esperado de ${pred.expectedTotal.toFixed(1)} puntos.`,
+  ];
+  if (rebHomeStat?.pointEstimate != null && rebAwayStat?.pointEstimate != null) {
+    tacticalMatchups.push(
+      `Batalla en el rebote y juego interior: ${h.shortName} (${rebHomeStat.pointEstimate.toFixed(1)} reb) vs ${a.shortName} (${rebAwayStat.pointEstimate.toFixed(1)} reb).`
+    );
+  }
+  if (homeGuard && awayGuard && homeGuard.splits.season.points !== undefined && awayGuard.splits.season.points !== undefined) {
+    tacticalMatchups.push(
+      `Duelo de perímetro y dirección: ${homeGuard.shortName} (${homeGuard.splits.season.points.toFixed(1)}p${
+        homeGuard.splits.season.assists !== undefined ? ` / ${homeGuard.splits.season.assists.toFixed(1)}a` : ''
+      }) frente a ${awayGuard.shortName} (${awayGuard.splits.season.points.toFixed(1)}p${
+        awayGuard.splits.season.assists !== undefined ? ` / ${awayGuard.splits.season.assists.toFixed(1)}a` : ''
+      }).`
+    );
+  }
+  if (homeBig && awayBig && homeBig.splits.season.rebounds !== undefined && awayBig.splits.season.rebounds !== undefined) {
+    tacticalMatchups.push(
+      `Duelo en la pintura: ${homeBig.shortName} (${homeBig.splits.season.rebounds.toFixed(1)} reb) vs ${awayBig.shortName} (${awayBig.splits.season.rebounds.toFixed(1)} reb).`
+    );
+  }
+
+  const h2hAssessment =
+    match.h2hSummary.played >= 4
+      ? `Muestra H2H sólida (${match.h2hSummary.played} enfrentamientos: ${match.h2hSummary.homeWins}V ${h.shortName} - ${match.h2hSummary.awayWins}V ${a.shortName}, media ${match.h2hSummary.avgTotalPointsOrGoals.toFixed(1)} pts).`
+      : match.h2hSummary.played > 0
+        ? `Muestra H2H reducida (${match.h2hSummary.played} partido${match.h2hSummary.played === 1 ? '' : 's'}); evita sobredimensionar resultados directos con menos de 4 duelos.`
+        : 'Sin serie H2H reciente cargada para este emparejamiento.';
+
+  const uncertaintiesAndLimits = [...pred.modelWarnings];
+  if (match.provenance?.isStale) {
+    uncertaintiesAndLimits.push(
+      `Advertencia de actualización: los datos tienen ${match.provenance.staleAgeMinutes} minutos de antigüedad.`
+    );
+  }
+
+  return {
+    headline: `${favLabel}. Margen proyectado: ${pred.expectedSpreadHome >= 0 ? '+' : ''}${pred.expectedSpreadHome.toFixed(1)} ${h.shortName}.`,
+    homeFavoringFactors,
+    awayFavoringFactors,
+    homeStrengthsWeaknesses: `${h.shortName}: ${h.ppgOrGpg !== undefined ? `${h.ppgOrGpg.toFixed(1)} PTS/p` : 'PTS N/D'} · ${h.oppgOrGapg !== undefined ? `${h.oppgOrGapg.toFixed(1)} REC/p` : 'Def. N/D'} · Pace ${h.pace !== undefined ? h.pace.toFixed(1) : 'N/D'}`,
+    awayStrengthsWeaknesses: `${a.shortName}: ${a.ppgOrGpg !== undefined ? `${a.ppgOrGpg.toFixed(1)} PTS/p` : 'PTS N/D'} · ${a.oppgOrGapg !== undefined ? `${a.oppgOrGapg.toFixed(1)} REC/p` : 'Def. N/D'} · Pace ${a.pace !== undefined ? a.pace.toFixed(1) : 'N/D'}`,
+    keyAbsencesImpact:
+      pred.absenceImpactSummary.length > 0
+        ? pred.absenceImpactSummary
+        : ['Rotaciones principales disponibles sin bajas confirmadas de alto impacto.'],
+    h2hAssessment,
+    tacticalMatchups,
+    uncertaintiesAndLimits:
+      uncertaintiesAndLimits.length > 0
+        ? uncertaintiesAndLimits
+        : [`Cobertura estadística del ${pred.dataConfidence}% con métricas NBA verificadas.`],
+  };
+}
+
